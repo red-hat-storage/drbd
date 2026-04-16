@@ -130,6 +130,19 @@
 	blkdev_issue_zeroout(BDEV, SS, NS, GFP)
 #endif
 
+/* RDMA related */
+#ifndef COMPAT_HAVE_IB_ALLOC_CQ_ANY
+#include <rdma/ib_verbs.h>
+
+static inline struct ib_cq *
+ib_alloc_cq_any(struct ib_device *dev, void *private,
+		int nr_cqe, enum ib_poll_context poll_ctx)
+{
+	return ib_alloc_cq(dev, private, nr_cqe, 0, poll_ctx);
+}
+#endif
+/* RDMA */
+
 #ifndef COMPAT_HAVE_PROC_CREATE_SINGLE
 extern struct proc_dir_entry *proc_create_single(const char *name, umode_t mode,
 		struct proc_dir_entry *parent,
@@ -167,4 +180,43 @@ void arch_wb_cache_pmem(void *addr, size_t size);
 #define list_last_entry(ptr, type, member) \
         list_entry((ptr)->prev, type, member)
 #endif
+
+
+/* For kernels before 5.1: bio_for_each_bvec polyfill.
+ * On these kernels, bio_for_each_segment() does not split multi-page bvecs
+ * into PAGE_SIZE chunks (upstream commit 3d75ca0adef4, merged in v5.1).
+ * The cocci compat patch also forces single-page allocations in
+ * drbd_alloc_pages() to avoid buffer overflows with drivers that iterate
+ * using bio_for_each_segment (e.g. brd). */
+#ifndef COMPAT_HAVE_BIO_FOR_EACH_BVEC
+#define mp_bvec_iter_page(bvec, iter)				\
+	(__bvec_iter_bvec((bvec), (iter))->bv_page)
+
+#define mp_bvec_iter_len(bvec, iter)				\
+	min((iter).bi_size,					\
+	    __bvec_iter_bvec((bvec), (iter))->bv_len - (iter).bi_bvec_done)
+
+#define mp_bvec_iter_offset(bvec, iter)				\
+	(__bvec_iter_bvec((bvec), (iter))->bv_offset + (iter).bi_bvec_done)
+
+#define mp_bvec_iter_page_idx(bvec, iter)			\
+	(mp_bvec_iter_offset((bvec), (iter)) / PAGE_SIZE)
+
+#define mp_bvec_iter_bvec(bvec, iter)				\
+((struct bio_vec) {						\
+	.bv_page	= mp_bvec_iter_page((bvec), (iter)),	\
+	.bv_len		= mp_bvec_iter_len((bvec), (iter)),	\
+	.bv_offset	= mp_bvec_iter_offset((bvec), (iter)),	\
+})
+
+#define __bio_for_each_bvec(bvl, bio, iter, start)			\
+	for (iter = (start);						\
+	     (iter).bi_size &&						\
+		((bvl = mp_bvec_iter_bvec((bio)->bi_io_vec, (iter))), 1); \
+	     bio_advance_iter((bio), &(iter), (bvl).bv_len))
+
+#define bio_for_each_bvec(bvl, bio, iter)			\
+	__bio_for_each_bvec(bvl, bio, iter, (bio)->bi_iter)
+#endif
+
 #endif

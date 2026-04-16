@@ -94,13 +94,9 @@ endif
 
 export REL_VERSION FDIST_VERSION
 
-all: module tools
+all: module
 
-.PHONY: all tools module
-tools: | $(if $(filter module all,$(if $(MAKECMDGOALS),,all)),module)
-	@cat README.drbd-utils
-doc:
-	@echo "Man page sources moved to https://github.com/LINBIT/drbd-utils/"
+.PHONY: all module
 
 # we cannot use 'git submodule foreach':
 # foreach only works if submodule already checked out
@@ -334,11 +330,21 @@ MODE = report
 endif
 
 .PHONY: coccicheck
-coccicheck: coccinelle/*.cocci
+coccicheck: checks/*.cocci
 	@for file in $^ ; do \
 		echo "  COCCICHECK $$(basename $${file} .cocci)"; \
 		spatch --very-quiet drbd/drbd_*.c -D $(MODE) --sp-file $${file}; \
 	done
+
+.PHONY: pychecks
+pychecks: checks/*.py
+	@for file in $^ ; do \
+		echo "  CHECK $$(basename $${file} .py)"; \
+		python3 $${file} drbd/*.c; \
+	done
+
+.PHONY: checks
+checks: coccicheck pychecks
 
 .PHONY: check-compat
 check-compat:

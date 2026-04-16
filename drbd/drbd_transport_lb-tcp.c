@@ -50,7 +50,7 @@ module_param_named(keepidle, drbd_keepidle, uint, 0664);
 MODULE_PARM_DESC(keepidle, "see tcp(7) tcp_keepalive_time; set TCP_KEEPIDLE for data sockets; default: 23s");
 static unsigned int drbd_keepintvl = DRBD_KEEP_INTVL;
 module_param_named(keepintvl, drbd_keepintvl, uint, 0664);
-MODULE_PARM_DESC(keepintvtl, "see tcp(7) tcp_keepalive_intvl; set TCP_KEEPINTVL for data sockets; default: 23s");
+MODULE_PARM_DESC(keepintvl, "see tcp(7) tcp_keepalive_intvl; set TCP_KEEPINTVL for data sockets; default: 23s");
 
 #define DTL_CONNECTING 1
 #define DTL_LOAD_BALANCE 2
@@ -121,7 +121,6 @@ struct dtl_path {
 	struct dtl_flow flow[2];
 };
 
-
 static int dtl_init(struct drbd_transport *transport);
 static void dtl_free(struct drbd_transport *transport, enum drbd_tr_free_op free_op);
 static void dtl_socket_free(struct drbd_transport *transport, struct socket **sock);
@@ -130,8 +129,7 @@ static int dtl_connect(struct drbd_transport *transport);
 static void dtl_finish_connect(struct drbd_transport *transport);
 static int dtl_recv(struct drbd_transport *transport, enum drbd_stream stream, void **buf,
 		    size_t size, int flags);
-static int dtl_recv_pages(struct drbd_transport *transport, struct drbd_page_chain_head *chain,
-			  size_t size);
+static int dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size);
 static void dtl_stats(struct drbd_transport *transport, struct drbd_transport_stats *stats);
 static int dtl_net_conf_change(struct drbd_transport *transport, struct net_conf *new_net_conf);
 static void dtl_set_rcvtimeo(struct drbd_transport *transport, enum drbd_stream stream,
@@ -139,7 +137,7 @@ static void dtl_set_rcvtimeo(struct drbd_transport *transport, enum drbd_stream 
 static long dtl_get_rcvtimeo(struct drbd_transport *transport, enum drbd_stream stream);
 static int dtl_send_page(struct drbd_transport *transport, enum drbd_stream, struct page *page,
 		int offset, size_t size, unsigned int msg_flags);
-static int dtl_send_zc_bio(struct drbd_transport *, struct bio *bio);
+static int dtl_send_bio(struct drbd_transport *, struct bio *bio, unsigned int msg_flags);
 static bool dtl_stream_ok(struct drbd_transport *transport, enum drbd_stream stream);
 static bool dtl_hint(struct drbd_transport *transport, enum drbd_stream stream,
 		     enum drbd_tr_hints hint);
@@ -173,13 +171,13 @@ static struct drbd_transport_class dtl_transport_class = {
 		.connect = dtl_connect,
 		.finish_connect = dtl_finish_connect,
 		.recv = dtl_recv,
-		.recv_pages = dtl_recv_pages,
+		.recv_bio = dtl_recv_bio,
 		.stats = dtl_stats,
 		.net_conf_change = dtl_net_conf_change,
 		.set_rcvtimeo = dtl_set_rcvtimeo,
 		.get_rcvtimeo = dtl_get_rcvtimeo,
 		.send_page = dtl_send_page,
-		.send_zc_bio = dtl_send_zc_bio,
+		.send_bio = dtl_send_bio,
 		.stream_ok = dtl_stream_ok,
 		.hint = dtl_hint,
 		.debugfs_show = dtl_debugfs_show,
@@ -470,8 +468,8 @@ _dtl_recv_page(struct dtl_transport *dtl_transport, struct page *page, int size)
 		if (err)
 			goto out;
 
-		err = dtl_recv_short(flow->sock, data, min(size, flow->recv_bytes), 0);
-		if (err < 0)
+		err = dtl_recv_short(flow->sock, pos, min(size, flow->recv_bytes), 0);
+		if (err <= 0)
 			goto out;
 		size -= err;
 		pos += err;
@@ -484,36 +482,35 @@ out:
 }
 
 static int
-dtl_recv_pages(struct drbd_transport *transport, struct drbd_page_chain_head *chain, size_t size)
+dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size)
 {
 	struct dtl_transport *dtl_transport =
 		container_of(transport, struct dtl_transport, transport);
+	size_t remaining = size;
 	struct page *page;
 	int err;
 
-	drbd_alloc_page_chain(transport, chain, DIV_ROUND_UP(size, PAGE_SIZE), GFP_TRY);
-	page = chain->head;
-	if (!page)
-		return -ENOMEM;
+	do {
+		size_t len;
 
-	page_chain_for_each(page) {
-		size_t len = min_t(int, size, PAGE_SIZE);
+		page = drbd_alloc_pages(transport, GFP_KERNEL, remaining);
+		if (!page)
+			return -ENOMEM;
+		len = min(PAGE_SIZE << compound_order(page), remaining);
 
 		err = _dtl_recv_page(dtl_transport, page, len);
+		if (err <= 0)
+			goto fail;
+		remaining -= err;
+		err = drbd_bio_add_page(transport, bios, page, len, 0);
 		if (err < 0)
 			goto fail;
-		set_page_chain_offset(page, 0);
-		set_page_chain_size(page, len);
-		size -= err;
-	}
-	if (unlikely(size)) {
-		tr_warn(transport, "Not enough data received; missing %zu bytes\n", size);
-		err = -ENODATA;
-		goto fail;
-	}
-	return 0;
+	} while (remaining > 0);
+
+	return size;
+
 fail:
-	drbd_free_page_chain(transport, chain);
+	drbd_free_page(transport, page);
 	return err;
 }
 
@@ -1631,7 +1628,7 @@ static int dtl_select_send_flow(struct dtl_transport *dtl_transport,
 static int _dtl_send_page(struct dtl_transport *dtl_transport, struct dtl_flow *flow,
 			  struct page *page, int offset, size_t size, unsigned int msg_flags)
 {
-	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL | MSG_SPLICE_PAGES };
+	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL };
 	struct drbd_transport *transport = &dtl_transport->transport;
 	struct socket *sock = flow->sock;
 	struct bio_vec bvec;
@@ -1716,7 +1713,7 @@ static int dtl_bio_chunk_size_available(struct bio *bio, int wmem_available,
 }
 
 static int dtl_send_bio_pages(struct dtl_transport *dtl_transport, struct dtl_flow *flow,
-		struct bio *bio, struct bvec_iter *iter, int chunk)
+			struct bio *bio, struct bvec_iter *iter, int chunk, unsigned int msg_flags)
 {
 	struct bio_vec bvec;
 
@@ -1726,7 +1723,7 @@ static int dtl_send_bio_pages(struct dtl_transport *dtl_transport, struct dtl_fl
 		bvec = bio_iter_iovec(bio, *iter);
 		err = _dtl_send_page(dtl_transport, flow, bvec.bv_page,
 				bvec.bv_offset, bvec.bv_len,
-				bio_iter_last(bvec, *iter) ? 0 : MSG_MORE);
+				msg_flags | (bio_iter_last(bvec, *iter) ? 0 : MSG_MORE));
 		if (err)
 			return err;
 		chunk -= bvec.bv_len;
@@ -1736,7 +1733,8 @@ static int dtl_send_bio_pages(struct dtl_transport *dtl_transport, struct dtl_fl
 	return 0;
 }
 
-static int dtl_send_zc_bio(struct drbd_transport *transport, struct bio *bio)
+static int dtl_send_bio(struct drbd_transport *transport, struct bio *bio,
+			   unsigned int msg_flags)
 {
 	struct dtl_transport *dtl_transport =
 		container_of(transport, struct dtl_transport, transport);
@@ -1777,7 +1775,7 @@ static int dtl_send_zc_bio(struct drbd_transport *transport, struct bio *bio)
 				goto out;
 		}
 
-		err = dtl_send_bio_pages(dtl_transport, flow, bio, &iter, chunk);
+		err = dtl_send_bio_pages(dtl_transport, flow, bio, &iter, chunk, msg_flags);
 		if (err)
 			goto out;
 	} while (iter.bi_size);
@@ -1844,9 +1842,9 @@ static void dtl_debugfs_show(struct drbd_transport *transport, struct seq_file *
 	list_for_each_entry_rcu(drbd_path, &transport->paths, list) {
 		enum drbd_stream i;
 
-		seq_printf(m, "%pI4 - %pI4:\n",
-			   &((struct sockaddr_in *)&drbd_path->my_addr)->sin_addr,
-			   &((struct sockaddr_in *)&drbd_path->peer_addr)->sin_addr);
+		seq_printf(m, "%pISpc - %pISpc:\n",
+			   &drbd_path->my_addr,
+			   &drbd_path->peer_addr);
 
 		for (i = DATA_STREAM; i <= CONTROL_STREAM ; i++) {
 			struct dtl_path *path = container_of(drbd_path, struct dtl_path, path);

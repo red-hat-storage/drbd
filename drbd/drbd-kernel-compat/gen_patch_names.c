@@ -114,6 +114,19 @@ int main(int argc, char **argv)
 	patch(1, "bvec_kmap_local", true, false,
 	      COMPAT_HAVE_BVEC_KMAP_LOCAL, "present");
 
+	patch(1, "bvec_virt", true, false,
+	      COMPAT_HAVE_BVEC_VIRT, "present");
+
+	patch(1, "bio_for_each_bvec", true, false,
+	      COMPAT_HAVE_BIO_FOR_EACH_BVEC, "present");
+
+#if !defined(COMPAT_HAVE_BIO_FOR_EACH_BVEC) || defined(COMPAT_HAVE_BVEC_NTH_PAGE)
+	/* Pre-5.2: bio_add_page() does not guarantee contiguous page
+	 * structs in merged bvecs. Use nth_page() for safe iteration. */
+	patch(1, "bvec_page_struct_contiguous", true, false,
+	      NO, "guaranteed");
+#endif
+
 	patch(1, "sendpage", false, true,
 	      COMPAT_HAVE_SENDPAGE, "present");
 
@@ -181,6 +194,9 @@ int main(int argc, char **argv)
 	patch(1, "genl_policy", true, false,
 	      COMPAT_GENL_POLICY_IN_OPS, "in_ops");
 
+	patch(1, "genl_pre_doit_split_ops", true, false,
+	      COMPAT_HAVE_GENL_PRE_DOIT_SPLIT_OPS, "present");
+
 	/*
 	 * >= 6.10:  BLK_FEAT_STABLE_WRITES
 	 * 5.9-6.10: QUEUE_FLAG_STABLE_WRITES
@@ -217,6 +233,12 @@ int main(int argc, char **argv)
 
 	patch(1, "rb_declare_callbacks_max", true, false,
 	      COMPAT_HAVE_RB_DECLARE_CALLBACKS_MAX, "present");
+
+	patch(1, "alloc_obj_default_gfp", true, false,
+	      COMPAT_HAVE_ALLOC_OBJ_DEFAULT_GFP, "present");
+
+	patch(1, "kmalloc_obj", true, false,
+	      COMPAT_HAVE_KMALLOC_OBJ, "present");
 
 	patch(1, "struct_size", true, false,
 	      COMPAT_HAVE_STRUCT_SIZE, "present");
@@ -496,6 +518,9 @@ int main(int argc, char **argv)
 	patch(1, "thaw_bdev", false, true,
 	      COMPAT_THAW_BDEV_TAKES_SUPER_BLOCK, "takes_super_block");
 #endif
+
+	patch(1, "queue_limits_max_hw_wzeroes_unmap_sectors", true, false,
+	      COMPAT_QUEUE_LIMITS_HAS_MAX_HW_WZEROES_UNMAP_SECTORS, "present");
 
 	patch(1, "struct_sockaddr_unsized", true, false,
 	      COMPAT_HAVE_STRUCT_SOCKADDR_UNSIZED, "present");
