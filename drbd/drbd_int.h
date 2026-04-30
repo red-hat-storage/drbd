@@ -1,15 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
-  drbd_int.h
-
-  This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-  Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-  Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-  Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
-
-*/
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
+ */
 
 #ifndef _DRBD_INT_H
 #define _DRBD_INT_H
@@ -2061,8 +2056,8 @@ static inline int interval_to_al_extents(struct drbd_interval *i)
 }
 
 struct drbd_bitmap *drbd_bm_alloc(unsigned int max_peers, unsigned int bm_block_shift);
-int  drbd_bm_resize(struct drbd_device *device, sector_t capacity,
-		    bool set_new_bits);
+int  drbd_bm_resize(struct drbd_device *device, struct drbd_bitmap *bitmap,
+		    sector_t capacity, bool set_new_bits);
 void drbd_bm_free(struct drbd_device *device);
 void drbd_bm_set_all(struct drbd_device *device);
 void drbd_bm_clear_all(struct drbd_device *device);

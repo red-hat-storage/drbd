@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_nl.c
-
-   This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-   Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-   Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-   Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
-
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
  */
 
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
@@ -35,6 +30,21 @@
 
 #include "drbd_meta_data.h"
 #include "drbd_legacy_84.h"
+
+/*
+ * DRBD used to repurpose bit 14 of nla_type as a "mandatory" flag
+ * (DRBD_GENLA_F_MANDATORY). The T_* enum values had this bit baked in, and
+ * old drbdsetup versions compare nla->nla_type directly (without nla_type())
+ * against these T_* values when parsing path attributes from the kernel.
+ *
+ * We no longer include bit 14 in the T_* enum values, but must keep setting
+ * it in hand-written nla_put() calls so already-built userspace tools can
+ * still parse our responses.
+ *
+ * Deprecated: only used for a specific compat case, will be removed with
+ * the new DRBD netlink family.
+ */
+#define nla_type_mandatory(type) ((type) | 0x4000)
 
 /* .doit */
 static int drbd_adm_new_minor(struct sk_buff *skb, struct genl_info *info);
@@ -84,7 +94,14 @@ static int drbd_adm_get_initial_state(struct sk_buff *skb, struct netlink_callba
 static int drbd_adm_get_initial_state_done(struct netlink_callback *cb);
 
 #include <linux/drbd_genl_api.h>
-#include "drbd_nla.h"
+/*
+ * genl_magic_func.h calls drbd_nla_parse_nested(). Provide it as a wrapper
+ * around nla_parse_nested_deprecated(), which a compat patch may further
+ * rewrite to nla_parse_nested() for older kernels.
+ * Can be removed together with the genl_magic infrastructure.
+ */
+#define drbd_nla_parse_nested(tb, maxtype, nla, policy) \
+	nla_parse_nested_deprecated(tb, maxtype, nla, policy, NULL)
 #include <linux/genl_magic_func.h>
 
 void drbd_enable_netns(void)
@@ -253,13 +270,13 @@ static int drbd_adm_prepare(struct drbd_config_context *adm_ctx,
 			goto fail;
 
 		/* and assign stuff to the adm_ctx */
-		nla = nested_attr_tb[__nla_type(T_ctx_volume)];
+		nla = nested_attr_tb[T_ctx_volume];
 		if (nla)
 			adm_ctx->volume = nla_get_u32(nla);
-		nla = nested_attr_tb[__nla_type(T_ctx_peer_node_id)];
+		nla = nested_attr_tb[T_ctx_peer_node_id];
 		if (nla)
 			adm_ctx->peer_node_id = nla_get_u32(nla);
-		nla = nested_attr_tb[__nla_type(T_ctx_resource_name)];
+		nla = nested_attr_tb[T_ctx_resource_name];
 		if (nla)
 			adm_ctx->resource_name = nla_data(nla);
 		kfree(nested_attr_tb);
@@ -1402,7 +1419,6 @@ static void opener_info(struct drbd_resource *resource,
 static const char *from_attrs_err_to_txt(int err)
 {
 	return	err == -ENOMSG ? "required attribute missing" :
-		err == -EOPNOTSUPP ? "unknown mandatory attribute" :
 		err == -EEXIST ? "can not change invariant setting" :
 		"invalid attribute value";
 }
@@ -1719,7 +1735,8 @@ drbd_determine_dev_size(struct drbd_device *device, sector_t peer_current_size,
 		int err = 0;
 
 		if (device->bitmap)
-			err = drbd_bm_resize(device, size, !(flags & DDSF_NO_RESYNC));
+			err = drbd_bm_resize(device, device->bitmap, size,
+					     !(flags & DDSF_NO_RESYNC));
 		if (unlikely(err)) {
 			/* currently there is only one error: ENOMEM! */
 			size = drbd_bm_capacity(device);
@@ -2549,19 +2566,30 @@ static int drbd_adm_disk_opts(struct sk_buff *skb, struct genl_info *info)
 
 	if (!old_disk_conf->d_bitmap && new_disk_conf->d_bitmap) {
 		struct drbd_md *md = &device->ldev->md;
+		struct drbd_bitmap *bitmap;
 
-		device->bitmap = drbd_bm_alloc(md->max_peers, md->bm_block_shift);
-		if (!device->bitmap) {
+		bitmap = drbd_bm_alloc(md->max_peers, md->bm_block_shift);
+		if (!bitmap) {
 			drbd_msg_put_info(adm_ctx->reply_skb, "Failed to allocate bitmap");
 			retcode = ERR_NOMEM;
 			goto fail_unlock;
 		}
-		err = drbd_bm_resize(device, get_capacity(device->vdisk), true);
+		err = drbd_bm_resize(device, bitmap, get_capacity(device->vdisk), true);
 		if (err) {
+			kfree(bitmap);
 			drbd_msg_put_info(adm_ctx->reply_skb, "Failed to allocate bitmap pages");
 			retcode = ERR_NOMEM;
 			goto fail_unlock;
 		}
+
+		/* Publish only after bm_pages is populated, otherwise readers
+		 * in __bm_op() can observe device->bitmap != NULL with
+		 * bm_pages == NULL and trip the assertion.  No
+		 * smp_load_acquire() needed: bm_pages is always read under
+		 * bitmap->bm_lock, and lockless NULL-checks are ordered by
+		 * address dependency.
+		 */
+		smp_store_release(&device->bitmap, bitmap);
 
 		drbd_bitmap_io(device, &drbd_bm_write, "write from disk_opts", BM_LOCK_ALL, NULL);
 	} else if (old_disk_conf->d_bitmap && !new_disk_conf->d_bitmap) {
@@ -3301,6 +3329,7 @@ static int drbd_adm_attach(struct sk_buff *skb, struct genl_info *info)
 	enum drbd_disk_state ds;
 	sector_t min_md_device_sectors;
 	struct drbd_backing_dev *nbc; /* new_backing_conf */
+	struct drbd_bitmap *bitmap = NULL; /* unpublished until bm_pages is wired up */
 	sector_t backing_disk_max_sectors;
 	struct disk_conf *new_disk_conf = NULL;
 	enum drbd_state_rv rv;
@@ -3404,9 +3433,9 @@ static int drbd_adm_attach(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	if (new_disk_conf->d_bitmap) {
-		/* ldev_safe: attach path, allocating bitmap */
-		device->bitmap = drbd_bm_alloc(nbc->md.max_peers, nbc->md.bm_block_shift);
-		if (!device->bitmap) {
+		/* ldev_safe: attach path, allocating bitmap. */
+		bitmap = drbd_bm_alloc(nbc->md.max_peers, nbc->md.bm_block_shift);
+		if (!bitmap) {
 			retcode = ERR_NOMEM;
 			goto fail;
 		}
@@ -3707,12 +3736,17 @@ static int drbd_adm_attach(struct sk_buff *skb, struct genl_info *info)
 		 * drbd_determine_dev_size() below allocate and initialise the
 		 * bitmap fresh.
 		 */
-		if (old_size > 0 && device->bitmap) {
-			err = drbd_bm_resize(device, old_size, false);
+		if (old_size > 0 && bitmap) {
+			err = drbd_bm_resize(device, bitmap, old_size, false);
 			if (err) {
 				retcode = ERR_NOMEM_BITMAP;
 				goto force_diskless_dec;
 			}
+
+			/* Publish only after bm_pages is populated. */
+			smp_store_release(&device->bitmap, bitmap);
+			bitmap = NULL;
+
 			err = drbd_bitmap_io(device, &drbd_bm_read,
 					     "read from attaching", BM_LOCK_ALL,
 					     NULL);
@@ -3720,6 +3754,16 @@ static int drbd_adm_attach(struct sk_buff *skb, struct genl_info *info)
 				retcode = ERR_IO_MD_DISK;
 				goto force_diskless_dec;
 			}
+		} else if (bitmap) {
+			/* old_size == 0: no prior bitmap to read.
+			 * drbd_determine_dev_size() below resizes via
+			 * device->bitmap, so we have to publish here.  The
+			 * window during which device->bitmap is non-NULL with
+			 * bm_pages == NULL is quiescent (D_ATTACHING, no peer
+			 * connected, no IO touching the bitmap).
+			 */
+			smp_store_release(&device->bitmap, bitmap);
+			bitmap = NULL;
 		}
 	}
 
@@ -3876,6 +3920,7 @@ static int drbd_adm_attach(struct sk_buff *skb, struct genl_info *info)
  force_diskless:
 	change_disk_state(device, D_DISKLESS, CS_HARD, "attach", NULL);
  fail:
+	kfree(bitmap); /* free unpublished local; NULL after publication */
 	drbd_bm_free(device);
 	mutex_unlock_cond(&resource->conf_update, &have_conf_update);
 	drbd_backing_dev_free(device, nbc);
@@ -4857,8 +4902,8 @@ adm_add_path(struct drbd_config_context *adm_ctx,  struct genl_info *info)
 		drbd_msg_put_info(adm_ctx->reply_skb, from_attrs_err_to_txt(err));
 		return ERR_MANDATORY_TAG;
 	}
-	my_addr = nested_attr_tb[__nla_type(T_my_addr)];
-	peer_addr = nested_attr_tb[__nla_type(T_peer_addr)];
+	my_addr = nested_attr_tb[T_my_addr];
+	peer_addr = nested_attr_tb[T_peer_addr];
 	kfree(nested_attr_tb);
 	nested_attr_tb = NULL;
 
@@ -5105,8 +5150,8 @@ adm_del_path(struct drbd_config_context *adm_ctx,  struct genl_info *info)
 		drbd_msg_put_info(adm_ctx->reply_skb, from_attrs_err_to_txt(err));
 		return ERR_MANDATORY_TAG;
 	}
-	my_addr = nested_attr_tb[__nla_type(T_my_addr)];
-	peer_addr = nested_attr_tb[__nla_type(T_peer_addr)];
+	my_addr = nested_attr_tb[T_my_addr];
+	peer_addr = nested_attr_tb[T_peer_addr];
 	kfree(nested_attr_tb);
 	nested_attr_tb = NULL;
 
@@ -6179,14 +6224,13 @@ nla_put_failure:
 static struct nlattr *find_cfg_context_attr(const struct nlmsghdr *nlh, int attr)
 {
 	const unsigned hdrlen = GENL_HDRLEN + GENL_MAGIC_FAMILY_HDRSZ;
-	const int maxtype = ARRAY_SIZE(drbd_cfg_context_nl_policy) - 1;
 	struct nlattr *nla;
 
 	nla = nla_find(nlmsg_attrdata(nlh, hdrlen), nlmsg_attrlen(nlh, hdrlen),
 		       DRBD_NLA_CFG_CONTEXT);
 	if (!nla)
 		return NULL;
-	return drbd_nla_find_nested(maxtype, nla, __nla_type(attr));
+	return nla_find_nested(nla, attr);
 }
 
 static void resource_to_info(struct resource_info *, struct drbd_resource *);
@@ -6407,8 +6451,21 @@ static int connection_paths_to_skb(struct sk_buff *skb, struct drbd_connection *
 	/* array of such paths. */
 	rcu_read_lock();
 	list_for_each_entry_rcu(path, &connection->transport.paths, list) {
-		if (nla_put(skb, T_my_addr, path->my_addr_len, &path->my_addr) ||
-				nla_put(skb, T_peer_addr, path->peer_addr_len, &path->peer_addr)) {
+		/*
+		 * Userspace compat hack: purposefully set bit 14 for old drbd-utils.
+		 * DRBD used to repurpose bit 14 as its "mandatory" flag; because of the way
+		 * the genl_magic infrastructure works, this flag also gets sent back on the wire,
+		 * and userspace usually strips it.
+		 * There is a bug in drbdsetup though: for these two fields, it does a raw
+		 * comparison between the genl_magic-defined T_my_addr (including bit 14) and the
+		 * data that came on the wire (which also used to include bit 14).
+		 * This comparison breaks when we remove bit 14, so add it back here.
+		 */
+		int my_type = nla_type_mandatory(T_my_addr);
+		int peer_type = nla_type_mandatory(T_peer_addr);
+
+		if (nla_put(skb, my_type, path->my_addr_len, &path->my_addr) ||
+		    nla_put(skb, peer_type, path->peer_addr_len, &path->peer_addr)) {
 			rcu_read_unlock();
 			goto nla_put_failure;
 		}
