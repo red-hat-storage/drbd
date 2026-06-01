@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2014, LINBIT HA-Solutions GmbH.
+ */
+
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 
 #include <linux/spinlock.h>
@@ -264,6 +268,27 @@ void drbd_put_listener(struct drbd_path *path)
 	kref_put(&listener->kref, drbd_listener_destroy);
 }
 
+/**
+ * drbd_listener_try_get_ref() - Acquire a reference to path->listener.
+ * @path: The path whose listener should be pinned.
+ *
+ * Necessary to protect from a concurrently running del-path.
+ */
+struct drbd_listener *drbd_listener_try_get_ref(struct drbd_path *path)
+{
+	struct drbd_connection *connection =
+		container_of(path->transport, struct drbd_connection, transport);
+	struct drbd_resource *resource = connection->resource;
+	struct drbd_listener *listener;
+
+	spin_lock_bh(&resource->listeners_lock);
+	listener = READ_ONCE(path->listener);
+	if (!listener || !kref_get_unless_zero(&listener->kref))
+		listener = NULL;
+	spin_unlock_bh(&resource->listeners_lock);
+	return listener;
+}
+
 struct drbd_path *drbd_find_path_by_addr(struct drbd_listener *listener, struct sockaddr_storage *addr)
 {
 	struct drbd_path *path;
@@ -274,6 +299,17 @@ struct drbd_path *drbd_find_path_by_addr(struct drbd_listener *listener, struct 
 	}
 
 	return NULL;
+}
+
+/* An incoming connection is routed by matching the listener (my_addr and
+ * my_port) and then the peer IP. Two paths that agree on all three are
+ * therefore indistinguishable to the receiver.
+ */
+bool drbd_path_conflicts_by_listener(struct drbd_path *existing,
+				     struct drbd_path *candidate)
+{
+	return addr_and_port_equal(&existing->my_addr, &candidate->my_addr) &&
+	       addr_equal(&existing->peer_addr, &candidate->peer_addr);
 }
 
 /**
@@ -394,6 +430,7 @@ EXPORT_SYMBOL_GPL(drbd_register_transport_class);
 EXPORT_SYMBOL_GPL(drbd_unregister_transport_class);
 EXPORT_SYMBOL_GPL(drbd_get_listener);
 EXPORT_SYMBOL_GPL(drbd_put_listener);
+EXPORT_SYMBOL_GPL(drbd_listener_try_get_ref);
 EXPORT_SYMBOL_GPL(drbd_find_path_by_addr);
 EXPORT_SYMBOL_GPL(drbd_stream_send_timed_out);
 EXPORT_SYMBOL_GPL(drbd_should_abort_listening);

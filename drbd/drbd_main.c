@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_main.c
-
-   This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-   Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-   Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-   Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
-   Thanks to Carter Burden, Bart Grantham and Gennadiy Nerubayev
-   from Logicworks, Inc. for making SDP replication support possible.
-
-
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
  */
 
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
@@ -128,6 +120,26 @@ static const struct kernel_param_ops param_ops_drbd_protocol_version = {
 
 unsigned int drbd_protocol_version_min = PRO_VERSION_8_MIN;
 module_param_named(protocol_version_min, drbd_protocol_version_min, drbd_protocol_version, 0644);
+
+static int param_set_max_parallel_resyncs(const char *s, const struct kernel_param *kp)
+{
+	int rv = param_set_uint(s, kp);
+
+	if (rv == 0)
+		drbd_apply_resync_max_parallel();
+	return rv;
+}
+
+static const struct kernel_param_ops param_ops_max_parallel_resyncs = {
+	.set = param_set_max_parallel_resyncs,
+	.get = param_get_uint,
+};
+
+unsigned int drbd_max_parallel_resyncs;	/* 0 = unlimited */
+module_param_cb(max_parallel_resyncs, &param_ops_max_parallel_resyncs,
+		&drbd_max_parallel_resyncs, 0644);
+MODULE_PARM_DESC(max_parallel_resyncs,
+	"Cap on volumes resyncing in parallel (0 = unlimited)");
 #define protocol_version_min_desc								\
 	"\n\t\tReject DRBD dialects older than this.\n\t\t"					\
 	"Supported: "										\
@@ -150,7 +162,7 @@ module_param_named(strict_names, drbd_strict_names, drbd_strict_names, 0644);
  * as member "struct gendisk *vdisk;"
  */
 struct idr drbd_devices;
-struct list_head drbd_resources;
+LIST_HEAD(drbd_resources);
 static DEFINE_SPINLOCK(drbd_devices_lock);
 DEFINE_MUTEX(resources_mutex);
 
@@ -4480,8 +4492,6 @@ static int __init drbd_init(void)
 	 */
 	drbd_proc = NULL; /* play safe for drbd_cleanup */
 	idr_init(&drbd_devices);
-
-	INIT_LIST_HEAD(&drbd_resources);
 
 	err = register_pernet_device(&drbd_pernet_ops);
 	if (err) {

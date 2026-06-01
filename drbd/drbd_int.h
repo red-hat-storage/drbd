@@ -1,15 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
-  drbd_int.h
-
-  This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-  Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-  Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-  Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
-
-*/
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
+ */
 
 #ifndef _DRBD_INT_H
 #define _DRBD_INT_H
@@ -46,6 +41,7 @@
 /* module parameter, defined in drbd_main.c */
 extern unsigned int drbd_minor_count;
 extern unsigned int drbd_protocol_version_min;
+extern unsigned int drbd_max_parallel_resyncs;
 extern bool drbd_strict_names;
 
 static inline bool drbd_protocol_version_acceptable(unsigned int pv)
@@ -544,8 +540,11 @@ enum {
 	/* SyncTarget: This is the last resync request. */
 	__EE_LAST_RESYNC_REQUEST,
 
-	/* This peer_req->recv_order is on some list */
+	/* This peer_req->recv_order is on some list protected by peer_reqs_lock */
 	__EE_ON_RECV_ORDER,
+
+	/* This peer_req->recv_order is on connection->send_oos protocted by send_oos_lock */
+	__EE_ON_SEND_OOS,
 };
 #define EE_MAY_SET_IN_SYNC     (1<<__EE_MAY_SET_IN_SYNC)
 #define EE_SET_OUT_OF_SYNC     (1<<__EE_SET_OUT_OF_SYNC)
@@ -562,6 +561,7 @@ enum {
 #define EE_IN_ACTLOG		(1<<__EE_IN_ACTLOG)
 #define EE_LAST_RESYNC_REQUEST	(1<<__EE_LAST_RESYNC_REQUEST)
 #define EE_ON_RECV_ORDER	(1<<__EE_ON_RECV_ORDER)
+#define EE_ON_SEND_OOS		(1<<__EE_ON_SEND_OOS)
 
 #define REQ_NO_BIO (REQ_OP_DRV_OUT) /* exception for drbd_alloc_peer_request(), DRBD private */
 
@@ -1347,6 +1347,7 @@ struct drbd_peer_device {
 	bool resync_susp_peer[2];
 	bool resync_susp_dependency[2];
 	bool resync_susp_other_c[2];
+	bool resync_susp_max_parallel[2];
 	bool resync_active[2];
 	bool replication[2]; /* Only while peer is Inconsistent: Is replication enabled? */
 	bool peer_replication[2]; /* Whether we have instructed peer to replicate to us */
@@ -2061,8 +2062,8 @@ static inline int interval_to_al_extents(struct drbd_interval *i)
 }
 
 struct drbd_bitmap *drbd_bm_alloc(unsigned int max_peers, unsigned int bm_block_shift);
-int  drbd_bm_resize(struct drbd_device *device, sector_t capacity,
-		    bool set_new_bits);
+int  drbd_bm_resize(struct drbd_device *device, struct drbd_bitmap *bitmap,
+		    sector_t capacity, bool set_new_bits);
 void drbd_bm_free(struct drbd_device *device);
 void drbd_bm_set_all(struct drbd_device *device);
 void drbd_bm_clear_all(struct drbd_device *device);
@@ -2259,6 +2260,7 @@ void drbd_start_resync(struct drbd_peer_device *peer_device,
 		       enum drbd_repl_state side, const char *tag);
 void resume_next_sg(struct drbd_device *device);
 void suspend_other_sg(struct drbd_device *device);
+void drbd_apply_resync_max_parallel(void);
 void drbd_resync_finished(struct drbd_peer_device *peer_device,
 			  enum drbd_disk_state new_peer_disk_state);
 void verify_progress(struct drbd_peer_device *peer_device,
