@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_receiver.c
-
-   This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-   Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-   Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-   Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
  */
 
 #include <net/sock.h>
@@ -546,7 +542,7 @@ void drbd_free_peer_req(struct drbd_peer_request *peer_req)
 			list_del(&peer_req->recv_order);
 		spin_unlock_irq(&connection->peer_reqs_lock);
 	}
-
+	D_ASSERT(peer_device, !(peer_req->flags & EE_ON_SEND_OOS));
 	if (peer_req->flags & EE_HAS_DIGEST)
 		kfree(peer_req->digest);
 	D_ASSERT(peer_device, atomic_read(&peer_req->pending_bios) == 0);
@@ -3711,8 +3707,12 @@ static void drbd_peer_resync_read_cancel(struct drbd_peer_request *peer_req)
 	u64 block_id = peer_req->block_id;
 
 	if (peer_req->i.type == INTERVAL_OV_READ_SOURCE) {
-		/* P_OV_REPLY */
-		dec_rs_pending(peer_device);
+		/* P_OV_REPLY.
+		 * rs_pending was already decremented in
+		 * receive_common_ov_reply() before the peer_req reached
+		 * either of the two paths that call us; do not decrement
+		 * again.
+		 */
 		drbd_send_ov_result(peer_device, sector, size, block_id, OV_RESULT_SKIP);
 	} else if (peer_req->i.type == INTERVAL_OV_READ_TARGET) {
 		/* P_OV_REQUEST */
@@ -9658,7 +9658,7 @@ static void cancel_dagtag_dependent_requests(struct drbd_resource *resource, uns
 	rcu_read_lock();
 	for_each_connection_rcu(connection, resource) {
 		spin_lock_irq(&connection->peer_reqs_lock);
-		list_for_each_entry(peer_req, &connection->dagtag_wait_ee, w.list) {
+		list_for_each_entry_safe(peer_req, t, &connection->dagtag_wait_ee, w.list) {
 			if (peer_req->depend_dagtag_node_id != node_id)
 				continue;
 
@@ -9669,15 +9669,25 @@ static void cancel_dagtag_dependent_requests(struct drbd_resource *resource, uns
 					node_id);
 
 			list_move_tail(&peer_req->w.list, &work_list);
-			break;
 		}
 		spin_unlock_irq(&connection->peer_reqs_lock);
 	}
 	rcu_read_unlock();
 
 	list_for_each_entry_safe(peer_req, t, &work_list, w.list) {
+		struct drbd_peer_device *peer_device = peer_req->peer_device;
+
 		drbd_peer_resync_read_cancel(peer_req);
+		/* Verify requests on the source side are placed in the
+		 * interval tree when the request is made; they need to be
+		 * removed if the reply was parked waiting for a dagtag.
+		 * Mirrors free_dagtag_wait_requests().
+		 */
+		if (peer_req->i.type == INTERVAL_OV_READ_SOURCE)
+			drbd_remove_peer_req_interval(peer_req);
 		drbd_free_peer_req(peer_req);
+		dec_unacked(peer_device);
+		put_ldev(peer_device->device);
 	}
 }
 
@@ -11162,21 +11172,26 @@ static void drbd_send_oos_from(struct drbd_connection *oos_connection, int peer_
 	while (peer_req) {
 		struct drbd_peer_device *peer_device =
 			conn_peer_device(oos_connection, peer_req->peer_device->device->vnr);
-		struct drbd_peer_request *free_peer_req = NULL;
+		struct drbd_peer_request *next_peer_req;
+		bool free_it;
 
 		/* Ignore errors and keep iterating to clear up list */
 		drbd_send_out_of_sync(peer_device, peer_req->i.sector, peer_req->i.size);
 
 		spin_lock_irq(&peer_ack_connection->send_oos_lock);
 		peer_req->send_oos_pending &= ~NODE_MASK(oos_node_id);
-		if (!peer_req->send_oos_pending)
-			free_peer_req = peer_req;
-
-		peer_req = drbd_send_oos_next_req(peer_ack_connection, oos_node_id, peer_req);
+		next_peer_req = drbd_send_oos_next_req(peer_ack_connection, oos_node_id, peer_req);
+		free_it = !peer_req->send_oos_pending;
+		if (free_it) {
+			peer_req->flags &= ~EE_ON_SEND_OOS;
+			list_del(&peer_req->recv_order);
+		}
 		spin_unlock_irq(&peer_ack_connection->send_oos_lock);
 
-		if (free_peer_req)
-			drbd_free_peer_req(free_peer_req);
+		if (free_it)
+			drbd_free_peer_req(peer_req);
+
+		peer_req = next_peer_req;
 	}
 
 	kref_debug_put(&peer_ack_connection->kref_debug, 18);
@@ -11300,8 +11315,12 @@ found:
 
 		peer_req->send_oos_pending = drbd_calculate_send_oos_pending(device, in_sync);
 		any_send_oos_pending |= peer_req->send_oos_pending;
-		if (!peer_req->send_oos_pending)
-			drbd_free_peer_req(peer_req);
+		if (peer_req->send_oos_pending) {
+			peer_req->flags &= ~EE_ON_RECV_ORDER;
+			peer_req->flags |= EE_ON_SEND_OOS;
+		} else {
+			drbd_free_peer_req(peer_req); /* list_del() because EE_ON_RECV_ORDER */
+		}
 	}
 
 	drbd_queue_send_out_of_sync(connection, &work_list, any_send_oos_pending);
@@ -11351,8 +11370,12 @@ static void cleanup_unacked_peer_requests(struct drbd_connection *connection)
 
 		peer_req->send_oos_pending = drbd_calculate_send_oos_pending(device, 0);
 		any_send_oos_pending |= peer_req->send_oos_pending;
-		if (!peer_req->send_oos_pending)
-			drbd_free_peer_req(peer_req);
+		if (peer_req->send_oos_pending) {
+			peer_req->flags &= ~EE_ON_RECV_ORDER;
+			peer_req->flags |= EE_ON_SEND_OOS;
+		} else {
+			drbd_free_peer_req(peer_req); /* list_del() because EE_ON_RECV_ORDER */
+		}
 	}
 
 	drbd_queue_send_out_of_sync(connection, &work_list, any_send_oos_pending);
