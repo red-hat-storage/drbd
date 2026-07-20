@@ -1,0 +1,2869 @@
+warning: rule starting on line 134, node 45: kunmap_local(...)[1,2,20,21,25] in recv_dless_read may be inconsistently modified
+warning: rule starting on line 134, node 42: decl:mapped[1,2,20,21,22] in recv_dless_read may be inconsistently modified
+warning: rule starting on line 159, node 18: src = ... ;[1,2,8,9,11] in drbd_csum_bio may be inconsistently modified
+warning: rule starting on line 159, node 20: kunmap_local(...)[1,2,8,9,13] in drbd_csum_bio may be inconsistently modified
+warning: rule starting on line 192, node 30: iov_iter_bvec(...)[1,2,12,13,16] in dtt_send_page may be inconsistently modified
+warning: rule starting on line 192, node 31: sent = ... ;[1,2,12,13,17] in dtt_send_page may be inconsistently modified
+warning: rule starting on line 192, node 29: bvec_set_page(...)[1,2,12,13,15] in dtt_send_page may be inconsistently modified
+warning: rule starting on line 192, node 22: iov_iter_bvec(...)[1,2,9,10,13] in _dtl_send_page may be inconsistently modified
+warning: rule starting on line 192, node 23: sent = ... ;[1,2,9,10,14] in _dtl_send_page may be inconsistently modified
+warning: rule starting on line 192, node 21: bvec_set_page(...)[1,2,9,10,12] in _dtl_send_page may be inconsistently modified
+--- ./drbd_int.h
++++ /tmp/cocci-output-524506-5e2d0e-drbd_int.h
+@@ -458,7 +458,7 @@ struct drbd_peer_request {
+ 	};
+ 
+ 	struct drbd_page_chain_head page_chain;
+-	blk_opf_t opf; /* to be used as bi_opf */
++	unsigned int opf; /* to be used as bi_opf */
+ 	atomic_t pending_bios;
+ 	struct drbd_interval i;
+ 	unsigned long flags;	/* see comments on ee flag bits below */
+@@ -794,9 +794,7 @@ struct drbd_md {
+ 
+ struct drbd_backing_dev {
+ 	struct block_device *backing_bdev;
+-	struct file *backing_bdev_file;
+ 	struct block_device *md_bdev;
+-	struct file *f_md_bdev;
+ 	struct drbd_md md;
+ 	struct disk_conf __rcu *disk_conf; /* RCU, for updates: resource->conf_update */
+ 	sector_t known_size; /* last known size of that backing device */
+@@ -838,7 +836,7 @@ struct fifo_buffer {
+ 	unsigned int head_index;
+ 	unsigned int size;
+ 	int total; /* sum of all values */
+-	int values[] __counted_by(size);
++	int values[];
+ };
+ struct fifo_buffer *fifo_alloc(unsigned int fifo_size);
+ 
+@@ -2226,7 +2224,7 @@ void do_submit(struct work_struct *ws);
+ #endif
+ void __drbd_make_request(struct drbd_device *device, struct bio *bio,
+ 			 ktime_t start_kt, unsigned long start_jif);
+-void drbd_submit_bio(struct bio *bio);
++blk_qc_t drbd_make_request(struct request_queue *q, struct bio *bio);
+ 
+ enum drbd_force_detach_flags {
+ 	DRBD_READ_ERROR,
+@@ -2302,7 +2300,7 @@ void *drbd_md_get_buffer(struct drbd_dev
+ void drbd_md_put_buffer(struct drbd_device *device);
+ int drbd_md_sync_page_io(struct drbd_device *device,
+ 			 struct drbd_backing_dev *bdev, sector_t sector,
+-			 enum req_op op);
++			 unsigned int op);
+ bool drbd_al_active(struct drbd_device *device, sector_t sector,
+ 		    unsigned int size);
+ void drbd_ov_out_of_sync_found(struct drbd_peer_device *peer_device,
+@@ -2481,7 +2479,7 @@ void drbd_init_connect_state(struct drbd
+ 
+ static inline sector_t drbd_get_capacity(struct block_device *bdev)
+ {
+-	return bdev ? bdev_nr_sectors(bdev) : 0;
++	return bdev ? i_size_read(bdev->bd_inode) >> 9 : 0;
+ }
+ 
+ /* sets the number of 512 byte sectors of our virtual device */
+@@ -2497,7 +2495,7 @@ static inline void drbd_submit_bio_noacc
+ 		bio->bi_status = BLK_STS_IOERR;
+ 		bio_endio(bio);
+ 	} else {
+-		submit_bio_noacct(bio);
++		generic_make_request(bio);
+ 	}
+ }
+ 
+--- drbd-headers/linux/genl_magic_struct.h
++++ /tmp/cocci-output-524506-61ac7c-genl_magic_struct.h
+@@ -14,6 +14,7 @@
+ # error "you need to define GENL_MAGIC_INCLUDE_FILE before inclusion"
+ #endif
+ 
++#include "drbd_wrappers.h"
+ #include <linux/netlink.h>
+ #include <linux/genetlink.h>
+ #ifdef __KERNEL__
+@@ -24,6 +25,7 @@
+ #define nla_strscpy nla_strlcpy
+ #endif
+ #include <linux/types.h>
++#include <linux/pfn_t.h>
+ #include "compat.h"
+ 
+ #define CONCAT__(a,b)	a ## b
+--- drbd-headers/linux/genl_magic_func.h
++++ /tmp/cocci-output-524506-b24289-genl_magic_func.h
+@@ -3,6 +3,7 @@
+ #define GENL_MAGIC_FUNC_H
+ 
+ #include <linux/genl_magic_struct.h>
++#include <linux/pfn_t.h>
+ 
+ /*
+  * Magic: declare tla policy						{{{1
+--- drbd-headers/linux/drbd_genl_api.h
++++ /tmp/cocci-output-524506-8ddb22-drbd_genl_api.h
+@@ -32,6 +32,7 @@ enum {
+  * we cannot possibly include <1/drbd_genl.h> */
+ #undef linux
+ 
++#include "drbd_wrappers.h"
+ #include <linux/drbd.h>
+ #include <linux/drbd_config.h>
+ #define GENL_MAGIC_VERSION	2
+@@ -39,5 +40,6 @@ enum {
+ #define GENL_MAGIC_FAMILY_HDRSZ	sizeof(struct drbd_genlmsghdr)
+ #define GENL_MAGIC_INCLUDE_FILE <linux/drbd_genl.h>
+ #include <linux/genl_magic_struct.h>
++#include <linux/pfn_t.h>
+ 
+ #endif
+--- drbd-headers/linux/drbd.h
++++ /tmp/cocci-output-524506-62ba43-drbd.h
+@@ -13,6 +13,7 @@
+ #ifndef DRBD_H
+ #define DRBD_H
+ 
++#include "drbd_wrappers.h"
+ #include <asm/types.h>
+ 
+ #ifdef __KERNEL__
+@@ -22,6 +23,7 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <limits.h>
++#include <linux/pfn_t.h>
+ 
+ /* Although the Linux source code makes a difference between
+    generic endianness and the bitfields' endianness, there is no
+--- drbd-kernel-compat/handshake/tlshd.c
++++ /tmp/cocci-output-524506-57bb5b-tlshd.c
+@@ -8,6 +8,7 @@
+  * Copyright (c) 2021-2023, Oracle and/or its affiliates.
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/types.h>
+ #include <linux/socket.h>
+ #include <linux/kernel.h>
+@@ -21,6 +22,7 @@
+ 
+ #include <uapi/linux/keyctl.h>
+ #include <uapi/linux/handshake.h>
++#include <linux/pfn_t.h>
+ #include "handshake.h"
+ 
+ struct tls_handshake_req {
+--- drbd-kernel-compat/handshake/request.c
++++ /tmp/cocci-output-524506-6774d6-request.c
+@@ -7,6 +7,7 @@
+  * Copyright (c) 2023, Oracle and/or its affiliates.
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/types.h>
+ #include <linux/socket.h>
+ #include <linux/kernel.h>
+@@ -21,6 +22,7 @@
+ #include <net/netns/generic.h>
+ 
+ #include <uapi/linux/handshake.h>
++#include <linux/pfn_t.h>
+ #include "handshake.h"
+ 
+ /*
+--- drbd-kernel-compat/handshake/netlink.c
++++ /tmp/cocci-output-524506-1be6a0-netlink.c
+@@ -7,6 +7,7 @@
+  * Copyright (c) 2023, Oracle and/or its affiliates.
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/types.h>
+ #include <linux/socket.h>
+ #include <linux/kernel.h>
+@@ -21,6 +22,7 @@
+ #include <net/netns/generic.h>
+ 
+ #include <uapi/linux/handshake.h>
++#include <linux/pfn_t.h>
+ #include "handshake.h"
+ #include "genl.h"
+ 
+--- drbd-kernel-compat/handshake/genl.c
++++ /tmp/cocci-output-524506-d4b074-genl.c
+@@ -3,12 +3,14 @@
+ /*	Documentation/netlink/specs/handshake.yaml */
+ /* YNL-GEN kernel source */
+ 
++#include "drbd_wrappers.h"
+ #include <net/netlink.h>
+ #include <net/genetlink.h>
+ 
+ #include "genl.h"
+ 
+ #include <uapi/linux/handshake.h>
++#include <linux/pfn_t.h>
+ 
+ 
+ /* HANDSHAKE_CMD_ACCEPT - do */
+--- kref_debug.c
++++ /tmp/cocci-output-524506-35b1cd-kref_debug.c
+@@ -1,9 +1,11 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+ 
++#include "drbd_wrappers.h"
+ #include <linux/spinlock.h>
+ #include <linux/seq_file.h>
+ #include <linux/kref.h>
++#include <linux/pfn_t.h>
+ #include "kref_debug.h"
+ 
+ static struct list_head kref_debug_objects;
+--- drbd_transport_template.c
++++ /tmp/cocci-output-524506-065784-drbd_transport_template.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/module.h>
++#include <linux/pfn_t.h>
+ #include "drbd_transport.h"
+ #include "drbd_int.h"
+ 
+--- drbd_transport_tcp.c
++++ /tmp/cocci-output-524506-2b6b80-drbd_transport_tcp.c
+@@ -9,6 +9,7 @@
+ 
+ */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/module.h>
+ #include <linux/errno.h>
+ #include <linux/socket.h>
+@@ -25,7 +26,7 @@
+ #include <net/tcp.h>
+ #include <net/handshake.h>
+ #include <net/tls.h>
+-#include <net/tls_prot.h>
++#include <linux/pfn_t.h>
+ #include "drbd_protocol.h"
+ #include "drbd_transport.h"
+ 
+@@ -226,7 +227,7 @@ static void dtt_free(struct drbd_transpo
+ 			drbd_path_event(transport, drbd_path);
+ 	}
+ 
+-	timer_delete_sync(&tcp_transport->control_timer);
++	del_timer_sync(&tcp_transport->control_timer);
+ 
+ 	if (free_op == DESTROY_TRANSPORT) {
+ 		for (i = DATA_STREAM; i <= CONTROL_STREAM; i++) {
+@@ -284,6 +285,44 @@ static int _dtt_send(struct drbd_tcp_tra
+ 	return sent;
+ }
+ 
++#define TLS_RECORD_TYPE_ALERT 0x15
++#define TLS_RECORD_TYPE_DATA 0x17
++#define TLS_ALERT_LEVEL_FATAL 2
++#define TLS_GET_RECORD_TYPE 2
++
++/**
++  * tls_get_record_type - Look for TLS RECORD_TYPE information
++  * @sk: socket (for IP address information)
++  * @cmsg: incoming message to be parsed
++  *
++  * Returns zero or a TLS_RECORD_TYPE value.
++  */
++u8 tls_get_record_type(const struct sock *sk, const struct cmsghdr *cmsg) {
++	if (cmsg->cmsg_level != SOL_TLS)
++		return 0;
++	if (cmsg->cmsg_type != TLS_GET_RECORD_TYPE)
++		return 0;
++
++	return *((u8 *)CMSG_DATA(cmsg));
++}
++
++/**
++  * tls_alert_recv - Parse TLS Alert messages
++  * @sk: socket (for IP address information)
++  * @msg: incoming message to be parsed
++  * @level: OUT - TLS AlertLevel value
++  * @description: OUT - TLS AlertDescription value
++  *
++  */
++void tls_alert_recv(const struct sock *sk, const struct msghdr *msg, u8 *level, u8 *description)
++{
++	const struct kvec *iov = msg->msg_iter.kvec;
++	u8 *data = iov->iov_base;
++
++	*level = data[0];
++	*description = data[1];
++}
++
+ static int dtt_recv_short(struct socket *socket, void *buf, size_t size, int flags)
+ {
+ 	struct kvec iov = {
+@@ -309,7 +348,7 @@ static int dtt_recv_short(struct socket
+ 
+ 		switch (tls_get_record_type(socket->sk, &u.cmsg)) {
+ 		case 0:
+-			fallthrough;
++			;/* fallthrough */
+ 		case TLS_RECORD_TYPE_DATA:
+ 			break;
+ 		case TLS_RECORD_TYPE_ALERT:
+@@ -520,15 +559,15 @@ static int dtt_try_connect(struct dtt_pa
+ 	*  a free one dynamically.
+ 	*/
+ 	what = "bind before connect";
+-	err = socket->ops->bind(socket, (struct sockaddr_unsized *) &my_addr,
+-			path->path.my_addr_len);
++	err = socket->ops->bind(socket, (struct sockaddr *) &my_addr,
++				path->path.my_addr_len);
+ 	if (err < 0)
+ 		goto out;
+ 
+ 	/* connect may fail, peer not yet available.
+ 	 * stay C_CONNECTING, don't go Disconnecting! */
+ 	what = "connect";
+-	err = socket->ops->connect(socket, (struct sockaddr_unsized *) &peer_addr,
++	err = socket->ops->connect(socket, (struct sockaddr *) &peer_addr,
+ 				   path->path.peer_addr_len, 0);
+ 	if (err < 0) {
+ 		err = dtt_socket_err_to_eagain(err);
+@@ -764,7 +803,7 @@ static int dtt_wait_for_connect(struct d
+ 	rcu_read_unlock();
+ 
+ 	timeo = connect_int * HZ;
+-	timeo += get_random_u32_below(2) ? timeo / 7 : -timeo / 7; /* 28.5% random jitter */
++	timeo += (prandom_u32() % 2) ? timeo / 7 : -timeo / 7; /* 28.5% random jitter */
+ 
+ retry:
+ 	if (path)
+@@ -828,7 +867,7 @@ retry:
+ 				container_of(drbd_path2->transport,
+ 					     struct drbd_tcp_transport, transport);
+ 
+-			socket_c = kmalloc_obj(*socket_c, GFP_ATOMIC);
++			socket_c = kmalloc(sizeof(*socket_c), GFP_ATOMIC);
+ 			if (!socket_c) {
+ 				tr_info(transport, /* path2->transport, */
+ 					"No mem, dropped an incoming connection\n");
+@@ -1019,7 +1058,7 @@ static void dtt_incoming_connection(stru
+ 
+ static void dtt_control_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_tcp_transport *tcp_transport = timer_container_of(tcp_transport, t,
++	struct drbd_tcp_transport *tcp_transport = from_timer(tcp_transport, t,
+ 			control_timer);
+ 	struct drbd_transport *transport = &tcp_transport->transport;
+ 
+@@ -1074,7 +1113,8 @@ static int dtt_init_listener(struct drbd
+ 	addr_len = addr->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+ 		: sizeof(struct sockaddr_in);
+ 
+-	err = s_listen->ops->bind(s_listen, (struct sockaddr_unsized *)&my_addr, addr_len);
++	err = s_listen->ops->bind(s_listen, (struct sockaddr *)&my_addr,
++				  addr_len);
+ 	if (err < 0) {
+ 		what = "bind before listen";
+ 		goto out;
+@@ -1316,7 +1356,7 @@ retry:
+ 				tr_warn(transport, "Error receiving initial packet: %d\n", fp);
+ 				dtt_socket_free(&s);
+ randomize:
+-				if (get_random_u32_below(2))
++				if ((prandom_u32() % 2))
+ 					goto retry;
+ 			}
+ 		}
+@@ -1391,9 +1431,6 @@ randomize:
+ 	dsocket->sk->sk_allocation = GFP_ATOMIC;
+ 	csocket->sk->sk_allocation = GFP_ATOMIC;
+ 
+-	dsocket->sk->sk_use_task_frag = false;
+-	csocket->sk->sk_use_task_frag = false;
+-
+ 	sk_set_memalloc(dsocket->sk);
+ 	sk_set_memalloc(csocket->sk);
+ 
+@@ -1421,10 +1458,15 @@ randomize:
+ 
+ 	if (drbd_keepidle)
+ 		tcp_sock_set_keepidle(dsocket->sk, drbd_keepidle);
+-	if (drbd_keepcnt)
+-		tcp_sock_set_keepcnt(dsocket->sk, drbd_keepcnt);
+-	if (drbd_keepintvl)
+-		tcp_sock_set_keepintvl(dsocket->sk, drbd_keepintvl);
++	if (drbd_keepcnt) {
++		kernel_setsockopt(dsocket, SOL_TCP, TCP_KEEPCNT,
++				  (char *)&drbd_keepcnt, sizeof(drbd_keepcnt));
++	}
++	if (drbd_keepintvl) {
++		kernel_setsockopt(dsocket, SOL_TCP, TCP_KEEPINTVL,
++				  (char *)&drbd_keepintvl,
++				  sizeof(drbd_keepintvl));
++	}
+ 
+ 	write_lock_bh(&csocket->sk->sk_callback_lock);
+ 	tcp_transport->original_control_sk_state_change = csocket->sk->sk_state_change;
+@@ -1537,8 +1579,7 @@ static int dtt_send_page(struct drbd_tra
+ 	struct drbd_tcp_transport *tcp_transport =
+ 		container_of(transport, struct drbd_tcp_transport, transport);
+ 	struct socket *socket = tcp_transport->stream[stream];
+-	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL | MSG_SPLICE_PAGES };
+-	struct bio_vec bvec;
++	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL };
+ 	int len = size;
+ 	int err = -EIO;
+ 
+@@ -1549,10 +1590,8 @@ static int dtt_send_page(struct drbd_tra
+ 	do {
+ 		int sent;
+ 
+-		bvec_set_page(&bvec, page, len, offset);
+-		iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, len);
+-
+-		sent = sock_sendmsg(socket, &msg);
++		sent = socket->ops->sendpage(socket, page, offset, len,
++					     msg.msg_flags);
+ 		if (sent <= 0) {
+ 			if (sent == -EAGAIN) {
+ 				if (drbd_stream_send_timed_out(transport, stream))
+@@ -1612,10 +1651,18 @@ static bool dtt_hint(struct drbd_transpo
+ 
+ 	switch (hint) {
+ 	case CORK:
+-		tcp_sock_set_cork(socket->sk, true);
++		{
++			int val = 1;
++			(void)kernel_setsockopt(socket, SOL_TCP, TCP_CORK,
++						(char *)&val, sizeof(val));
++		}
+ 		break;
+ 	case UNCORK:
+-		tcp_sock_set_cork(socket->sk, false);
++		{
++			int val = 0;
++			(void)kernel_setsockopt(socket, SOL_TCP, TCP_CORK,
++						(char *)&val, sizeof(val));
++		}
+ 		break;
+ 	case NODELAY:
+ 		tcp_sock_set_nodelay(socket->sk);
+@@ -1625,7 +1672,11 @@ static bool dtt_hint(struct drbd_transpo
+ 			set_bit(SOCK_NOSPACE, &socket->sk->sk_socket->flags);
+ 		break;
+ 	case QUICKACK:
+-		tcp_sock_set_quickack(socket->sk, 2);
++		{
++			int val = 2;
++			(void)kernel_setsockopt(socket, SOL_TCP, TCP_QUICKACK,
++						(char *)&val, sizeof(val));
++		}
+ 		break;
+ 	default: /* not implemented, but should not trigger error handling */
+ 		return true;
+--- drbd_transport_rdma.c
++++ /tmp/cocci-output-524506-c6f692-drbd_transport_rdma.c
+@@ -21,6 +21,7 @@
+ #define SENDER_COMPACTS_BVECS 0
+ #endif
+ 
++#include "drbd_wrappers.h"
+ #include <linux/module.h>
+ #include <linux/sched/signal.h>
+ #include <linux/bio.h>
+@@ -29,6 +30,7 @@
+ #include <rdma/ib_cm.h>
+ #include <linux/interrupt.h>
+ #include <linux/drbd_genl_api.h>
++#include <linux/pfn_t.h>
+ #include "drbd_protocol.h"
+ #include "drbd_transport.h"
+ #include "linux/drbd_config.h" /* for REL_VERSION */
+@@ -368,7 +370,7 @@ static void dtr_control_timer_fn(struct
+ static void dtr_tx_timeout_work_fn(struct work_struct *work);
+ static void dtr_cma_connect_work_fn(struct work_struct *work);
+ static struct dtr_rx_desc *dtr_next_rx_desc(struct dtr_stream *rdma_stream);
+-static void dtr_control_tasklet_fn(struct tasklet_struct *t);
++static void dtr_control_tasklet_fn(unsigned long data);
+ static int dtr_init_listener(struct drbd_transport *transport, const struct sockaddr *addr,
+ 			     struct net *net, struct drbd_listener *drbd_listener);
+ static void dtr_destroy_listener(struct drbd_listener *generic_listener);
+@@ -470,7 +472,8 @@ static int dtr_init(struct drbd_transpor
+ 	for (i = DATA_STREAM; i <= CONTROL_STREAM ; i++)
+ 		dtr_init_stream(&rdma_transport->stream[i], transport);
+ 
+-	tasklet_setup(&rdma_transport->control_tasklet, dtr_control_tasklet_fn);
++	tasklet_init(&rdma_transport->control_tasklet, dtr_control_tasklet_fn,
++		     (unsigned long)rdma_transport);
+ 
+ 	return 0;
+ }
+@@ -518,7 +521,7 @@ static void dtr_free(struct drbd_transpo
+ 		}
+ 	}
+ 
+-	timer_delete_sync(&rdma_transport->control_timer);
++	del_timer_sync(&rdma_transport->control_timer);
+ 
+ 	if (free_op == DESTROY_TRANSPORT) {
+ 		list_for_each_entry(drbd_path, &transport->paths, list) {
+@@ -536,7 +539,7 @@ static void dtr_free(struct drbd_transpo
+ 
+ static void dtr_control_timer_fn(struct timer_list *t)
+ {
+-	struct dtr_transport *rdma_transport = timer_container_of(rdma_transport, t, control_timer);
++	struct dtr_transport *rdma_transport = from_timer(rdma_transport, t, control_timer);
+ 	struct drbd_transport *transport = &rdma_transport->transport;
+ 
+ 	drbd_control_event(transport, TIMEOUT);
+@@ -1567,9 +1570,9 @@ static int dtr_got_flow_control_msg(stru
+ 	return be32_to_cpu(msg->send_from_stream);
+ }
+ 
+-static void dtr_flow_control_tasklet_fn(struct tasklet_struct *t)
++static void dtr_flow_control_tasklet_fn(unsigned long data)
+ {
+-	struct dtr_path *path = from_tasklet(path, t, flow_control_tasklet);
++	struct dtr_path *path = (struct dtr_path *)data;
+ 
+ 	dtr_send_flow_control_msg(path, GFP_ATOMIC);
+ }
+@@ -1629,7 +1632,7 @@ out:
+ 
+ static void dtr_tx_timeout_fn(struct timer_list *t)
+ {
+-	struct dtr_cm *cm = timer_container_of(cm, t, tx_timeout);
++	struct dtr_cm *cm = from_timer(cm, t, tx_timeout);
+ 
+ 	/* cm->kref for armed timer becomes a ref for the work */
+ 	schedule_work(&cm->tx_timeout_work);
+@@ -1732,10 +1735,9 @@ static void __dtr_order_rx_descs_front(s
+ 	list_add(&rx_desc->list, &rdma_stream->rx_descs);
+ }
+ 
+-static void dtr_control_tasklet_fn(struct tasklet_struct *t)
++static void dtr_control_tasklet_fn(unsigned long data)
+ {
+-	struct dtr_transport *rdma_transport =
+-		from_tasklet(rdma_transport, t, control_tasklet);
++	struct dtr_transport *rdma_transport = (struct dtr_transport *)data;
+ 	struct dtr_stream *rdma_stream = &rdma_transport->stream[CONTROL_STREAM];
+ 	struct dtr_rx_desc *rx_desc, *tmp;
+ 	LIST_HEAD(rx_descs);
+@@ -1943,7 +1945,7 @@ static void dtr_tx_cqe_done(struct ib_cq
+ 	if (tx_desc)
+ 		dtr_free_tx_desc(cm, tx_desc);
+ 	if (atomic_dec_and_test(&cm->tx_descs_posted)) {
+-		bool was_active = timer_delete(&cm->tx_timeout);
++		bool was_active = del_timer(&cm->tx_timeout);
+ 
+ 		if (was_active)
+ 			kref_put(&cm->kref, dtr_destroy_cm);
+@@ -2240,7 +2242,7 @@ static int __dtr_post_tx_desc(struct dtr
+ 	err = ib_post_send(cm->id->qp, &send_wr, &send_wr_failed);
+ 	if (err) {
+ 		tr_err(&rdma_transport->transport, "ib_post_send() failed %d\n", err);
+-		was_active = timer_delete(&cm->tx_timeout);
++		was_active = del_timer(&cm->tx_timeout);
+ 		if (!was_active)
+ 			was_active = cancel_work_sync(&cm->tx_timeout_work);
+ 		if (was_active)
+@@ -2744,7 +2746,7 @@ static void __dtr_disconnect_path(struct
+ 				       HZ * 60);
+ 		if (t == 0)
+ 			tr_warn(transport, "passive_state still %d\n", atomic_read(&path->cs.passive_state));
+-		fallthrough;
++		;/* fallthrough */
+ 	case PCS_INACTIVE:
+ 		break;
+ 	}
+@@ -2756,14 +2758,14 @@ static void __dtr_disconnect_path(struct
+ 			atomic_set(&path->cs.active_state, PCS_INACTIVE);
+ 			break;
+ 		}
+-		fallthrough;
++		;/* fallthrough */
+ 	case PCS_REQUEST_ABORT:
+ 		t = wait_event_timeout(path->cs.wq,
+ 				       atomic_read(&path->cs.active_state) == PCS_INACTIVE,
+ 				       HZ * 60);
+ 		if (t == 0)
+ 			tr_warn(transport, "active_state still %d\n", atomic_read(&path->cs.active_state));
+-		fallthrough;
++		;/* fallthrough */
+ 	case PCS_INACTIVE:
+ 		break;
+ 	}
+@@ -3466,7 +3468,8 @@ static int dtr_add_path(struct drbd_path
+ 	atomic_set(&path->cs.passive_state, PCS_INACTIVE);
+ 	atomic_set(&path->cs.active_state, PCS_INACTIVE);
+ 	spin_lock_init(&path->send_flow_control_lock);
+-	tasklet_setup(&path->flow_control_tasklet, dtr_flow_control_tasklet_fn);
++	tasklet_init(&path->flow_control_tasklet, dtr_flow_control_tasklet_fn,
++		     (unsigned long)path);
+ 	INIT_WORK(&path->refill_rx_descs_work, dtr_refill_rx_descs_work_fn);
+ 	INIT_DELAYED_WORK(&path->cs.retry_connect_work, dtr_cma_retry_connect_work_fn);
+ 
+--- drbd_transport_lb-tcp.c
++++ /tmp/cocci-output-524506-23fe4c-drbd_transport_lb-tcp.c
+@@ -6,6 +6,7 @@
+  *
+  *  Copyright (C) 2014-2023, LINBIT HA-Solutions GmbH.
+  */
++#include "drbd_wrappers.h"
+ #include <linux/module.h>
+ #include <linux/errno.h>
+ #include <linux/socket.h>
+@@ -18,6 +19,7 @@
+ #include <linux/drbd_genl_api.h>
+ #include <linux/drbd_config.h>
+ #include <net/tcp.h>
++#include <linux/pfn_t.h>
+ #include "drbd_protocol.h"
+ #include "drbd_transport.h"
+ 
+@@ -235,7 +237,7 @@ static void dtl_free(struct drbd_transpo
+ 			drbd_path_event(transport, drbd_path);
+ 	}
+ 
+-	timer_delete_sync(&dtl_transport->control_timer);
++	del_timer_sync(&dtl_transport->control_timer);
+ 	cancel_delayed_work_sync(&dtl_transport->connect_work);
+ 
+ 	if (free_op == DESTROY_TRANSPORT) {
+@@ -463,7 +465,7 @@ dtl_recv(struct drbd_transport *transpor
+ static int
+ _dtl_recv_page(struct dtl_transport *dtl_transport, struct page *page, int size)
+ {
+-	void *data = kmap_local_page(page);
++	void *data = kmap(page);
+ 	void *pos = data;
+ 	struct dtl_flow *flow;
+ 	int err;
+@@ -482,7 +484,7 @@ _dtl_recv_page(struct dtl_transport *dtl
+ 	}
+ 	err = pos - data;
+ out:
+-	kunmap_local(data);
++	kunmap(data);
+ 	return err;
+ }
+ 
+@@ -628,7 +630,8 @@ dtl_try_connect(struct drbd_transport *t
+ 	 * a free one dynamically.
+ 	 */
+ 	what = "bind before connect";
+-	err = sock->ops->bind(sock, (struct sockaddr_unsized *) &my_addr, path->path.my_addr_len);
++	err = sock->ops->bind(sock, (struct sockaddr *) &my_addr,
++			      path->path.my_addr_len);
+ 	if (err < 0)
+ 		goto out;
+ 
+@@ -637,7 +640,7 @@ dtl_try_connect(struct drbd_transport *t
+ 	mutex_lock(&dtl_transport->connecting_socket_mutex);
+ 	dtl_transport->connecting_socket = sock;
+ 	mutex_unlock(&dtl_transport->connecting_socket_mutex);
+-	err = sock->ops->connect(sock, (struct sockaddr_unsized *) &peer_addr,
++	err = sock->ops->connect(sock, (struct sockaddr *) &peer_addr,
+ 				   path->path.peer_addr_len, 0);
+ 	mutex_lock(&dtl_transport->connecting_socket_mutex);
+ 	dtl_transport->connecting_socket = NULL;
+@@ -1033,7 +1036,7 @@ static void dtl_incoming_connection(stru
+ 
+ static void dtl_control_timer_fn(struct timer_list *t)
+ {
+-	struct dtl_transport *dtl_transport = timer_container_of(dtl_transport, t, control_timer);
++	struct dtl_transport *dtl_transport = from_timer(dtl_transport, t, control_timer);
+ 	struct drbd_transport *transport = &dtl_transport->transport;
+ 
+ 	drbd_control_event(transport, TIMEOUT);
+@@ -1089,7 +1092,8 @@ static int dtl_init_listener(struct drbd
+ 	addr_len = addr->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+ 		: sizeof(struct sockaddr_in);
+ 
+-	err = s_listen->ops->bind(s_listen, (struct sockaddr_unsized *)&my_addr, addr_len);
++	err = s_listen->ops->bind(s_listen, (struct sockaddr *)&my_addr,
++				  addr_len);
+ 	if (err < 0) {
+ 		what = "bind before listen";
+ 		goto out;
+@@ -1132,10 +1136,6 @@ static void dtl_setup_socket(struct dtl_
+ 	long timeout = HZ;
+ 
+ 	sock->sk->sk_reuse = SK_CAN_REUSE; /* SO_REUSEADDR */
+-	/* We are a block device, we are in the write-out path,
+-	 * we may need memory to facilitate memory reclaim
+-	 */
+-	sock->sk->sk_use_task_frag = false;
+ 	sock->sk->sk_allocation = GFP_ATOMIC;
+ 	sk_set_memalloc(sock->sk);
+ 
+@@ -1154,10 +1154,16 @@ static void dtl_setup_socket(struct dtl_
+ 	if (use_for_data) {
+ 		if (drbd_keepidle)
+ 			tcp_sock_set_keepidle(sock->sk, drbd_keepidle);
+-		if (drbd_keepcnt)
+-			tcp_sock_set_keepcnt(sock->sk, drbd_keepcnt);
+-		if (drbd_keepintvl)
+-			tcp_sock_set_keepintvl(sock->sk, drbd_keepintvl);
++		if (drbd_keepcnt) {
++			kernel_setsockopt(sock, SOL_TCP, TCP_KEEPCNT,
++					  (char *)&drbd_keepcnt,
++					  sizeof(drbd_keepcnt));
++		}
++		if (drbd_keepintvl) {
++			kernel_setsockopt(sock, SOL_TCP, TCP_KEEPINTVL,
++					  (char *)&drbd_keepintvl,
++					  sizeof(drbd_keepintvl));
++		}
+ 	}
+ 	flow->sock = sock;
+ }
+@@ -1456,7 +1462,7 @@ static int dtl_prepare_connect(struct dr
+ 	dtl_transport->connected_paths = 0;
+ 	dtl_transport->err = 0;
+ 	flush_signals(current);
+-	timer_delete_sync(&dtl_transport->control_timer);
++	del_timer_sync(&dtl_transport->control_timer);
+ 	dtl_transport->err = dtl_set_active(transport, true);
+ 
+ 	return dtl_transport->err;
+@@ -1660,20 +1666,17 @@ static int dtl_select_send_flow(struct d
+ static int _dtl_send_page(struct dtl_transport *dtl_transport, struct dtl_flow *flow,
+ 			  struct page *page, int offset, size_t size, unsigned int msg_flags)
+ {
+-	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL | MSG_SPLICE_PAGES };
++	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL };
+ 	struct drbd_transport *transport = &dtl_transport->transport;
+ 	struct socket *sock = flow->sock;
+-	struct bio_vec bvec;
+ 	int len = size;
+ 	int err = -EIO;
+ 
+ 	do {
+ 		int sent;
+ 
+-		bvec_set_page(&bvec, page, len, offset);
+-		iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, len);
+-
+-		sent = sock_sendmsg(sock, &msg);
++		sent = sock->ops->sendpage(sock, page, offset, len,
++					   msg.msg_flags);
+ 		if (sent <= 0) {
+ 			if (sent == -EAGAIN) {
+ 				if (drbd_stream_send_timed_out(transport, flow->stream_nr))
+@@ -1738,7 +1741,7 @@ static int dtl_bio_chunk_size_available(
+ 	while (chunk < wmem_available && iter_scan->bi_size) {
+ 		bvec = bio_iter_iovec(bio, *iter_scan);
+ 		chunk += bvec.bv_len;
+-		bio_advance_iter_single(bio, iter_scan, bvec.bv_len);
++		bio_advance_iter(bio, iter_scan, bvec.bv_len);
+ 	}
+ 
+ 	return chunk;
+@@ -1759,7 +1762,7 @@ static int dtl_send_bio_pages(struct dtl
+ 		if (err)
+ 			return err;
+ 		chunk -= bvec.bv_len;
+-		bio_advance_iter_single(bio, iter, bvec.bv_len);
++		bio_advance_iter(bio, iter, bvec.bv_len);
+ 	}
+ 
+ 	return 0;
+@@ -1828,10 +1831,22 @@ static bool dtl_hint(struct drbd_transpo
+ 
+ 		switch (hint) {
+ 		case CORK:
+-			tcp_sock_set_cork(sock->sk, true);
++			{
++				int val = 1;
++				(void)kernel_setsockopt(sock, SOL_TCP,
++							TCP_CORK,
++							(char *)&val,
++							sizeof(val));
++			}
+ 			break;
+ 		case UNCORK:
+-			tcp_sock_set_cork(sock->sk, false);
++			{
++				int val = 0;
++				(void)kernel_setsockopt(sock, SOL_TCP,
++							TCP_CORK,
++							(char *)&val,
++							sizeof(val));
++			}
+ 			break;
+ 		case NODELAY:
+ 			tcp_sock_set_nodelay(sock->sk);
+@@ -1841,7 +1856,13 @@ static bool dtl_hint(struct drbd_transpo
+ 				set_bit(SOCK_NOSPACE, &sock->sk->sk_socket->flags);
+ 			break;
+ 		case QUICKACK:
+-			tcp_sock_set_quickack(sock->sk, 2);
++			{
++				int val = 2;
++				(void)kernel_setsockopt(sock, SOL_TCP,
++							TCP_QUICKACK,
++							(char *)&val,
++							sizeof(val));
++			}
+ 			break;
+ 		}
+ 	}
+--- drbd_transport.c
++++ /tmp/cocci-output-524506-9d0049-drbd_transport.c
+@@ -1,9 +1,11 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+ 
++#include "drbd_wrappers.h"
+ #include <linux/spinlock.h>
+ #include <linux/module.h>
+ #include <net/ipv6.h>
++#include <linux/pfn_t.h>
+ #include "drbd_transport.h"
+ #include "drbd_int.h"
+ 
+--- drbd_state.c
++++ /tmp/cocci-output-524506-f06dda-drbd_state.c
+@@ -13,8 +13,10 @@
+ 
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/random.h>
+ #include <linux/jiffies.h>
++#include <linux/pfn_t.h>
+ #include "drbd_int.h"
+ #include "drbd_protocol.h"
+ #include "drbd_req.h"
+@@ -178,7 +180,7 @@ static bool may_be_up_to_date(struct drb
+ 		case D_DISKLESS:
+ 			if (!(peer_md->flags & MDF_PEER_DEVICE_SEEN))
+ 				continue;
+-			fallthrough;
++			;/* fallthrough */
+ 		case D_ATTACHING:
+ 		case D_DETACHING:
+ 		case D_FAILED:
+@@ -791,7 +793,7 @@ static struct after_state_change_work *a
+ 	if (test_bit(R_UNREGISTERED, &resource->flags))
+ 		return NULL;
+ 
+-	work = kmalloc_obj(*work, GFP_ATOMIC);
++	work = kmalloc(sizeof(*work), GFP_ATOMIC);
+ 	if (work) {
+ 		work->state_change = remember_state_change(resource, GFP_ATOMIC);
+ 		if (!work->state_change) {
+@@ -4460,7 +4462,7 @@ static int w_after_state_change(struct d
+ 					drbd_disk_str(device->disk_state[NOW]));
+ 
+ 			/* we may need to cancel the md_sync timer */
+-			timer_delete_sync(&device->md_sync_timer);
++			del_timer_sync(&device->md_sync_timer);
+ 
+ 			if (have_ldev)
+ 				send_new_state_to_all_peer_devices(state_change, n_device);
+@@ -4961,7 +4963,7 @@ long twopc_retry_timeout(struct drbd_res
+ 			retries = 5;
+ 		timeout = resource->res_opts.twopc_retry_timeout *
+ 			  HZ / 10 * connections * (1 << retries);
+-		timeout = get_random_u32_below(timeout);
++		timeout = (prandom_u32() % timeout);
+ 	}
+ 	return timeout;
+ }
+@@ -5202,7 +5204,7 @@ change_cluster_wide_state(bool (*change)
+ 	}
+ 
+ 	do
+-		reply->tid = get_random_u32();
++		reply->tid = prandom_u32();
+ 	while (!reply->tid);
+ 
+ 	clear_bit(TWOPC_RECV_SIZES_ERR, &resource->flags);
+@@ -5461,7 +5463,7 @@ retry:
+ 	*reply = (struct twopc_reply) { 0 };
+ 
+ 	do
+-		reply->tid = get_random_u32();
++		reply->tid = prandom_u32();
+ 	while (!reply->tid);
+ 
+ 	request.tid = reply->tid;
+--- drbd_sender.c
++++ /tmp/cocci-output-524506-2e0d11-drbd_sender.c
+@@ -11,6 +11,7 @@
+ 
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/drbd.h>
+ #include <linux/sched.h>
+ #include <linux/sched/signal.h>
+@@ -21,7 +22,6 @@
+ #include <linux/slab.h>
+ #include <linux/random.h>
+ #include <linux/overflow.h>
+-#include <linux/part_stat.h>
+ 
+ #include "drbd_int.h"
+ #include "drbd_protocol.h"
+@@ -323,7 +323,7 @@ void drbd_request_endio(struct bio *bio)
+ 
+ 	/* to avoid recursion in __req_mod */
+ 	if (unlikely(status)) {
+-		enum req_op op = bio_op(bio);
++		unsigned int op = bio_op(bio);
+ 		if (op == REQ_OP_DISCARD || op == REQ_OP_WRITE_ZEROES) {
+ 			if (status == BLK_STS_NOTSUPP)
+ 				what = DISCARD_COMPLETED_NOTSUPP;
+@@ -531,9 +531,9 @@ void drbd_csum_bio(struct crypto_shash *
+ 
+ 	bio_for_each_segment(bvec, bio, iter) {
+ 		u8 *src;
+-		src = bvec_kmap_local(&bvec);
++		src = kmap_atomic(bvec.bv_page) + bvec.bv_offset;
+ 		crypto_shash_update(desc, src, bvec.bv_len);
+-		kunmap_local(src);
++		kunmap_atomic(src);
+ 	}
+ 	crypto_shash_final(desc, digest);
+ 	shash_desc_zero(desc);
+@@ -774,7 +774,7 @@ bool drbd_any_flush_pending(struct drbd_
+ 
+ void resync_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_peer_device *peer_device = timer_container_of(peer_device, t, resync_timer);
++	struct drbd_peer_device *peer_device = from_timer(peer_device, t, resync_timer);
+ 
+ 	drbd_queue_work_if_unqueued(
+ 		&peer_device->connection->sender_work,
+@@ -814,7 +814,7 @@ struct fifo_buffer *fifo_alloc(unsigned
+ {
+ 	struct fifo_buffer *fb;
+ 
+-	fb = kzalloc_flex(*fb, values, fifo_size, GFP_NOIO);
++	fb = kzalloc(struct_size(fb, values, fifo_size), GFP_NOIO);
+ 	if (!fb)
+ 		return NULL;
+ 
+@@ -1759,7 +1759,7 @@ static void queue_resync_finished(struct
+ 	struct drbd_connection *connection = peer_device->connection;
+ 	struct resync_finished_work *rfw;
+ 
+-	rfw = kmalloc_obj(*rfw, GFP_ATOMIC);
++	rfw = kmalloc(sizeof(*rfw), GFP_ATOMIC);
+ 	if (!rfw) {
+ 		drbd_err(peer_device, "Warn failed to kmalloc(dw).\n");
+ 		return;
+@@ -2901,7 +2901,9 @@ void drbd_rs_controller_reset(struct drb
+ 	atomic_set(&peer_device->device->rs_sect_ev, 0);  /* FIXME: ??? */
+ 	peer_device->rs_last_mk_req_kt = ktime_get();
+ 	peer_device->rs_in_flight = 0;
+-	peer_device->rs_last_events = (int)part_stat_read_accum(disk->part0, sectors);
++	peer_device->rs_last_events = (int)part_stat_read(&disk->part0,
++							  sectors[0]) + (int)part_stat_read(&disk->part0,
++											    sectors[1]);
+ 
+ 	/* Updating the RCU protected object in place is necessary since
+ 	   this function gets called from atomic context.
+@@ -2916,7 +2918,7 @@ void drbd_rs_controller_reset(struct drb
+ 
+ void start_resync_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_peer_device *peer_device = timer_container_of(peer_device, t,
++	struct drbd_peer_device *peer_device = from_timer(peer_device, t,
+ 			start_resync_timer);
+ 	drbd_peer_device_post_work(peer_device, RS_START);
+ }
+--- drbd_req.c
++++ /tmp/cocci-output-524506-8eac35-drbd_req.c
+@@ -11,10 +11,12 @@
+ 
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/module.h>
+ 
+ #include <linux/slab.h>
+ #include <linux/drbd.h>
++#include <linux/pfn_t.h>
+ #include "drbd_int.h"
+ #include "drbd_req.h"
+ 
+@@ -140,7 +142,7 @@ int w_queue_peer_ack(struct drbd_work *w
+ 
+ 	list_for_each_entry_safe(req, tmp, &work_list, list) {
+ 		struct drbd_peer_ack *peer_ack =
+-			kzalloc_obj(struct drbd_peer_ack);
++			kzalloc(sizeof(struct drbd_peer_ack), GFP_KERNEL);
+ 
+ 		peer_ack->resource = resource;
+ 		INIT_LIST_HEAD(&peer_ack->list);
+@@ -1172,7 +1174,7 @@ void __req_mod(struct drbd_request *req,
+ 	case READ_COMPLETED_WITH_ERROR:
+ 		drbd_set_all_out_of_sync(device, req->i.sector, req->i.size);
+ 		drbd_report_io_error(device, req);
+-		fallthrough;
++		;/* fallthrough */
+ 	case READ_AHEAD_COMPLETED_WITH_ERROR:
+ 		mod_rq_state(req, m, peer_device, RQ_LOCAL_PENDING, RQ_LOCAL_COMPLETED);
+ 		break;
+@@ -1317,7 +1319,7 @@ void __req_mod(struct drbd_request *req,
+ 		spin_lock_irqsave(&req->rq_lock, flags);
+ 		req->net_rq_state[idx] |= RQ_NET_SIS;
+ 		spin_unlock_irqrestore(&req->rq_lock, flags);
+-		fallthrough;
++		;/* fallthrough */
+ 	case WRITE_ACKED_BY_PEER:
+ 		/* Normal operation protocol C: successfully written on peer.
+ 		 * During resync, even in protocol != C,
+@@ -1500,7 +1502,7 @@ static bool remote_due_to_read_balancing
+ 		/* originally, this used the bdi congestion framework,
+ 		 * but that was removed in linux 5.18.
+ 		 * so just never report the lower device as congested. */
+-		return false;
++		return bdi_read_congested(device->ldev->backing_bdev->bd_disk->queue->backing_dev_info);
+ 	case RB_LEAST_PENDING:
+ 		return atomic_read(&device->local_cnt) >
+ 			atomic_read(&peer_device->ap_pending_cnt) + atomic_read(&peer_device->rs_pending_cnt);
+@@ -1838,7 +1840,7 @@ drbd_submit_req_private_bio(struct drbd_
+ 		} else if (bio_op(bio) == REQ_OP_DISCARD) {
+ 			drbd_process_discard_or_zeroes_req(req, EE_TRIM);
+ 		} else {
+-			submit_bio_noacct(bio);
++			generic_make_request(bio);
+ 		}
+ 		put_ldev(device);
+ 	} else {
+@@ -1896,7 +1898,8 @@ drbd_request_prepare(struct drbd_device
+ 	req->start_jif = bio_start_io_acct(req->master_bio);
+ 
+ 	if (get_ldev(device)) {
+-		req->private_bio = bio_alloc_clone(device->ldev->backing_bdev, bio, GFP_NOIO, &drbd_io_bio_set);
++		req->private_bio = bio_clone_fast(bio, GFP_NOIO,
++						  &drbd_io_bio_set);
+ 		if (!req->private_bio) {
+ 			drbd_err(device, "could not bio_alloc_clone() req->private_bio\n");
+ 			kfree(req);
+@@ -2736,9 +2739,9 @@ static bool request_size_bad(struct drbd
+  *                                           v
+  *                                   Request state machine
+  */
+-void drbd_submit_bio(struct bio *bio)
++blk_qc_t drbd_make_request(struct request_queue *q, struct bio *bio)
+ {
+-	struct drbd_device *device = bio->bi_bdev->bd_disk->private_data;
++	struct drbd_device *device = bio->bi_disk->private_data;
+ #ifdef CONFIG_DRBD_TIMING_STATS
+ 	ktime_t start_kt;
+ #endif
+@@ -2747,17 +2750,15 @@ void drbd_submit_bio(struct bio *bio)
+ 	if (drbd_reject_write_early(device, bio)) {
+ 		bio->bi_status = BLK_STS_IOERR;
+ 		bio_endio(bio);
+-		return;
++		return BLK_QC_T_NONE;
+ 	}
+ 
+-	bio = bio_split_to_limits(bio);
+-	if (!bio)
+-		return;
++	blk_queue_split(bio->bi_disk->queue, &bio);
+ 
+ 	if (device->cached_err_io || request_size_bad(device, bio)) {
+ 		bio->bi_status = BLK_STS_IOERR;
+ 		bio_endio(bio);
+-		return;
++		return BLK_QC_T_NONE;
+ 	}
+ 
+ 	/* This is both an optimization: READ of size 0, nothing to do
+@@ -2769,13 +2770,14 @@ void drbd_submit_bio(struct bio *bio)
+ 	if (bio_op(bio) == REQ_OP_READ && bio->bi_iter.bi_size == 0) {
+ 		WARN_ONCE(1, "size zero read from upper layers");
+ 		bio_endio(bio);
+-		return;
++		return BLK_QC_T_NONE;
+ 	}
+ 
+ 	ktime_get_accounting(start_kt);
+ 	start_jif = jiffies;
+ 
+ 	__drbd_make_request(device, bio, start_kt, start_jif);
++	return BLK_QC_T_NONE;
+ }
+ 
+ static unsigned long time_min_in_future(unsigned long now,
+@@ -2876,7 +2878,7 @@ static bool net_timeout_reached(struct d
+ 
+ void request_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_device *device = timer_container_of(device, t, request_timer);
++	struct drbd_device *device = from_timer(device, t, request_timer);
+ 	struct drbd_resource *resource = device->resource;
+ 	struct drbd_connection *connection;
+ 	struct drbd_request *req_read, *req_write;
+@@ -3051,7 +3053,7 @@ void drbd_handle_io_error_(struct drbd_d
+ 			}
+ 			break;
+ 		}
+-		fallthrough;	/* for DRBD_META_IO_ERROR or DRBD_FORCE_DETACH */
++		;/* fallthrough */	/* for DRBD_META_IO_ERROR or DRBD_FORCE_DETACH */
+ 	case EP_DETACH:
+ 	case EP_CALL_HELPER:
+ 		/* Force-detach is not really an IO error, but rather a
+--- drbd_receiver.c
++++ /tmp/cocci-output-524506-8acd0b-drbd_receiver.c
+@@ -10,6 +10,7 @@
+ 
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <net/sock.h>
+ 
+ #include <linux/bio.h>
+@@ -26,7 +27,6 @@
+ #include <linux/vmalloc.h>
+ #include <linux/random.h>
+ #include <net/ipv6.h>
+-#include <linux/part_stat.h>
+ 
+ #include "drbd_int.h"
+ #include "drbd_protocol.h"
+@@ -259,6 +259,11 @@ enum rcv_timeou_kind {
+ 	PING_TIMEOUT,
+ 	REGULAR_TIMEOUT,
+ };
++#include <linux/mempool.h>
++static inline bool mempool_is_saturated(mempool_t *pool)
++{
++	return READ_ONCE(pool->curr_nr) >= pool->min_nr;
++}
+ 
+ int drbd_do_features(struct drbd_connection *connection);
+ int drbd_do_auth(struct drbd_connection *connection);
+@@ -733,7 +738,7 @@ void wait_initial_states_received(struct
+ 
+ void connect_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_connection *connection = timer_container_of(connection, t, connect_timer);
++	struct drbd_connection *connection = from_timer(connection, t, connect_timer);
+ 
+ 	drbd_queue_work(&connection->sender_work, &connection->connect_timer_work);
+ }
+@@ -1259,9 +1264,8 @@ static void one_flush_endio(struct bio *
+ 
+ static void submit_one_flush(struct drbd_device *device, struct issue_flush_context *ctx)
+ {
+-	struct bio *bio = bio_alloc(device->ldev->backing_bdev, 0,
+-			REQ_OP_WRITE | REQ_PREFLUSH, GFP_NOIO);
+-	struct one_flush_context *octx = kmalloc_obj(*octx, GFP_NOIO);
++	struct bio *bio = bio_alloc(GFP_NOIO, 0);
++	struct one_flush_context *octx = kmalloc(sizeof(*octx), GFP_NOIO);
+ 
+ 	if (!octx) {
+ 		drbd_warn(device, "Could not allocate a octx, CANNOT ISSUE FLUSH\n");
+@@ -1279,12 +1283,14 @@ static void submit_one_flush(struct drbd
+ 
+ 	octx->device = device;
+ 	octx->ctx = ctx;
++	bio_set_dev(bio, device->ldev->backing_bdev);
+ 	bio->bi_private = octx;
+ 	bio->bi_end_io = one_flush_endio;
+ 
+ 	device->flush_jif = jiffies;
+ 	set_bit(FLUSH_PENDING, &device->flags);
+ 	atomic_inc(&ctx->pending);
++	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
+ 	submit_bio(bio);
+ }
+ 
+@@ -1514,7 +1520,7 @@ static enum finish_epoch drbd_may_finish
+ 
+ 	if (schedule_flush) {
+ 		struct flush_work *fw;
+-		fw = kmalloc_obj(*fw, GFP_ATOMIC);
++		fw = kmalloc(sizeof(*fw), GFP_ATOMIC);
+ 		if (fw) {
+ 			fw->w.cb = w_flush;
+ 			fw->epoch = epoch;
+@@ -1627,7 +1633,8 @@ int drbd_issue_discard_or_zero_out(struc
+ 	granularity = max(q->limits.discard_granularity >> 9, 1U);
+ 	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+ 
+-	max_discard_sectors = min(bdev_max_discard_sectors(bdev), (1U << 22));
++	max_discard_sectors = min(bdev_get_queue(bdev)->limits.max_discard_sectors,
++				  (1U << 22));
+ 	max_discard_sectors -= max_discard_sectors % granularity;
+ 	if (unlikely(!max_discard_sectors))
+ 		goto zero_out;
+@@ -1651,7 +1658,8 @@ int drbd_issue_discard_or_zero_out(struc
+ 		start = tmp;
+ 	}
+ 	while (nr_sectors >= max_discard_sectors) {
+-		err |= blkdev_issue_discard(bdev, start, max_discard_sectors, GFP_NOIO);
++		err |= blkdev_issue_discard(bdev, start, max_discard_sectors,
++					    GFP_NOIO, 0);
+ 		nr_sectors -= max_discard_sectors;
+ 		start += max_discard_sectors;
+ 	}
+@@ -1663,7 +1671,8 @@ int drbd_issue_discard_or_zero_out(struc
+ 		nr = nr_sectors;
+ 		nr -= (unsigned int)nr % granularity;
+ 		if (nr) {
+-			err |= blkdev_issue_discard(bdev, start, nr, GFP_NOIO);
++			err |= blkdev_issue_discard(bdev, start, nr, GFP_NOIO,
++						    0);
+ 			nr_sectors -= nr;
+ 			start += nr;
+ 		}
+@@ -1681,7 +1690,7 @@ static bool can_do_reliable_discards(str
+ 	struct disk_conf *dc;
+ 	bool can_do;
+ 
+-	if (!bdev_max_discard_sectors(device->ldev->backing_bdev))
++	if (!bdev_get_queue(device->ldev->backing_bdev)->limits.max_discard_sectors)
+ 		return false;
+ 
+ 	rcu_read_lock();
+@@ -1793,17 +1802,18 @@ next_bio:
+ 	 * bio because bio_add_page may be able to merge consecutive pages into
+ 	 * one bio_vec.
+ 	 */
+-	bio_nr_iovecs = bio_max_segs(nr_pages);
++	bio_nr_iovecs = min(nr_pages, (unsigned int) BIO_MAX_PAGES);
+ 
+ 	/* we special case some flags in the multi-bio case, see below
+ 	 * (REQ_PREFLUSH, or BIO_RW_BARRIER in older kernels) */
+ 	/* ldev_safe: a peer_req has a ldev reference */
+-	bio = bio_alloc(device->ldev->backing_bdev, bio_nr_iovecs, peer_req->opf,
+-			GFP_NOIO);
++	bio = bio_alloc(GFP_NOIO, bio_nr_iovecs);
++	bio_set_dev(bio, device->ldev->backing_bdev);
+ 	/* > peer_req->i.sector, unless this is the first bio */
+ 	bio->bi_iter.bi_sector = sector;
+ 	bio->bi_private = peer_req;
+ 	bio->bi_end_io = drbd_peer_request_endio;
++	bio->bi_opf = peer_req->opf;
+ 
+ 	bio->bi_next = bios;
+ 	bios = bio;
+@@ -1928,7 +1938,7 @@ int w_e_reissue(struct drbd_work *w, int
+ 		drbd_queue_work(&connection->sender_work,
+ 				&peer_req->w);
+ 		/* retry later */
+-		fallthrough;
++		;/* fallthrough */
+ 	case 0:
+ 		/* keep worker happy and connection up */
+ 		return 0;
+@@ -2015,7 +2025,7 @@ static int receive_Barrier(struct drbd_c
+ 
+ 	/* receiver context, in the writeout path of the other node.
+ 	 * avoid potential distributed deadlock */
+-	epoch = kzalloc_obj(struct drbd_epoch, GFP_NOIO);
++	epoch = kzalloc(sizeof(struct drbd_epoch), GFP_NOIO);
+ 	if (!epoch) {
+ 		drbd_warn(connection, "Allocation of an epoch failed, slowing down\n");
+ 		issue_flush = !test_and_set_bit(DE_BARRIER_IN_NEXT_EPOCH_ISSUED, &connection->current_epoch->flags);
+@@ -2193,10 +2203,10 @@ static int recv_dless_read(struct drbd_p
+ 	D_ASSERT(peer_device->device, sector == bio->bi_iter.bi_sector);
+ 
+ 	bio_for_each_segment(bvec, bio, iter) {
+-		void *mapped = bvec_kmap_local(&bvec);
++		void *mapped = kmap(bvec.bv_page) + bvec.bv_offset;
+ 		expect = min_t(int, data_size, bvec.bv_len);
+ 		err = drbd_recv_into(peer_device->connection, mapped, expect);
+-		kunmap_local(mapped);
++		kunmap(bvec.bv_page);
+ 		if (err)
+ 			return err;
+ 		data_size -= expect;
+@@ -2353,7 +2363,7 @@ void drbd_queue_update_peers(struct drbd
+ 	struct drbd_device *device = peer_device->device;
+ 	struct update_peers_work *upw;
+ 
+-	upw = kmalloc_obj(*upw, GFP_ATOMIC | __GFP_NOWARN);
++	upw = kmalloc(sizeof(*upw), GFP_ATOMIC | __GFP_NOWARN);
+ 	if (upw) {
+ 		upw->sector_start = sector_start;
+ 		upw->sector_end = sector_end;
+@@ -2972,7 +2982,7 @@ static int wait_for_and_update_peer_seq(
+ 	return ret;
+ }
+ 
+-static enum req_op wire_flags_to_bio_op(u32 dpf)
++static unsigned int wire_flags_to_bio_op(u32 dpf)
+ {
+ 	if (dpf & DP_ZEROES)
+ 		return REQ_OP_WRITE_ZEROES;
+@@ -2982,9 +2992,9 @@ static enum req_op wire_flags_to_bio_op(
+ }
+ 
+ /* see also bio_flags_to_wire() */
+-static blk_opf_t wire_flags_to_bio(struct drbd_connection *connection, u32 dpf)
++static unsigned int wire_flags_to_bio(struct drbd_connection *connection, u32 dpf)
+ {
+-	blk_opf_t opf = wire_flags_to_bio_op(dpf) |
++	unsigned int opf = wire_flags_to_bio_op(dpf) |
+ 		(dpf & DP_RW_SYNC ? REQ_SYNC : 0);
+ 
+ 	/* we used to communicate one bit only in older DRBD */
+@@ -3529,7 +3539,8 @@ bool drbd_rs_c_min_rate_throttle(struct
+ 	if (c_min_rate == 0)
+ 		return false;
+ 
+-	curr_events = (int)part_stat_read_accum(disk->part0, sectors)
++	curr_events = (int)part_stat_read(&disk->part0, sectors[0]) + (int)part_stat_read(&disk->part0,
++											  sectors[1])
+ 		- atomic_read(&device->rs_sect_ev);
+ 
+ 	if (atomic_read(&device->ap_actlog_cnt) || curr_events - peer_device->rs_last_events > 64) {
+@@ -3879,7 +3890,7 @@ static int receive_common_data_request(s
+ 			case P_OV_DAGTAG_REQ:
+ 				drbd_verify_skipped_block(peer_device, sector, size);
+ 				verify_progress(peer_device, sector, size);
+-				fallthrough;
++				;/* fallthrough */
+ 			case P_RS_DATA_REQUEST:
+ 			case P_RS_DAGTAG_REQ:
+ 			case P_CSUM_RS_REQUEST:
+@@ -3907,7 +3918,7 @@ static int receive_common_data_request(s
+ 		   then we would do something smarter here than reading
+ 		   the block... */
+ 		peer_req->flags |= EE_RS_THIN_REQ;
+-		fallthrough;
++		;/* fallthrough */
+ 	case P_RS_DATA_REQUEST:
+ 	case P_RS_DAGTAG_REQ:
+ 		peer_req->i.type = INTERVAL_RESYNC_READ;
+@@ -4234,7 +4245,7 @@ static enum sync_strategy drbd_asb_recov
+ 			rv = SYNC_SOURCE_USE_BITMAP;
+ 			break;
+ 		}
+-		fallthrough;	/* to one of the other strategies */
++		;/* fallthrough */	/* to one of the other strategies */
+ 	case ASB_DISCARD_OLDER_PRI:
+ 		if (self == 0 && peer == 1) {
+ 			rv = SYNC_SOURCE_USE_BITMAP;
+@@ -4246,7 +4257,7 @@ static enum sync_strategy drbd_asb_recov
+ 		}
+ 		drbd_warn(peer_device, "Discard younger/older primary did not find a decision\n"
+ 			  "Using discard-least-changes instead\n");
+-		fallthrough;
++		;/* fallthrough */
+ 	case ASB_DISCARD_ZERO_CHG:
+ 		if (ch_peer == 0 && ch_self == 0) {
+ 			rv = test_bit(RESOLVE_CONFLICTS, &peer_device->connection->transport.flags)
+@@ -4264,7 +4275,7 @@ static enum sync_strategy drbd_asb_recov
+ 		}
+ 		if (after_sb_0p == ASB_DISCARD_ZERO_CHG)
+ 			break;
+-		fallthrough;
++		;/* fallthrough */
+ 	case ASB_DISCARD_LEAST_CHG:
+ 		if	(ch_self < ch_peer)
+ 			rv = SYNC_TARGET_USE_BITMAP;
+@@ -5384,7 +5395,7 @@ static enum sync_strategy drbd_attach_ha
+ 		switch (rr_conflict) {
+ 		case ASB_CALL_HELPER:
+ 			drbd_maybe_khelper(device, connection, "pri-lost");
+-			fallthrough;
++			;/* fallthrough */
+ 		case ASB_DISCONNECT:
+ 		case ASB_RETRY_CONNECT:
+ 			drbd_err(peer_device,
+@@ -5590,7 +5601,7 @@ static enum sync_strategy drbd_sync_hand
+ 		switch (rr_conflict) {
+ 		case ASB_CALL_HELPER:
+ 			drbd_maybe_khelper(device, connection, "pri-lost");
+-			fallthrough;
++			;/* fallthrough */
+ 		case ASB_DISCONNECT:
+ 		case ASB_RETRY_CONNECT:
+ 			drbd_err(peer_device, "I shall become SyncTarget, but I am primary!\n");
+@@ -5780,7 +5791,7 @@ static int receive_protocol(struct drbd_
+ 		}
+ 	}
+ 
+-	new_net_conf = kmalloc_obj(struct net_conf);
++	new_net_conf = kmalloc(sizeof(struct net_conf), GFP_KERNEL);
+ 	if (!new_net_conf)
+ 		goto disconnect;
+ 
+@@ -5814,7 +5825,7 @@ static int receive_protocol(struct drbd_
+ 		drbd_info(connection, "peer data-integrity-alg: %s\n",
+ 			  integrity_alg[0] ? integrity_alg : "(none)");
+ 
+-	kvfree_rcu_mightsleep(old_net_conf);
++	kvfree_rcu(old_net_conf);
+ 	return 0;
+ 
+ disconnect_rcu_unlock:
+@@ -5977,7 +5988,8 @@ static int receive_SyncParam(struct drbd
+ 		}
+ 
+ 		if (verify_tfm || csums_tfm) {
+-			new_net_conf = kzalloc_obj(struct net_conf);
++			new_net_conf = kzalloc(sizeof(struct net_conf),
++					       GFP_KERNEL);
+ 			if (!new_net_conf)
+ 				goto disconnect;
+ 
+@@ -6260,7 +6272,8 @@ static int receive_sizes(struct drbd_con
+ 		if (my_usize != p_usize) {
+ 			struct disk_conf *old_disk_conf, *new_disk_conf;
+ 
+-			new_disk_conf = kzalloc_obj(struct disk_conf);
++			new_disk_conf = kzalloc(sizeof(struct disk_conf),
++						GFP_KERNEL);
+ 			if (!new_disk_conf) {
+ 				err = -ENOMEM;
+ 				goto out;
+@@ -6271,7 +6284,7 @@ static int receive_sizes(struct drbd_con
+ 			new_disk_conf->disk_size = p_usize;
+ 
+ 			rcu_assign_pointer(device->ldev->disk_conf, new_disk_conf);
+-			kvfree_rcu_mightsleep(old_disk_conf);
++			kvfree_rcu(old_disk_conf);
+ 
+ 			drbd_info(peer_device, "Peer sets u_size to %llu sectors (old: %llu)\n",
+ 				 (unsigned long long)p_usize, (unsigned long long)my_usize);
+@@ -7257,7 +7270,7 @@ static void drbd_abort_twopc(struct drbd
+ 
+ void twopc_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_resource *resource = timer_container_of(resource, t, twopc_timer);
++	struct drbd_resource *resource = from_timer(resource, t, twopc_timer);
+ 	unsigned long irq_flags;
+ 
+ 	write_lock_irqsave(&resource->state_rwlock, irq_flags);
+@@ -7592,7 +7605,7 @@ drbd_commit_size_change(struct drbd_devi
+ 		drbd_info(device, "New u_size %llu sectors\n",
+ 			  (unsigned long long)tr->user_size);
+ 
+-		new_disk_conf = kzalloc_obj(struct disk_conf);
++		new_disk_conf = kzalloc(sizeof(struct disk_conf), GFP_KERNEL);
+ 		if (!new_disk_conf) {
+ 			device->ldev->disk_conf->disk_size = tr->user_size;
+ 			goto cont;
+@@ -7603,7 +7616,7 @@ drbd_commit_size_change(struct drbd_devi
+ 		new_disk_conf->disk_size = tr->user_size;
+ 
+ 		rcu_assign_pointer(device->ldev->disk_conf, new_disk_conf);
+-		kvfree_rcu_mightsleep(old_disk_conf);
++		kvfree_rcu(old_disk_conf);
+ 	}
+ cont:
+ 	dd = drbd_determine_dev_size(device, tr->new_size, tr->dds_flags | DDSF_2PC, rs);
+@@ -8048,7 +8061,7 @@ retry:
+ 				drbd_err(resource, "FATAL: Local commit of prepared %u failed! \n",
+ 					 reply->tid);
+ 
+-			timer_delete(&resource->twopc_timer);
++			del_timer(&resource->twopc_timer);
+ 		}
+ 
+ 		nested_twopc_request(resource, &request);
+@@ -9591,8 +9604,8 @@ void drbd_process_rs_discards(struct drb
+ 		 * than DRBD_MAX_RS_DISCARD_SIZE, then allow merging up to a size of
+ 		 * DRBD_MAX_RS_DISCARD_SIZE.
+ 		 */
+-		align = max(DRBD_MAX_RS_DISCARD_SIZE, bdev_discard_granularity(
+-					device->ldev->backing_bdev)) >> SECTOR_SHIFT;
++		align = max(DRBD_MAX_RS_DISCARD_SIZE,
++			    (device->ldev->backing_bdev->bd_disk->queue->limits.discard_granularity ? : 512)) >> SECTOR_SHIFT;
+ 		put_ldev(device);
+ 	}
+ 
+@@ -9910,9 +9923,9 @@ static void cleanup_resync_leftovers(str
+ 	peer_device->rs_failed = 0;
+ 	D_ASSERT(peer_device, atomic_read(&peer_device->rs_pending_cnt) == 0);
+ 
+-	timer_delete_sync(&peer_device->resync_timer);
++	del_timer_sync(&peer_device->resync_timer);
+ 	resync_timer_fn(&peer_device->resync_timer);
+-	timer_delete_sync(&peer_device->start_resync_timer);
++	del_timer_sync(&peer_device->start_resync_timer);
+ }
+ 
+ static void free_waiting_resync_requests(struct drbd_connection *connection)
+@@ -10166,7 +10179,7 @@ static void cleanup_remote_state_change(
+ 		drbd_info(connection, "Aborting %s state change %u commit not possible\n",
+ 			  remote ? "remote" : "local", reply->tid);
+ 		if (remote) {
+-			timer_delete(&resource->twopc_timer);
++			del_timer(&resource->twopc_timer);
+ 			__clear_remote_state_change(resource);
+ 		} else {
+ 			enum alt_rv alt_rv = abort_local_transaction(connection, 0);
+@@ -10405,7 +10418,7 @@ static void conn_disconnect(struct drbd_
+ 	atomic_set(&connection->current_epoch->epoch_size, 0);
+ 	connection->send.seen_any_write_yet = false;
+ 	connection->send.current_dagtag_sector =
+-		resource->dagtag_sector - ((BIO_MAX_VECS << PAGE_SHIFT) >> SECTOR_SHIFT) - 1;
++		resource->dagtag_sector - ((BIO_MAX_PAGES << PAGE_SHIFT) >> SECTOR_SHIFT) - 1;
+ 	connection->current_epoch->oldest_unconfirmed_peer_req = NULL;
+ 
+ 	/* Indicate that last_dagtag_sector may no longer be up-to-date. We
+@@ -10715,7 +10728,7 @@ int drbd_do_auth(struct drbd_connection
+ 		goto fail;
+ 	}
+ 
+-	peers_ch = kmalloc_obj(*peers_ch, GFP_NOIO);
++	peers_ch = kmalloc(sizeof(*peers_ch), GFP_NOIO);
+ 	if (!peers_ch) {
+ 		rv = -1;
+ 		goto fail;
+--- drbd_proc.c
++++ /tmp/cocci-output-524506-d19f98-drbd_proc.c
+@@ -11,8 +11,10 @@
+ 
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
++#include <linux/pfn_t.h>
+ #include "drbd_int.h"
+ #include "drbd_transport.h"
+ #include "drbd_legacy_84.h"
+--- drbd_nla.c
++++ /tmp/cocci-output-524506-434fd4-drbd_nla.c
+@@ -1,7 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++#include "drbd_wrappers.h"
+ #include <linux/kernel.h>
+ #include <net/netlink.h>
+ #include <linux/drbd_genl_api.h>
++#include <linux/pfn_t.h>
+ #include "drbd_nla.h"
+ 
+ static int drbd_nla_check_mandatory(int maxtype, struct nlattr *nla)
+--- drbd_nl.c
++++ /tmp/cocci-output-524506-1c49ce-drbd_nl.c
+@@ -13,6 +13,7 @@
+ 
+ #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+ 
++#include "drbd_wrappers.h"
+ #include <linux/module.h>
+ #include <linux/drbd.h>
+ #include <linux/in.h>
+@@ -86,6 +87,7 @@ static int drbd_adm_get_initial_state_do
+ #include <linux/drbd_genl_api.h>
+ #include "drbd_nla.h"
+ #include <linux/genl_magic_func.h>
++#include <linux/pfn_t.h>
+ 
+ void drbd_enable_netns(void)
+ {
+@@ -205,7 +207,7 @@ static struct drbd_path *first_path(stru
+ static int drbd_adm_prepare(struct drbd_config_context *adm_ctx,
+ 	struct sk_buff *skb, struct genl_info *info, unsigned flags)
+ {
+-	struct drbd_genlmsghdr *d_in = genl_info_userhdr(info);
++	struct drbd_genlmsghdr *d_in = info->userhdr;
+ 	const u8 cmd = info->genlhdr->cmd;
+ 	int err;
+ 
+@@ -1592,7 +1594,8 @@ void drbd_set_my_capacity(struct drbd_de
+ {
+ 	char ppb[10];
+ 
+-	set_capacity_and_notify(device->vdisk, size);
++	set_capacity(device->vdisk, size);
++	revalidate_disk_size(device->vdisk, false);
+ 
+ 	drbd_info(device, "size = %s (%llu KB)\n",
+ 		ppsize(ppb, size>>1), (unsigned long long)size>>1);
+@@ -1662,7 +1665,7 @@ drbd_determine_dev_size(struct drbd_devi
+ 	 * Clear the timer, to avoid scary "timer expired!" messages,
+ 	 * "Superblock" is written out at least twice below, anyways.
+ 	 */
+-	timer_delete(&device->md_sync_timer);
++	del_timer(&device->md_sync_timer);
+ 
+ 	if (rs) {
+ 		/* rs is non NULL if we should change the AL layout only */
+@@ -2063,7 +2066,7 @@ static unsigned int drbd_max_discard_sec
+ static bool drbd_discard_supported(struct drbd_device *device,
+ 		struct drbd_backing_dev *bdev)
+ {
+-	if (bdev && !bdev_max_discard_sectors(bdev->backing_bdev))
++	if (bdev && !bdev_get_queue(bdev->backing_bdev)->limits.max_discard_sectors)
+ 		return false;
+ 
+ 	if (!(common_connection_features(device->resource) & DRBD_FF_TRIM)) {
+@@ -2089,7 +2092,7 @@ static void get_common_queue_limits(stru
+ 	common_limits->physical_block_size = device->device_conf.block_size;
+ 	common_limits->logical_block_size = device->device_conf.block_size;
+ 	common_limits->io_min = device->device_conf.block_size;
+-	common_limits->max_hw_zone_append_sectors = 0;
++	common_limits->max_zone_append_sectors = 0;
+ 
+ 	rcu_read_lock();
+ 	for_each_peer_device_rcu(peer_device, device) {
+@@ -2109,13 +2112,25 @@ static void get_common_queue_limits(stru
+ 	rcu_read_unlock();
+ }
+ 
++static void fixup_discard_if_not_supported(struct request_queue *q)
++{
++	/* To avoid confusion, if this queue does not support discard, clear
++	 * max_discard_sectors, which is what lsblk -D reports to the user.
++	 * Older kernels got this wrong in "stack limits".
++	 * */
++	if (!blk_queue_discard(q)) {
++		blk_queue_max_discard_sectors(q, 0);
++		q->limits.discard_granularity = 0;
++	}
++}
++
+ void drbd_reconsider_queue_parameters(struct drbd_device *device, struct drbd_backing_dev *bdev)
+ {
+ 	struct request_queue * const q = device->rq_queue;
+ 	struct queue_limits lim;
+ 	struct request_queue *b = NULL;
+ 
+-	lim = queue_limits_start_update(q);
++	lim = q->limits;
+ 	get_common_queue_limits(&lim, device);
+ 
+ 	/*
+@@ -2128,32 +2143,17 @@ void drbd_reconsider_queue_parameters(st
+ 	if (drbd_discard_supported(device, bdev)) {
+ 		lim.discard_granularity = 512;
+ 		lim.max_hw_discard_sectors = drbd_max_discard_sectors(device->resource);
++		blk_queue_flag_set(QUEUE_FLAG_DISCARD, q);
+ 	} else {
+ 		lim.discard_granularity = 0;
+ 		lim.max_hw_discard_sectors = 0;
++		blk_queue_flag_clear(QUEUE_FLAG_DISCARD, q);
+ 	}
+ 
+ 	if (bdev) {
+ 		b = bdev->backing_bdev->bd_disk->queue;
+ 		blk_stack_limits(&lim, &b->limits, 0);
+-		/*
+-		 * blk_set_stacking_limits() cleared the features, and
+-		 * blk_stack_limits() may or may not have inherited
+-		 * BLK_FEAT_STABLE_WRITES from the backing device.
+-		 *
+-		 * DRBD always requires stable writes because:
+-		 * 1. The same bio data is read for both local disk I/O and
+-		 *    network transmission. If the page changes mid-flight,
+-		 *    the local and remote copies could diverge.
+-		 * 2. When data integrity is enabled, DRBD calculates a
+-		 *    checksum before sending the data. If the page changes
+-		 *    between checksum calculation and transmission, the
+-		 *    receiver will detect a checksum mismatch.
+-		 */
+-		lim.features |= BLK_FEAT_STABLE_WRITES;
+ 	} else {
+-		lim.features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA |
+-			       BLK_FEAT_ROTATIONAL | BLK_FEAT_STABLE_WRITES;
+ 	}
+ 
+ 	/*
+@@ -2165,7 +2165,6 @@ void drbd_reconsider_queue_parameters(st
+ 		lim.max_write_zeroes_sectors = DRBD_MAX_BBIO_SECTORS;
+ 	else
+ 		lim.max_write_zeroes_sectors = 0;
+-	lim.max_hw_wzeroes_unmap_sectors = 0;
+ 
+ 	if ((lim.discard_granularity >> SECTOR_SHIFT) >
+ 	    lim.max_hw_discard_sectors) {
+@@ -2178,8 +2177,14 @@ void drbd_reconsider_queue_parameters(st
+ 		lim.max_hw_discard_sectors = 0;
+ 	}
+ 
+-	if (queue_limits_commit_update(q, &lim))
+-		drbd_err(device, "setting new queue limits failed\n");
++	q->limits = lim;
++	blk_queue_max_hw_sectors(q, lim.max_hw_sectors);
++	blk_queue_max_write_same_sectors(q, 0);
++	blk_queue_max_discard_sectors(q, lim.max_hw_discard_sectors);
++	if (bdev) {
++		blk_queue_update_readahead(q);
++	}
++	fixup_discard_if_not_supported(q);
+ }
+ 
+ /* Make sure IO is suspended before calling this function(). */
+@@ -2221,7 +2226,7 @@ static void drbd_try_suspend_al(struct d
+ 
+ static bool should_set_defaults(struct genl_info *info)
+ {
+-	unsigned int flags = ((struct drbd_genlmsghdr *)genl_info_userhdr(info))->flags;
++	unsigned int flags = ((struct drbd_genlmsghdr *) info->userhdr)->flags;
+ 	return 0 != (flags & DRBD_GENL_F_SET_DEFAULTS);
+ }
+ 
+@@ -2270,7 +2275,7 @@ static void sanitize_disk_conf(struct dr
+ 	if (disk_conf->al_extents > drbd_al_extents_max(nbc))
+ 		disk_conf->al_extents = drbd_al_extents_max(nbc);
+ 
+-	if (!bdev_max_discard_sectors(bdev)) {
++	if (!bdev_get_queue(bdev)->limits.max_discard_sectors) {
+ 		if (disk_conf->rs_discard_granularity) {
+ 			disk_conf->rs_discard_granularity = 0; /* disable feature */
+ 			drbd_info(device, "rs_discard_granularity feature disabled\n");
+@@ -2288,8 +2293,8 @@ static void sanitize_disk_conf(struct dr
+ 	if (disk_conf->rs_discard_granularity) {
+ 		unsigned int new_discard_granularity =
+ 			disk_conf->rs_discard_granularity;
+-		unsigned int discard_sectors = bdev_max_discard_sectors(bdev);
+-		unsigned int discard_granularity = bdev_discard_granularity(bdev);
++		unsigned int discard_sectors = bdev_get_queue(bdev)->limits.max_discard_sectors;
++		unsigned int discard_granularity = (bdev->bd_disk->queue->limits.discard_granularity ? : 512);
+ 
+ 		/* should be at least the discard_granularity of the bdev,
+ 		 * and preferably a multiple (or the backend won't be able to
+@@ -2459,7 +2464,7 @@ static int drbd_adm_disk_opts(struct sk_
+ 		goto out;
+ 	}
+ 
+-	new_disk_conf = kmalloc_obj(struct disk_conf);
++	new_disk_conf = kmalloc(sizeof(struct disk_conf), GFP_KERNEL);
+ 	if (!new_disk_conf) {
+ 		retcode = ERR_NOMEM;
+ 		goto fail;
+@@ -2524,7 +2529,7 @@ static int drbd_adm_disk_opts(struct sk_
+ 			drbd_send_sync_param(peer_device);
+ 	}
+ 
+-	kvfree_rcu_mightsleep(old_disk_conf);
++	kvfree_rcu(old_disk_conf);
+ 	mod_timer(&device->request_timer, jiffies + HZ);
+ 	goto success;
+ 
+@@ -2754,13 +2759,13 @@ bool want_bitmap(struct drbd_peer_device
+ }
+ 
+ static void close_backing_dev(struct drbd_device *device,
+-		struct file *bdev_file, bool do_bd_unlink)
++		struct block_device *bdev, bool do_bd_unlink)
+ {
+-	if (!bdev_file)
++	if (!bdev)
+ 		return;
+ 	if (do_bd_unlink)
+-		bd_unlink_disk_holder(file_bdev(bdev_file), device->vdisk);
+-	fput(bdev_file);
++		bd_unlink_disk_holder(bdev, device->vdisk);
++	blkdev_put(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+ }
+ 
+ void drbd_backing_dev_free(struct drbd_device *device, struct drbd_backing_dev *ldev)
+@@ -2771,33 +2776,32 @@ void drbd_backing_dev_free(struct drbd_d
+ 	drbd_dax_close(ldev);
+ 
+ 	close_backing_dev(device,
+-			  ldev->f_md_bdev,
++			  ldev->md_bdev,
+ 			  ldev->md_bdev != ldev->backing_bdev);
+-	close_backing_dev(device, ldev->backing_bdev_file, true);
++	close_backing_dev(device, ldev->backing_bdev, true);
+ 
+ 	kfree(ldev->disk_conf);
+ 	kfree(ldev);
+ }
+ 
+-static struct file *open_backing_dev(struct drbd_device *device,
++static struct block_device *open_backing_dev(struct drbd_device *device,
+ 		const char *bdev_path, void *claim_ptr)
+ {
+-	struct file *file = bdev_file_open_by_path(bdev_path,
+-				  BLK_OPEN_READ | BLK_OPEN_WRITE,
+-				  claim_ptr, NULL);
+-	if (IS_ERR(file)) {
++	struct block_device *bdev = blkdev_get_by_path(bdev_path,
++				  FMODE_READ | FMODE_WRITE | FMODE_EXCL,
++				  claim_ptr);
++	if (IS_ERR(bdev)) {
+ 		drbd_err(device, "open(\"%s\") failed with %ld\n",
+-				bdev_path, PTR_ERR(file));
++				bdev_path, PTR_ERR(bdev));
+ 	}
+-	return file;
++	return bdev;
+ }
+ 
+ static int link_backing_dev(struct drbd_device *device,
+-		const char *bdev_path, struct file *file)
++		const char *bdev_path, struct block_device *bdev)
+ {
+-	int err = bd_link_disk_holder(file_bdev(file), device->vdisk);
++	int err = bd_link_disk_holder(bdev, device->vdisk);
+ 	if (err) {
+-		fput(file);
+ 		drbd_err(device, "bd_link_disk_holder(\"%s\", ...) failed with %d\n",
+ 				bdev_path, err);
+ 	}
+@@ -2808,22 +2812,21 @@ static int open_backing_devices(struct d
+ 		struct disk_conf *new_disk_conf,
+ 		struct drbd_backing_dev *nbc)
+ {
+-	struct file *file;
++	struct block_device *bdev;
+ 	void *meta_claim_ptr;
+ 	int err;
+ 
+-	file = open_backing_dev(device, new_disk_conf->backing_dev, device);
+-	if (IS_ERR(file))
++	bdev = open_backing_dev(device, new_disk_conf->backing_dev, device);
++	if (IS_ERR(bdev))
+ 		return ERR_OPEN_DISK;
+ 
+-	err = link_backing_dev(device, new_disk_conf->backing_dev, file);
++	err = link_backing_dev(device, new_disk_conf->backing_dev, bdev);
+ 	if (err) {
+ 		/* close without unlinking; otherwise error path will try to unlink */
+-		close_backing_dev(device, file, false);
++		close_backing_dev(device, bdev, false);
+ 		return ERR_OPEN_DISK;
+ 	}
+-	nbc->backing_bdev = file_bdev(file);
+-	nbc->backing_bdev_file = file;
++	nbc->backing_bdev = bdev;
+ 
+ 	/* meta_claim_ptr: device, if claimed exclusively; shared drbd_m_holder,
+ 	 * if potentially shared with other drbd minors
+@@ -2838,23 +2841,23 @@ static int open_backing_devices(struct d
+ 	 * should check it for you already; but if you don't, or
+ 	 * someone fooled it, we need to double check here)
+ 	 */
+-	file = open_backing_dev(device, new_disk_conf->meta_dev, meta_claim_ptr);
+-	if (IS_ERR(file))
++	bdev = open_backing_dev(device, new_disk_conf->meta_dev, meta_claim_ptr);
++	if (IS_ERR(bdev))
+ 		return ERR_OPEN_MD_DISK;
+ 
+ 	/* avoid double bd_claim_by_disk() for the same (source,target) tuple,
+ 	 * as would happen with internal metadata. */
+-	if (file_bdev(file) != nbc->backing_bdev) {
+-		err = link_backing_dev(device, new_disk_conf->meta_dev, file);
++	if (bdev != nbc->backing_bdev) {
++		err = link_backing_dev(device, new_disk_conf->meta_dev,
++				       bdev);
+ 		if (err) {
+ 			/* close without unlinking; otherwise error path will try to unlink */
+-			close_backing_dev(device, file, false);
++			close_backing_dev(device, bdev, false);
+ 			return ERR_OPEN_MD_DISK;
+ 		}
+ 	}
+ 
+-	nbc->md_bdev = file_bdev(file);
+-	nbc->f_md_bdev = file;
++	nbc->md_bdev = bdev;
+ 	return NO_ERROR;
+ }
+ 
+@@ -3229,14 +3232,14 @@ static int drbd_adm_attach(struct sk_buf
+ 	}
+ 
+ 	/* allocation not in the IO path, drbdsetup context */
+-	nbc = kzalloc_obj(struct drbd_backing_dev);
++	nbc = kzalloc(sizeof(struct drbd_backing_dev), GFP_KERNEL);
+ 	if (!nbc) {
+ 		retcode = ERR_NOMEM;
+ 		goto fail;
+ 	}
+ 	spin_lock_init(&nbc->md.uuid_lock);
+ 
+-	new_disk_conf = kzalloc_obj(struct disk_conf);
++	new_disk_conf = kzalloc(sizeof(struct disk_conf), GFP_KERNEL);
+ 	if (!new_disk_conf) {
+ 		retcode = ERR_NOMEM;
+ 		goto fail;
+@@ -4095,7 +4098,7 @@ static int drbd_adm_net_opts(struct sk_b
+ 		goto out_no_adm_mutex;
+ 	}
+ 
+-	new_net_conf = kzalloc_obj(struct net_conf);
++	new_net_conf = kzalloc(sizeof(struct net_conf), GFP_KERNEL);
+ 	if (!new_net_conf) {
+ 		retcode = ERR_NOMEM;
+ 		goto out;
+@@ -4188,7 +4191,7 @@ static int drbd_adm_net_opts(struct sk_b
+ 
+ 	mutex_unlock(&connection->mutex[DATA_STREAM]);
+ 	mutex_unlock(&connection->resource->conf_update);
+-	kvfree_rcu_mightsleep(old_net_conf);
++	kvfree_rcu(old_net_conf);
+ 
+ 	if (connection->cstate[NOW] >= C_CONNECTED) {
+ 		struct drbd_peer_device *peer_device;
+@@ -4261,7 +4264,8 @@ static int drbd_adm_peer_device_opts(str
+ 	}
+ 	mutex_lock(&adm_ctx.resource->conf_update);
+ 
+-	new_peer_device_conf = kzalloc_obj(struct peer_device_conf);
++	new_peer_device_conf = kzalloc(sizeof(struct peer_device_conf),
++				       GFP_KERNEL);
+ 	if (!new_peer_device_conf)
+ 		goto fail;
+ 
+@@ -4324,7 +4328,7 @@ static int drbd_adm_peer_device_opts(str
+ 
+ 	rcu_assign_pointer(peer_device->conf, new_peer_device_conf);
+ 
+-	kvfree_rcu_mightsleep(old_peer_device_conf);
++	kvfree_rcu(old_peer_device_conf);
+ 	kfree(old_plan);
+ 
+ 	/* No need to call drbd_send_sync_param() here. The values in
+@@ -4352,7 +4356,7 @@ int drbd_create_peer_device_default_conf
+ 	struct peer_device_conf *conf;
+ 	int err;
+ 
+-	conf = kzalloc_obj(*conf);
++	conf = kzalloc(sizeof(*conf), GFP_KERNEL);
+ 	if (!conf)
+ 		return -ENOMEM;
+ 
+@@ -4505,7 +4509,7 @@ static int adm_new_connection(struct drb
+ 	struct drbd_transport *transport;
+ 
+ 	/* allocation not in the IO path, drbdsetup / netlink process context */
+-	new_net_conf = kzalloc_obj(*new_net_conf);
++	new_net_conf = kzalloc(sizeof(*new_net_conf), GFP_KERNEL);
+ 	if (!new_net_conf)
+ 		return ERR_NOMEM;
+ 
+@@ -5288,7 +5292,7 @@ sector_t drbd_local_max_size(struct drbd
+ 	struct drbd_backing_dev *tmp_bdev;
+ 	sector_t s;
+ 
+-	tmp_bdev = kmalloc_obj(struct drbd_backing_dev, GFP_ATOMIC);
++	tmp_bdev = kmalloc(sizeof(struct drbd_backing_dev), GFP_ATOMIC);
+ 	if (!tmp_bdev)
+ 		return 0;
+ 
+@@ -5401,7 +5405,7 @@ static int drbd_adm_resize(struct sk_buf
+ 	u_size = rcu_dereference(device->ldev->disk_conf)->disk_size;
+ 	rcu_read_unlock();
+ 	if (u_size != (sector_t)rs.resize_size) {
+-		new_disk_conf = kmalloc_obj(struct disk_conf);
++		new_disk_conf = kmalloc(sizeof(struct disk_conf), GFP_KERNEL);
+ 		if (!new_disk_conf) {
+ 			retcode = ERR_NOMEM;
+ 			goto fail_ldev;
+@@ -5440,7 +5444,7 @@ static int drbd_adm_resize(struct sk_buf
+ 		new_disk_conf->disk_size = (sector_t)rs.resize_size;
+ 		rcu_assign_pointer(device->ldev->disk_conf, new_disk_conf);
+ 		mutex_unlock(&device->resource->conf_update);
+-		kvfree_rcu_mightsleep(old_disk_conf);
++		kvfree_rcu(old_disk_conf);
+ 		new_disk_conf = NULL;
+ 	}
+ 
+@@ -6109,7 +6113,8 @@ static void device_to_statistics(struct
+ 		/* originally, this used the bdi congestion framework,
+ 		 * but that was removed in linux 5.18.
+ 		 * so just never report the lower device as congested. */
+-		s->dev_lower_blocked = false;
++		s->dev_lower_blocked = bdi_congested(device->ldev->backing_bdev->bd_disk->queue->backing_dev_info,
++						     (1 << WB_async_congested) | (1 << WB_sync_congested));
+ 		put_ldev(device);
+ 	}
+ 	s->dev_size = get_capacity(device->vdisk);
+@@ -7139,7 +7144,7 @@ out_no_unlock:
+ static int drbd_adm_new_minor(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct drbd_config_context adm_ctx;
+-	struct drbd_genlmsghdr *dh = genl_info_userhdr(info);
++	struct drbd_genlmsghdr *dh = info->userhdr;
+ 	struct device_conf device_conf;
+ 	struct drbd_resource *resource;
+ 	struct drbd_device *device;
+@@ -7313,8 +7318,8 @@ static int adm_del_resource(struct drbd_
+ 		kref_debug_put(&resource->kref_debug, 11);
+ 		kref_put(&resource->kref, drbd_destroy_resource);
+ 	}
+-	timer_shutdown_sync(&resource->twopc_timer);
+-	timer_shutdown_sync(&resource->peer_ack_timer);
++	del_timer_sync(&resource->twopc_timer);
++	del_timer_sync(&resource->peer_ack_timer);
+ 	call_rcu(&resource->rcu, drbd_reclaim_resource);
+ 
+ 	mutex_lock(&notification_mutex);
+@@ -8072,7 +8077,7 @@ static int drbd_adm_rename_resource(stru
+ 	}
+ 	old_res_name = resource->name;
+ 	resource->name = new_res_name;
+-	kvfree_rcu_mightsleep(old_res_name);
++	kvfree_rcu(old_res_name);
+ 
+ 	drbd_debugfs_resource_rename(resource, new_res_name);
+ 
+--- drbd_main.c
++++ /tmp/cocci-output-524506-f27bf0-drbd_main.c
+@@ -16,6 +16,7 @@
+ 
+ #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+ 
++#include "drbd_wrappers.h"
+ #include <linux/module.h>
+ #include <linux/jiffies.h>
+ #include <linux/drbd.h>
+@@ -50,8 +51,8 @@
+ #include "drbd_legacy_84.h"
+ #include "drbd_dax_pmem.h"
+ 
+-static int drbd_open(struct gendisk *gd, blk_mode_t mode);
+-static void drbd_release(struct gendisk *gd);
++static int drbd_open(struct block_device *bdev, fmode_t mode);
++static void drbd_release(struct gendisk *gd, fmode_t mode);
+ static void md_sync_timer_fn(struct timer_list *t);
+ static int w_bitmap_io(struct drbd_work *w, int unused);
+ static int flush_send_buffer(struct drbd_connection *connection, enum drbd_stream drbd_stream);
+@@ -71,6 +72,7 @@ MODULE_ALIAS_BLOCKDEV_MAJOR(DRBD_MAJOR);
+ MODULE_SOFTDEP("post: handshake");
+ 
+ #include <linux/moduleparam.h>
++#include <linux/vermagic.h>
+ 
+ #ifdef CONFIG_DRBD_FAULT_INJECTION
+ int drbd_enable_faults;
+@@ -187,7 +189,6 @@ struct bio_set drbd_io_bio_set;
+ 
+ static const struct block_device_operations drbd_ops = {
+ 	.owner		= THIS_MODULE,
+-	.submit_bio	= drbd_submit_bio,
+ 	.open		= drbd_open,
+ 	.release	= drbd_release,
+ };
+@@ -681,7 +682,7 @@ int drbd_thread_start(struct drbd_thread
+ 			drbd_info(connection, "Restarting %s thread\n", thi->name);
+ 		else
+ 			drbd_info(resource, "Restarting %s thread\n", thi->name);
+-		fallthrough;
++		;/* fallthrough */
+ 	case RUNNING:
+ 	case RESTARTING:
+ 	default:
+@@ -1643,7 +1644,7 @@ int drbd_send_sizes(struct drbd_peer_dev
+ 			cpu_to_be32(bdev_alignment_offset(bdev));
+ 		p->qlim->io_min = cpu_to_be32(bdev_io_min(bdev));
+ 		p->qlim->io_opt = cpu_to_be32(bdev_io_opt(bdev));
+-		p->qlim->discard_enabled = !!bdev_max_discard_sectors(bdev);
++		p->qlim->discard_enabled = !!bdev_get_queue(bdev)->limits.max_discard_sectors;
+ 		p->qlim->write_same_capable = 0;
+ 		put_ldev(device);
+ 	} else {
+@@ -2456,7 +2457,7 @@ int drbd_send_dblock(struct drbd_peer_de
+ 	int digest_size = 0;
+ 	int err;
+ 	const unsigned s = req->net_rq_state[peer_device->node_id];
+-	const enum req_op op = bio_op(req->master_bio);
++	const unsigned int op = bio_op(req->master_bio);
+ 
+ 	if (op == REQ_OP_DISCARD || op == REQ_OP_WRITE_ZEROES) {
+ 		trim = drbd_prepare_command(peer_device, sizeof(*trim), DATA_STREAM);
+@@ -2771,7 +2772,7 @@ enum ioc_rv {
+  * If we are already Primary, or already have an open count != 0,
+  * we don't need to wait, it won't change anything.
+  */
+-static enum ioc_rv inc_open_count(struct drbd_device *device, blk_mode_t mode)
++static enum ioc_rv inc_open_count(struct drbd_device *device, fmode_t mode)
+ {
+ 	struct drbd_resource *resource = device->resource;
+ 	enum ioc_rv r;
+@@ -2784,15 +2785,15 @@ static enum ioc_rv inc_open_count(struct
+ 		r = IOC_ABORT;
+ 	else if (resource->remote_state_change &&
+ 		resource->role[NOW] != R_PRIMARY &&
+-		(device->open_cnt == 0 || mode & BLK_OPEN_WRITE)) {
+-		if (mode & BLK_OPEN_NDELAY)
++		(device->open_cnt == 0 || mode & FMODE_WRITE)) {
++		if (mode & FMODE_NDELAY)
+ 			r = IOC_ABORT;
+ 		else
+ 			r = IOC_SLEEP;
+ 	} else {
+ 		r = IOC_OK;
+ 		device->open_cnt++;
+-		if (mode & BLK_OPEN_WRITE)
++		if (mode & FMODE_WRITE)
+ 			device->writable = true;
+ 	}
+ 	read_unlock_irq(&resource->state_rwlock);
+@@ -2846,7 +2847,7 @@ static void add_opener(struct drbd_devic
+ 		resource->auto_promoted_by.opened = now;
+ 		get_task_comm(resource->auto_promoted_by.comm, current);
+ 	}
+-	opener = kmalloc_obj(*opener, GFP_NOIO);
++	opener = kmalloc(sizeof(*opener), GFP_NOIO);
+ 	if (!opener)
+ 		return;
+ 	get_task_comm(opener->comm, current);
+@@ -2867,9 +2868,9 @@ out:
+ 	spin_unlock(&device->openers_lock);
+ }
+ 
+-static int drbd_open(struct gendisk *gd, blk_mode_t mode)
++static int drbd_open(struct block_device *bdev, fmode_t mode)
+ {
+-	struct drbd_device *device = gd->private_data;
++	struct drbd_device *device = bdev->bd_disk->private_data;
+ 	struct drbd_resource *resource = device->resource;
+ 	long timeout = resource->res_opts.auto_promote_timeout * HZ / 10;
+ 	enum drbd_state_rv rv = SS_UNKNOWN_ERROR;
+@@ -2878,7 +2879,7 @@ static int drbd_open(struct gendisk *gd,
+ 	int err = 0;
+ 
+ 	/* Fail read-only open from systemd-udev (version <= 238) */
+-	if (!(mode & BLK_OPEN_WRITE) && !drbd_allow_oos) {
++	if (!(mode & FMODE_WRITE) && !drbd_allow_oos) {
+ 		char comm[TASK_COMM_LEN];
+ 		get_task_comm(comm, current);
+ 		if (!strcmp("systemd-udevd", comm))
+@@ -2887,12 +2888,24 @@ static int drbd_open(struct gendisk *gd,
+ 
+ 	/* Fail read-write open early,
+ 	 * in case someone explicitly set us read-only (blockdev --setro) */
+-	if (bdev_read_only(gd->part0) && (mode & BLK_OPEN_WRITE))
++	if (bdev_read_only(bdev) && (mode & FMODE_WRITE))
+ 		return -EACCES;
+ 
+ 	if (resource->fail_io[NOW])
+ 		return -ENOTRECOVERABLE;
+ 
++	/*
++	 * Older kernels sometimes fail to clear TIF_SIGPENDING when returning
++	 * from drbd_open() with -ERESTARTSYS. The kernel calls into drbd_open()
++	 * with TIF_SIGPENDING still set. recalc_sigpending() clears
++	 * TIF_SIGPENDING if it is no longer accurate.
++	 */
++	if (signal_pending(current)) {
++		spin_lock_irq(&current->sighand->siglock);
++		recalc_sigpending();
++		spin_unlock_irq(&current->sighand->siglock);
++	}
++
+ 	kref_get(&device->kref);
+ 	kref_debug_get(&device->kref_debug, 3);
+ 
+@@ -2916,14 +2929,15 @@ static int drbd_open(struct gendisk *gd,
+ 		   This avoids split brain when the drbd volume gets opened
+ 		   temporarily by udev while it scans for PV signatures. */
+ 
+-		if (mode & BLK_OPEN_WRITE) {
++		if (mode & FMODE_WRITE) {
+ 			if (resource->role[NOW] == R_SECONDARY) {
+-				rv = try_to_promote(device, timeout, (mode & BLK_OPEN_NDELAY));
++				rv = try_to_promote(device, timeout,
++						    (mode & FMODE_NDELAY));
+ 				if (rv < SS_SUCCESS)
+ 					drbd_info(resource, "Auto-promote failed: %s (%d)\n",
+ 						  drbd_set_st_err_str(rv), rv);
+ 			}
+-		} else if ((mode & BLK_OPEN_NDELAY) == 0) {
++		} else if ((mode & FMODE_NDELAY) == 0) {
+ 			/* Double check peers
+ 			 *
+ 			 * Some services may try to first open ro, and only if that
+@@ -2943,14 +2957,14 @@ static int drbd_open(struct gendisk *gd,
+ 			}
+ 		}
+ 	} else if (resource->role[NOW] != R_PRIMARY &&
+-			!(mode & BLK_OPEN_WRITE) && !drbd_allow_oos) {
++			!(mode & FMODE_WRITE) && !drbd_allow_oos) {
+ 		err = -EMEDIUMTYPE;
+ 		goto out;
+ 	}
+ 
+ 	if (test_bit(UNREGISTERED, &device->flags)) {
+ 		err = -ENODEV;
+-	} else if (mode & BLK_OPEN_WRITE) {
++	} else if (mode & FMODE_WRITE) {
+ 		if (resource->role[NOW] != R_PRIMARY)
+ 			err = rv == SS_INTERRUPTED ? -ERESTARTSYS : -EROFS;
+ 	} else /* READ access only */ {
+@@ -2974,8 +2988,8 @@ out:
+ 
+ 	mutex_unlock(&resource->open_release);
+ 	if (err) {
+-		drbd_release(gd);
+-		if (err == -EAGAIN && !(mode & BLK_OPEN_NDELAY))
++		drbd_release(bdev->bd_disk, 0);
++		if (err == -EAGAIN && !(mode & FMODE_NDELAY))
+ 			err = -EMEDIUMTYPE;
+ 	}
+ 
+@@ -3024,7 +3038,10 @@ static void drbd_fsync_device(struct drb
+ {
+ 	struct drbd_resource *resource = device->resource;
+ 
+-	sync_blockdev(device->vdisk->part0);
++	struct block_device *bdev = bdget_disk(device->vdisk, 0);
++	if (bdev)
++		sync_blockdev(bdev);
++	bdput(bdev);
+ 	/* Prevent writes occurring after demotion, at least
+ 	 * the writes already submitted in this context. This
+ 	 * covers the case where DRBD auto-demotes on release,
+@@ -3056,7 +3073,7 @@ static void drbd_fsync_device(struct drb
+ 	drbd_flush_peer_acks(resource);
+ }
+ 
+-static void drbd_release(struct gendisk *gd)
++static void drbd_release(struct gendisk *gd, fmode_t mode)
+ {
+ 	struct drbd_device *device = gd->private_data;
+ 	struct drbd_resource *resource = device->resource;
+@@ -3551,6 +3568,61 @@ static void drbd_cleanup(void)
+ 
+ 	pr_info("module cleanup done.\n");
+ }
++/**
++  * drbd_congested() - Callback for the flusher thread
++  * @congested_data:	User data
++  * @bdi_bits:		Bits the BDI flusher thread is currently interested in
++  *
++  * Returns 1<<WB_async_congested and/or 1<<WB_sync_congested if we are congested.
++  */
++static int drbd_congested(void *congested_data, int bdi_bits) {
++	struct drbd_device *device = congested_data;
++	struct request_queue *q;
++	int r = 0;
++
++	if (!may_inc_ap_bio(device)) {
++		/* DRBD has frozen IO */
++		r = bdi_bits;
++		goto out;
++	}
++
++	if (test_bit(CALLBACK_PENDING, &device->resource->flags)) {
++		r |= (1 << WB_async_congested);
++		/* Without good local data, we would need to read from remote,
++ 		 * and that would need the worker thread as well, which is
++ 		 * currently blocked waiting for that usermode helper to
++ 		 * finish.
++ 		 */
++		if (!get_ldev_if_state(device, D_UP_TO_DATE))
++			r |= (1 << WB_sync_congested);
++		else
++			put_ldev(device);
++		r &= bdi_bits;
++		goto out;
++	}
++
++	if (get_ldev(device)) {
++		q = bdev_get_queue(device->ldev->backing_bdev);
++		r = bdi_congested(q->backing_dev_info, bdi_bits);
++		put_ldev(device);
++	}
++
++	if (bdi_bits & (1 << WB_async_congested)) {
++		struct drbd_peer_device *peer_device;
++
++		rcu_read_lock();
++		for_each_peer_device_rcu (peer_device, device) {
++			if (test_bit(NET_CONGESTED, &peer_device->connection->transport.flags)) {
++				r |= (1 << WB_async_congested);
++				break;
++			}
++		}
++		rcu_read_unlock();
++	}
++
++out:
++	return r;
++}
+ 
+ static void drbd_init_workqueue(struct drbd_work_queue* wq)
+ {
+@@ -3675,7 +3747,7 @@ void drbd_flush_peer_acks(struct drbd_re
+ 
+ static void peer_ack_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_resource *resource = timer_container_of(resource, t, peer_ack_timer);
++	struct drbd_resource *resource = from_timer(resource, t, peer_ack_timer);
+ 
+ 	drbd_flush_peer_acks(resource);
+ }
+@@ -3790,7 +3862,7 @@ struct drbd_resource *drbd_create_resour
+ {
+ 	struct drbd_resource *resource;
+ 
+-	resource = kzalloc_obj(struct drbd_resource);
++	resource = kzalloc(sizeof(struct drbd_resource), GFP_KERNEL);
+ 	if (!resource)
+ 		goto fail;
+ 	resource->name = kstrdup(name, GFP_KERNEL);
+@@ -3875,7 +3947,8 @@ struct drbd_connection *drbd_create_conn
+ 	if (drbd_alloc_send_buffers(connection))
+ 		goto fail;
+ 
+-	connection->current_epoch = kzalloc_obj(struct drbd_epoch);
++	connection->current_epoch = kzalloc(sizeof(struct drbd_epoch),
++					    GFP_KERNEL);
+ 	if (!connection->current_epoch)
+ 		goto fail;
+ 
+@@ -3892,7 +3965,7 @@ struct drbd_connection *drbd_create_conn
+ 	connection->send.current_epoch_nr = 0;
+ 	connection->send.current_epoch_writes = 0;
+ 	connection->send.current_dagtag_sector =
+-		resource->dagtag_sector - ((BIO_MAX_VECS << PAGE_SHIFT) >> SECTOR_SHIFT) - 1;
++		resource->dagtag_sector - ((BIO_MAX_PAGES << PAGE_SHIFT) >> SECTOR_SHIFT) - 1;
+ 
+ 	connection->cstate[NOW] = C_STANDALONE;
+ 	connection->peer_role[NOW] = R_UNKNOWN;
+@@ -4039,7 +4112,7 @@ struct drbd_peer_device *create_peer_dev
+ 	struct drbd_peer_device *peer_device;
+ 	int err;
+ 
+-	peer_device = kzalloc_obj(struct drbd_peer_device);
++	peer_device = kzalloc(sizeof(struct drbd_peer_device), GFP_KERNEL);
+ 	if (!peer_device)
+ 		return NULL;
+ 
+@@ -4142,6 +4215,7 @@ enum drbd_ret_code drbd_create_device(st
+ 	struct drbd_resource *resource = adm_ctx->resource;
+ 	struct drbd_connection *connection;
+ 	struct drbd_device *device;
++	struct request_queue *q;
+ 	struct drbd_peer_device *peer_device, *tmp_peer_device;
+ 	struct gendisk *disk;
+ 	LIST_HEAD(peer_devices);
+@@ -4158,7 +4232,7 @@ enum drbd_ret_code drbd_create_device(st
+ 		return ERR_MINOR_OR_VOLUME_EXISTS;
+ 
+ 	/* GFP_KERNEL, we are outside of all write-out paths */
+-	device = kzalloc_obj(struct drbd_device);
++	device = kzalloc(sizeof(struct drbd_device), GFP_KERNEL);
+ 	if (!device)
+ 		return ERR_NOMEM;
+ 	kref_init(&device->kref);
+@@ -4212,24 +4286,31 @@ enum drbd_ret_code drbd_create_device(st
+ 
+ 	init_rwsem(&device->uuid_sem);
+ 
+-	disk = blk_alloc_disk(NULL, NUMA_NO_NODE);
+-	if (IS_ERR(disk)) {
+-		err = PTR_ERR(disk);
++	q = blk_alloc_queue_rh(drbd_make_request, NUMA_NO_NODE);
++	if (!q) {
++		goto out_no_q;
++	}
++	device->rq_queue = q;
++	disk = alloc_disk(1);
++	if (!disk) {
+ 		goto out_no_disk;
+ 	}
+ 
+ 	INIT_WORK(&device->ldev_destroy_work, drbd_ldev_destroy);
+ 
+ 	device->vdisk = disk;
+-	device->rq_queue = disk->queue;
+ 
+ 	disk->major = DRBD_MAJOR;
+ 	disk->first_minor = minor;
+-	disk->minors = 1;
++	disk->queue = q;
+ 	disk->fops = &drbd_ops;
+-	disk->flags |= GENHD_FL_NO_PART;
++	disk->flags |= GENHD_FL_NO_PART_SCAN;
+ 	sprintf(disk->disk_name, "drbd%d", minor);
+ 	disk->private_data = device;
++	q->backing_dev_info->congested_fn = drbd_congested;
++	q->backing_dev_info->congested_data = device;
++	disk->queue->backing_dev_info->capabilities |= BDI_CAP_STABLE_WRITES;
++	blk_queue_write_cache(disk->queue, true, true);
+ 
+ 	device->md_io.page = alloc_page(GFP_KERNEL);
+ 	if (!device->md_io.page)
+@@ -4308,9 +4389,7 @@ enum drbd_ret_code drbd_create_device(st
+ 		goto out_remove_peer_device;
+ 	}
+ 
+-	err = add_disk(disk);
+-	if (err)
+-		goto out_destroy_submitter;
++	add_disk(disk);
+ 	device->have_quorum[OLD] =
+ 	device->have_quorum[NEW] =
+ 		(resource->res_opts.quorum == QOU_OFF);
+@@ -4329,10 +4408,6 @@ enum drbd_ret_code drbd_create_device(st
+ 	drbd_debugfs_device_add(device);
+ 	*p_device = device;
+ 	return NO_ERROR;
+-
+-out_destroy_submitter:
+-	destroy_workqueue(device->submit.wq);
+-	device->submit.wq = NULL;
+ out_remove_peer_device:
+ 	list_splice_init_rcu(&device->peer_devices, &tmp, synchronize_rcu);
+ 	list_for_each_entry_safe(peer_device, tmp_peer_device, &tmp, peer_devices) {
+@@ -4368,6 +4443,8 @@ out_no_peer_device:
+ out_no_io_page:
+ 	put_disk(disk);
+ out_no_disk:
++	blk_cleanup_queue(q);
++out_no_q:
+ 	kref_put(&resource->kref, drbd_destroy_resource);
+ 	kref_debug_put(&resource->kref_debug, 4);
+ 		/* kref debugging wants an extra put, see has_refs() */
+@@ -4410,7 +4487,7 @@ void drbd_unregister_device(struct drbd_
+ 	device->submit_conflict.wq = NULL;
+ 	destroy_workqueue(device->submit.wq);
+ 	device->submit.wq = NULL;
+-	timer_shutdown_sync(&device->request_timer);
++	del_timer_sync(&device->request_timer);
+ }
+ 
+ void drbd_reclaim_device(struct rcu_head *rp)
+@@ -4432,7 +4509,7 @@ void drbd_reclaim_device(struct rcu_head
+ 
+ static void shutdown_connect_timer(struct drbd_connection *connection)
+ {
+-	if (timer_shutdown_sync(&connection->connect_timer)) {
++	if (del_timer_sync(&connection->connect_timer)) {
+ 		kref_debug_put(&connection->kref_debug, 11);
+ 		kref_put(&connection->kref, drbd_destroy_connection);
+ 	}
+@@ -4440,7 +4517,7 @@ static void shutdown_connect_timer(struc
+ 
+ void del_connect_timer(struct drbd_connection *connection)
+ {
+-	if (timer_delete_sync(&connection->connect_timer)) {
++	if (del_timer_sync(&connection->connect_timer)) {
+ 		kref_debug_put(&connection->kref_debug, 11);
+ 		kref_put(&connection->kref, drbd_destroy_connection);
+ 	}
+@@ -4506,9 +4583,49 @@ void drbd_reclaim_path(struct rcu_head *
+ 	kref_put(&path->kref, drbd_destroy_path);
+ }
+ 
++static int __init double_check_for_kabi_breakage(void)
++{
++#if defined(RHEL_RELEASE_CODE) && ((RHEL_RELEASE_CODE & 0xff00) == 0x700)
++	/* RHEL 7.5 chose to change sizeof(struct nla_policy), and to
++	 * lie about that, which makes the module version magic believe
++	 * it was compatible, while it is not.  To avoid "surprises" in
++	 * nla_parse() later, we ask the running kernel about its
++	 * opinion about the nla_policy_len() of this dummy nla_policy,
++	 * and if it does not agree, we fail on module load already. */
++	static struct nla_policy dummy[] = {
++		[0] = {
++			.type = NLA_UNSPEC,
++			.len = 8,
++		},
++		[1] = {
++			.type = NLA_UNSPEC,
++			.len = 80,
++		},
++		[2] = {
++			.type = NLA_UNSPEC,
++			.len = 800,
++		},
++		[9] = {
++			.type = NLA_UNSPEC,
++		},
++	};
++	int len = nla_policy_len(dummy, 3);
++	if (len != 900) {
++		pr_notice("kernel disagrees about the layout of struct nla_policy (%d)\n",
++			  len);
++		pr_err("kABI breakage detected! module compiled for: %s\n",
++		       UTS_RELEASE);
++		return -EINVAL;
++	}
++#endif
++	return 0;
++}
++
+ static int __init drbd_init(void)
+ {
+ 	int err;
++	if (double_check_for_kabi_breakage())
++		return -EINVAL;
+ 
+ 	initialize_kref_debugging();
+ 
+@@ -4696,7 +4813,7 @@ static int __drbd_md_sync(struct drbd_de
+ 	if (!buffer)
+ 		goto out;
+ 
+-	timer_delete(&device->md_sync_timer);
++	del_timer(&device->md_sync_timer);
+ 	/* timer may be rearmed by drbd_md_mark_dirty() now. */
+ 
+ 	if (test_and_clear_bit(MD_DIRTY, &device->flags) || !maybe) {
+@@ -6122,7 +6239,7 @@ void drbd_queue_bitmap_io(struct drbd_de
+ 
+ 	D_ASSERT(device, current == device->resource->worker.task);
+ 
+-	bm_io_work = kmalloc_obj(*bm_io_work, GFP_NOIO);
++	bm_io_work = kmalloc(sizeof(*bm_io_work), GFP_NOIO);
+ 	if (!bm_io_work) {
+ 		if (done)
+ 			done(device, peer_device, -ENOMEM);
+@@ -6257,7 +6374,7 @@ bool drbd_md_test_peer_flag(struct drbd_
+ 
+ static void md_sync_timer_fn(struct timer_list *t)
+ {
+-	struct drbd_device *device = timer_container_of(device, t, md_sync_timer);
++	struct drbd_device *device = from_timer(device, t, md_sync_timer);
+ 	drbd_device_post_work(device, MD_SYNC);
+ }
+ 
+--- drbd_kref_debug.c
++++ /tmp/cocci-output-524506-1e90e7-drbd_kref_debug.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <drbd_kref_debug.h>
++#include <linux/pfn_t.h>
+ #include "drbd_int.h"
+ 
+ 
+--- drbd_interval.c
++++ /tmp/cocci-output-524506-b07ab9-drbd_interval.c
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++#include "drbd_wrappers.h"
+ #include <asm/bug.h>
+ #include <linux/rbtree_augmented.h>
++#include <linux/pfn_t.h>
+ #include "drbd_interval.h"
+ 
+ /*
+--- drbd_debugfs.c
++++ /tmp/cocci-output-524506-cdc846-drbd_debugfs.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #define pr_fmt(fmt)	KBUILD_MODNAME " debugfs: " fmt
++#include "drbd_wrappers.h"
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/debugfs.h>
+@@ -7,6 +8,7 @@
+ #include <linux/jiffies.h>
+ #include <linux/list.h>
+ #include <generated/utsrelease.h>
++#include <linux/pfn_t.h>
+ 
+ #include "drbd_int.h"
+ #include "drbd_req.h"
+@@ -778,11 +780,16 @@ void drbd_debugfs_resource_cleanup(struc
+ 
+ void drbd_debugfs_resource_rename(struct drbd_resource *resource, const char *new_name)
+ {
+-	int err;
+-
+-	err = debugfs_change_name(resource->debugfs_res, "%s", new_name);
+-	if (err)
++	struct dentry *new_d;new_d = debugfs_rename(drbd_debugfs_resources,
++						    resource->debugfs_res,
++						    drbd_debugfs_resources,
++						    new_name);
++	if (IS_ERR(new_d)) {
+ 		drbd_err(resource, "failed to rename debugfs entry for resource\n");
++	} else
++	{
++		resource->debugfs_res = new_d;
++	}
+ }
+ 
+ static void seq_print_one_timing_detail(struct seq_file *m,
+@@ -1964,6 +1971,88 @@ static const struct file_operations drbd
+ 
+ static int drbd_compat_show(struct seq_file *m, void *ignored)
+ {
++	seq_puts(m, "bio_split_to_limits__no_present\n");
++	seq_puts(m, "blk_queue_split__yes_has_two_parameters\n");
++	seq_puts(m, "bio_alloc__no_has_4_params\n");
++	seq_puts(m, "bio_alloc_clone__no_present\n");
++	seq_puts(m, "bio_bi_bdev__no_present\n");
++	seq_puts(m, "bvec_kmap_local__no_present\n");
++	seq_puts(m, "sendpage__yes_present\n");
++	seq_puts(m, "queue_limits_features__no_present\n");
++	seq_puts(m, "blk_alloc_disk__no_takes_queue_limits\n");
++	seq_puts(m, "blk_alloc_disk__no_present\n");
++	seq_puts(m, "submit_bio__no_returns_void\n");
++	seq_puts(m, "submit_bio__no_present\n");
++	seq_puts(m, "blk_alloc_queue_rh__yes_present\n");
++	seq_puts(m, "blk_queue_make_request__yes_present\n");
++	seq_puts(m, "queue_flag_stable_writes__no_present\n");
++	seq_puts(m, "queue_flag_discard__yes_present\n");
++	seq_puts(m, "blk_opf_t__no_present\n");
++	seq_puts(m, "enum_req_op__no_present\n");
++	seq_puts(m, "alloc_obj_default_gfp__no_present\n");
++	seq_puts(m, "kmalloc_obj__no_present\n");
++	seq_puts(m, "kzalloc_flex__no_present\n");
++	seq_puts(m, "part_stat_h__no_present\n");
++	seq_puts(m, "__vmalloc__no_has_2_params\n");
++	seq_puts(m, "tcp_sock_set_cork__no_present\n");
++	seq_puts(m, "tcp_sock_set_quickack__no_present\n");
++	seq_puts(m, "tcp_sock_set_keepcnt__no_present\n");
++	seq_puts(m, "submit_bio_noacct__no_present\n");
++	seq_puts(m, "bdi_congested__yes_present\n");
++	seq_puts(m, "congested_fn__yes_present\n");
++	seq_puts(m, "queue_limits_start_update__no_present\n");
++	seq_puts(m, "disk_update_readahead__no_present\n");
++	seq_puts(m, "struct_gendisk__no_has_backing_dev_info\n");
++	seq_puts(m, "fallthrough__no_present\n");
++	seq_puts(m, "set_capacity_and_notify__no_present\n");
++	seq_puts(m, "vermagic_h__yes_can_include\n");
++	seq_puts(m, "part_stat_read__no_takes_block_device\n");
++	seq_puts(m, "part_stat_read_accum__no_present\n");
++	seq_puts(m, "bdgrab__yes_present\n");
++	seq_puts(m, "gendisk_part0__no_is_block_device\n");
++	seq_puts(m, "bio_max_segs__no_present\n");
++	seq_puts(m, "bio_max_vecs__no_present\n");
++	seq_puts(m, "fs_dax_get_by_bdev__no_takes_start_off_and_holder\n");
++	seq_puts(m, "fs_dax_get_by_bdev__no_takes_start_off\n");
++	seq_puts(m, "add_disk__no_returns_int\n");
++	seq_puts(m, "bdev_nr_sectors__no_present\n");
++	seq_puts(m, "genhd_fl_no_part__no_present\n");
++	seq_puts(m, "dax_direct_access__no_takes_mode\n");
++	seq_puts(m, "pfn_t__yes_present\n");
++	seq_puts(m, "bdev_max_discard_sectors__no_present\n");
++	seq_puts(m, "blk_queue_max_write_same_sectors__yes_present\n");
++	seq_puts(m, "blkdev_issue_discard__yes_takes_flags\n");
++	seq_puts(m, "drbd_wrappers__yes_need\n");
++	seq_puts(m, "bdev_discard_granularity__no_present\n");
++	seq_puts(m, "kvfree_rcu_mightsleep__no_present\n");
++	seq_puts(m, "get_random_u32_below__no_present\n");
++	seq_puts(m, "get_random_u32__no_present\n");
++	seq_puts(m, "sk_use_task_frag__no_present\n");
++	seq_puts(m, "timer_shutdown__no_present\n");
++	seq_puts(m, "blk_mode_t__no_present\n");
++	seq_puts(m, "bdev_file_open_by_path__no_present\n");
++	seq_puts(m, "bdev_open_by_path__no_present\n");
++	seq_puts(m, "blkdev_put__no_has_holder\n");
++	seq_puts(m, "blkdev_get_by_path__no_has_holder_ops\n");
++	seq_puts(m, "block_device_operations_open__no_takes_gendisk\n");
++	seq_puts(m, "tasklet_setup__no_present\n");
++	seq_puts(m,
++		 "block_device_operations_release__no_takes_single_argument\n");
++	seq_puts(m, "genl_info_userhdr__no_present\n");
++	seq_puts(m, "need_recalc_sigpending__yes_need\n");
++	seq_puts(m, "tls_get_record_type__no_present\n");
++	seq_puts(m, "bio_advance_iter_single__no_present\n");
++	seq_puts(m, "kmap_local_page__no_present\n");
++	seq_puts(m, "counted_by__no_present\n");
++	seq_puts(m, "linux_unaligned_h__no_present\n");
++	seq_puts(m, "genlmsg_multicast_allns__no_has_4_params\n");
++	seq_puts(m, "debugfs_change_name__no_present\n");
++	seq_puts(m, "queue_limits_max_hw_zone_append_sectors__no_present\n");
++	seq_puts(m, "timer_delete__no_present\n");
++	seq_puts(m, "mempool_is_saturated__no_present\n");
++	seq_puts(m, "timer_container_of__no_present\n");
++	seq_puts(m, "queue_limits_max_hw_wzeroes_unmap_sectors__no_present\n");
++	seq_puts(m, "struct_sockaddr_unsized__no_present\n");
+ 	return 0;
+ }
+ 
+--- drbd_dax_pmem.c
++++ /tmp/cocci-output-524506-4df802-drbd_dax_pmem.c
+@@ -19,11 +19,13 @@
+      writing transactions, the unmangled LRU-cache hash table is there.
+ */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/dax.h>
+ #include <linux/libnvdimm.h>
+ #include <linux/blkdev.h>
++#include <linux/pfn_t.h>
+ #include "drbd_int.h"
+ #include "drbd_dax_pmem.h"
+ #include "drbd_meta_data.h"
+@@ -34,11 +36,11 @@ static int map_superblock_for_dax(struct
+ 	pgoff_t pgoff = bdev->md.md_offset >> (PAGE_SHIFT - SECTOR_SHIFT);
+ 	void *kaddr;
+ 	long len;
+-	unsigned long pfn_unused; /* before 4.18 it is required to pass in non-NULL */
++	pfn_t pfn_unused; /* before 4.18 it is required to pass in non-NULL */
+ 	int id;
+ 
+ 	id = dax_read_lock();
+-	len = dax_direct_access(dax_dev, pgoff, want, DAX_ACCESS, &kaddr, &pfn_unused);
++	len = dax_direct_access(dax_dev, pgoff, want, &kaddr, &pfn_unused);
+ 	dax_read_unlock(id);
+ 
+ 	if (len < want)
+@@ -57,9 +59,8 @@ int drbd_dax_open(struct drbd_backing_de
+ {
+ 	struct dax_device *dax_dev;
+ 	int err;
+-	u64 part_off;
+ 
+-	dax_dev = fs_dax_get_by_bdev(bdev->md_bdev, &part_off, NULL, NULL);
++	dax_dev = fs_dax_get_by_bdev(bdev->md_bdev);
+ 	if (!dax_dev)
+ 		return -ENODEV;
+ 
+@@ -92,11 +93,11 @@ int drbd_dax_map(struct drbd_backing_dev
+ 	long al_offset_byte = (al_sector - first_sector) << SECTOR_SHIFT;
+ 	void *kaddr;
+ 	long len;
+-	unsigned long pfn_unused; /* before 4.18 it is required to pass in non-NULL */
++	pfn_t pfn_unused; /* before 4.18 it is required to pass in non-NULL */
+ 	int id;
+ 
+ 	id = dax_read_lock();
+-	len = dax_direct_access(dax_dev, pgoff, want, DAX_ACCESS, &kaddr, &pfn_unused);
++	len = dax_direct_access(dax_dev, pgoff, want, &kaddr, &pfn_unused);
+ 	dax_read_unlock(id);
+ 
+ 	if (len < want)
+--- drbd_bitmap.c
++++ /tmp/cocci-output-524506-e063bf-drbd_bitmap.c
+@@ -12,6 +12,7 @@
+ 
+ #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+ 
++#include "drbd_wrappers.h"
+ #include <linux/bitops.h>
+ #include <linux/vmalloc.h>
+ #include <linux/string.h>
+@@ -19,6 +20,7 @@
+ #include <linux/slab.h>
+ #include <linux/dynamic_debug.h>
+ #include <linux/libnvdimm.h>
++#include <linux/pfn_t.h>
+ 
+ #include "drbd_int.h"
+ #include "drbd_dax_pmem.h"
+@@ -370,7 +372,8 @@ static struct page **bm_realloc_pages(st
+ 	new_pages = kzalloc(bytes, GFP_NOIO | __GFP_NOWARN);
+ 	if (!new_pages) {
+ 		new_pages = __vmalloc(bytes,
+-				GFP_NOIO | __GFP_HIGHMEM | __GFP_ZERO);
++				      GFP_NOIO | __GFP_HIGHMEM | __GFP_ZERO,
++				      PAGE_KERNEL);
+ 		if (!new_pages)
+ 			return NULL;
+ 	}
+@@ -408,7 +411,7 @@ struct drbd_bitmap *drbd_bm_alloc(unsign
+ {
+ 	struct drbd_bitmap *b;
+ 
+-	b = kzalloc_obj(struct drbd_bitmap);
++	b = kzalloc(sizeof(struct drbd_bitmap), GFP_KERNEL);
+ 	if (!b)
+ 		return NULL;
+ 
+@@ -1269,7 +1272,7 @@ static void bm_page_io_async(struct drbd
+ 	sector_t first_bm_sect;
+ 	sector_t on_disk_sector;
+ 	unsigned int len;
+-	enum req_op op = ctx->flags & BM_AIO_READ ? REQ_OP_READ : REQ_OP_WRITE;
++	unsigned int op = ctx->flags & BM_AIO_READ ? REQ_OP_READ : REQ_OP_WRITE;
+ 
+ 	first_bm_sect = device->ldev->md.md_offset + device->ldev->md.bm_offset;
+ 	on_disk_sector = first_bm_sect + (((sector_t)page_nr) << (PAGE_SHIFT-SECTOR_SHIFT));
+@@ -1313,12 +1316,13 @@ static void bm_page_io_async(struct drbd
+ 	} else
+ 		page = b->bm_pages[page_nr];
+ 
+-	bio = bio_alloc_bioset(device->ldev->md_bdev, 1, op, GFP_NOIO,
+-		&drbd_md_io_bio_set);
++	bio = bio_alloc_bioset(GFP_NOIO, 1, &drbd_md_io_bio_set);
++	bio_set_dev(bio, device->ldev->md_bdev);
+ 	bio->bi_iter.bi_sector = on_disk_sector;
+ 	__bio_add_page(bio, page, len, 0);
+ 	bio->bi_private = ctx;
+ 	bio->bi_end_io = drbd_bm_endio;
++	bio->bi_opf = op;
+ 
+ 	if (drbd_insert_fault(device, (op == REQ_OP_WRITE) ? DRBD_FAULT_MD_WR : DRBD_FAULT_MD_RD)) {
+ 		bio->bi_status = BLK_STS_IOERR;
+@@ -1376,7 +1380,7 @@ static int bm_rw_range(struct drbd_devic
+ 	if (!expect(device, b->bm_number_of_pages))
+ 		return -ENODEV;
+ 
+-	ctx = kmalloc_obj(struct drbd_bm_aio_ctx, GFP_NOIO);
++	ctx = kmalloc(sizeof(struct drbd_bm_aio_ctx), GFP_NOIO);
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 
+--- drbd_actlog.c
++++ /tmp/cocci-output-524506-c759a0-drbd_actlog.c
+@@ -11,10 +11,12 @@
+ 
+  */
+ 
++#include "drbd_wrappers.h"
+ #include <linux/slab.h>
+ #include <linux/crc32c.h>
+ #include <linux/drbd.h>
+ #include <linux/dynamic_debug.h>
++#include <linux/pfn_t.h>
+ #include "drbd_int.h"
+ #include "drbd_meta_data.h"
+ #include "drbd_dax_pmem.h"
+@@ -88,13 +90,13 @@ void wait_until_done_or_force_detached(s
+ 
+ static int _drbd_md_sync_page_io(struct drbd_device *device,
+ 				 struct drbd_backing_dev *bdev,
+-				 sector_t sector, enum req_op op)
++				 sector_t sector, unsigned int op)
+ {
+ 	struct bio *bio;
+ 	/* we do all our meta data IO in aligned 4k blocks. */
+ 	const int size = 4096;
+ 	int err;
+-	blk_opf_t op_flags = 0;
++	unsigned int op_flags = 0;
+ 
+ 	if ((op == REQ_OP_WRITE) && !test_bit(MD_NO_FUA, &device->flags))
+ 		op_flags |= REQ_FUA | REQ_PREFLUSH;
+@@ -103,14 +105,15 @@ static int _drbd_md_sync_page_io(struct
+ 	device->md_io.done = 0;
+ 	device->md_io.error = -ENODEV;
+ 
+-	bio = bio_alloc_bioset(bdev->md_bdev, 1, op | op_flags,
+-		GFP_NOIO, &drbd_md_io_bio_set);
++	bio = bio_alloc_bioset(GFP_NOIO, 1, &drbd_md_io_bio_set);
++	bio_set_dev(bio, bdev->md_bdev);
+ 	bio->bi_iter.bi_sector = sector;
+ 	err = -EIO;
+ 	if (bio_add_page(bio, device->md_io.page, size, 0) != size)
+ 		goto out;
+ 	bio->bi_private = device;
+ 	bio->bi_end_io = drbd_md_endio;
++	bio->bi_opf = op | op_flags;
+ 
+ 	if (op != REQ_OP_WRITE && device->disk_state[NOW] == D_DISKLESS && device->ldev == NULL)
+ 		/* special case, drbd_md_read() during drbd_adm_attach(): no get_ldev */
+@@ -139,7 +142,7 @@ static int _drbd_md_sync_page_io(struct
+ }
+ 
+ int drbd_md_sync_page_io(struct drbd_device *device, struct drbd_backing_dev *bdev,
+-			 sector_t sector, enum req_op op)
++			 sector_t sector, unsigned int op)
+ {
+ 	int err;
+ 	D_ASSERT(device, atomic_read(&device->md_io.in_use) == 1);
+--- drbd-headers/linux/genl_magic_func-genl_register_family_with_ops_groups.h
++++ drbd-headers/linux/genl_magic_func-genl_register_family_with_ops_groups.h
+@@ -18,8 +18,12 @@ static int CONCAT_(GENL_MAGIC_FAMILY, _genl_multicast_ ## group)(	\
+ {									\
+ 	unsigned int group_id =						\
+ 		CONCAT_(GENL_MAGIC_FAMILY, _group_ ## group);		\
+-	return genlmsg_multicast_allns(&ZZZ_genl_family, skb, 0,	\
+-				 group_id);				\
++	int ret;		 					\
++	rcu_read_lock();						\
++	ret = genlmsg_multicast_allns(&ZZZ_genl_family, skb, 0,		\
++			 group_id, GFP_ATOMIC);				\
++	rcu_read_unlock();						\
++	return ret;							\
+ }
+ 
+ #include GENL_MAGIC_INCLUDE_FILE
