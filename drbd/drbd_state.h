@@ -167,6 +167,8 @@ void __change_resync_susp_peer(struct drbd_peer_device *peer_device,
 			       bool value);
 void __change_resync_susp_dependency(struct drbd_peer_device *peer_device,
 				     bool value);
+void __change_resync_susp_max_parallel(struct drbd_peer_device *peer_device,
+				       bool value);
 void apply_connect(struct drbd_connection *connection, bool commit);
 
 struct drbd_work;
@@ -191,4 +193,5 @@ bool drbd_res_data_accessible(struct drbd_resource *resource);
 
 
 void drbd_empty_twopc_work_fn(struct work_struct *work);
+void drbd_resume_twopc_work_fn(struct work_struct *work);
 #endif

@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_sender.c
-
-   This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-   Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-   Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-   Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
-
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
  */
 
 #include <linux/drbd.h>
@@ -34,6 +29,7 @@ static int make_ov_request(struct drbd_peer_device *, int);
 static int make_resync_request(struct drbd_peer_device *, int);
 static bool should_send_barrier(struct drbd_connection *, unsigned int epoch);
 static void maybe_send_barrier(struct drbd_connection *, unsigned int);
+static void send_reconcile_current_uuid(struct drbd_peer_device *);
 
 /* endio handlers:
  *   drbd_md_endio (defined here)
@@ -73,9 +69,9 @@ void drbd_md_endio(struct bio *bio)
 	 * During normal operation, this only puts that extra reference
 	 * down to 1 again.
 	 * Make sure we first drop the reference, and only then signal
-	 * completion, or we may (in drbd_al_read_log()) cycle so fast into the
-	 * next drbd_md_sync_page_io(), that we trigger the
-	 * ASSERT(atomic_read(&mdev->md_io_in_use) == 1) there.
+	 * completion, or a tight loop of metadata page IO (the next
+	 * drbd_md_get_buffer() / drbd_md_sync_page_io()) could re-enter so fast
+	 * that it finds device->md_io.in_use still held.
 	 */
 	drbd_md_put_buffer(device);
 	device->md_io.done = 1;
@@ -217,8 +213,10 @@ void drbd_endio_write_sec_final(struct drbd_peer_request *peer_req)
 	 * cleanup functions if the connection is lost.
 	 */
 
+	read_lock_irqsave(&connection->resource->state_rwlock, flags);
 	if (connection->cstate[NOW] == C_CONNECTED)
 		queue_work(connection->ack_sender, &connection->send_acks_work);
+	read_unlock_irqrestore(&connection->resource->state_rwlock, flags);
 
 	if (type == INTERVAL_RESYNC_WRITE)
 		do_wake = atomic_dec_and_test(&connection->backing_ee_cnt);
@@ -682,7 +680,6 @@ static int make_one_resync_request(struct drbd_peer_device *peer_device, int dis
 				       size, REQ_OP_WRITE);
 	if (!peer_req) {
 		drbd_err(device, "Could not allocate resync request\n");
-		put_ldev(device);
 		return -EAGAIN;
 	}
 
@@ -767,7 +764,7 @@ int w_send_uuids(struct drbd_work *w, int cancel)
 		container_of(w, struct drbd_peer_device, propagate_uuids_work);
 
 	if (peer_device->repl_state[NOW] < L_ESTABLISHED ||
-	    !test_bit(INITIAL_STATE_SENT, &peer_device->flags))
+	    !test_bit(INITIAL_STATE_SENT, peer_device->flags))
 		return 0;
 
 	drbd_send_uuids(peer_device, 0, 0);
@@ -1044,7 +1041,7 @@ void drbd_rs_all_in_flight_came_back(struct drbd_peer_device *peer_device, int r
 		 * extent even when all the requests are canceled. This can
 		 * cause application IO to be blocked for an indefinitely long
 		 * time. */
-		if (test_bit(RS_REQUEST_UNSUCCESSFUL, &peer_device->flags))
+		if (test_bit(RS_REQUEST_UNSUCCESSFUL, peer_device->flags))
 			return;
 	}
 
@@ -1294,7 +1291,7 @@ static int make_resync_request(struct drbd_peer_device *peer_device, int cancel)
 	if (unlikely(cancel))
 		return 0;
 
-	if (test_bit(SYNC_TARGET_TO_BEHIND, &peer_device->flags)) {
+	if (test_bit(SYNC_TARGET_TO_BEHIND, peer_device->flags)) {
 		/* If a P_RS_CANCEL_AHEAD on control socket overtook the
 		 * already queued data and state change to Ahead/Behind,
 		 * don't add more resync requests, just wait it out. */
@@ -1335,8 +1332,8 @@ static int make_resync_request(struct drbd_peer_device *peer_device, int cancel)
 	 * resolved in an arbitrary order, leading to an unexpected ordering of
 	 * requests being completed.
 	 */
-	if (test_bit(RS_REQUEST_UNSUCCESSFUL, &peer_device->flags) &&
-			peer_device->rs_in_flight > 0) {
+	if (test_bit(RS_REQUEST_UNSUCCESSFUL, peer_device->flags) &&
+	    peer_device->rs_in_flight > 0) {
 		/*
 		 * The rs_in_flight counter does not include discards waiting
 		 * to be merged. Hence we may jump back while there are
@@ -1356,14 +1353,14 @@ static int make_resync_request(struct drbd_peer_device *peer_device, int cancel)
 	bits_per_peer_bit = peer_bm_block_shift > bm_block_shift ?
 		1 << (peer_bm_block_shift - bm_block_shift) : 1;
 
-	clear_bit(RS_REQUEST_UNSUCCESSFUL, &peer_device->flags);
+	clear_bit(RS_REQUEST_UNSUCCESSFUL, peer_device->flags);
 	for (; i < number; i += bits_per_peer_bit) {
 		int err;
 
 		/* If we are aborting the requests or the peer is canceling
 		 * them, there is no need to flood the connection with
 		 * requests. Back off now. */
-		if (i > 0 && test_bit(RS_REQUEST_UNSUCCESSFUL, &peer_device->flags)) {
+		if (i > 0 && test_bit(RS_REQUEST_UNSUCCESSFUL, peer_device->flags)) {
 			request_ok = false;
 			goto request_done;
 		}
@@ -1431,7 +1428,7 @@ static int make_resync_request(struct drbd_peer_device *peer_device, int cancel)
 			put_ldev(device);
 			return -EIO;
 		case -EAGAIN: /* allocation failed, or ldev busy */
-			set_bit(RS_REQUEST_UNSUCCESSFUL, &peer_device->flags);
+			set_bit(RS_REQUEST_UNSUCCESSFUL, peer_device->flags);
 			peer_device->resync_next_bit = bm_sect_to_bit(bm, sector);
 			i = rollback_i;
 			goto request_done;
@@ -1753,7 +1750,7 @@ static bool was_resync_stable(struct drbd_peer_device *peer_device)
 {
 	struct drbd_device *device = peer_device->device;
 
-	if (test_bit(UNSTABLE_RESYNC, &peer_device->flags) &&
+	if (test_bit(UNSTABLE_RESYNC, peer_device->flags) &&
 	    !test_bit(STABLE_RESYNC, &device->flags))
 		return false;
 
@@ -1807,7 +1804,7 @@ static void init_resync_stable_bits(struct drbd_peer_device *first_target_pd)
 	struct drbd_device *device = first_target_pd->device;
 	struct drbd_peer_device *peer_device;
 
-	clear_bit(UNSTABLE_RESYNC, &first_target_pd->flags);
+	clear_bit(UNSTABLE_RESYNC, first_target_pd->flags);
 
 	/* Clear the device wide STABLE_RESYNC flag when becoming
 	   resync target on the first peer_device. */
@@ -2031,7 +2028,7 @@ void drbd_resync_finished(struct drbd_peer_device *peer_device,
 			if (stable_resync) {
 				enum drbd_disk_state new_disk_state = peer_device->disk_state[NOW];
 				if (new_disk_state < D_UP_TO_DATE &&
-				    test_bit(SYNC_SRC_CRASHED_PRI, &peer_device->flags)) {
+				    test_bit(SYNC_SRC_CRASHED_PRI, peer_device->flags)) {
 					try_to_get_resynced_from_primary_flag = true;
 					set_bit(CRASHED_PRIMARY, &device->flags);
 				}
@@ -2041,7 +2038,7 @@ void drbd_resync_finished(struct drbd_peer_device *peer_device,
 			if (device->disk_state[NEW] == D_UP_TO_DATE)
 				target_m = __cancel_other_resyncs(device);
 
-			if (stable_resync && test_bit(UUIDS_RECEIVED, &peer_device->flags)) {
+			if (stable_resync && test_bit(UUIDS_RECEIVED, peer_device->flags)) {
 				const int node_id = device->resource->res_opts.node_id;
 				int i;
 
@@ -2057,10 +2054,10 @@ void drbd_resync_finished(struct drbd_peer_device *peer_device,
 					peer_device->history_uuids[i] =
 						drbd_history_uuid(device, i);
 			} else {
-				if (!test_bit(UUIDS_RECEIVED, &peer_device->flags))
+				if (!test_bit(UUIDS_RECEIVED, peer_device->flags))
 					drbd_err(peer_device, "BUG: uuids were not received!\n");
 
-				if (test_bit(UNSTABLE_RESYNC, &peer_device->flags))
+				if (test_bit(UNSTABLE_RESYNC, peer_device->flags))
 					drbd_info(peer_device, "Peer was unstable during resync\n");
 			}
 		} else if (repl_state[NOW] == L_SYNC_SOURCE || repl_state[NOW] == L_PAUSED_SYNC_S) {
@@ -2772,6 +2769,189 @@ void suspend_other_sg(struct drbd_device *device)
 	unlock_all_resources();
 }
 
+static bool __device_is_resyncing(struct drbd_device *device)
+{
+	struct drbd_peer_device *peer_device;
+
+	for_each_peer_device_rcu(peer_device, device) {
+		enum drbd_repl_state s = peer_device->repl_state[NOW];
+
+		if (s == L_SYNC_SOURCE || s == L_SYNC_TARGET ||
+		    s == L_VERIFY_S || s == L_VERIFY_T)
+			return true;
+	}
+	return false;
+}
+
+static bool __resource_has_resyncing_device(struct drbd_resource *resource)
+{
+	struct drbd_device *device;
+	int vnr;
+
+	idr_for_each_entry(&resource->devices, device, vnr) {
+		if (__device_is_resyncing(device))
+			return true;
+	}
+	return false;
+}
+
+/* Only admit a device whose unblocking would actually transition it into
+ * L_SYNC_*. Otherwise the slot would be consumed without progress: e.g.,
+ * a volume blocked by both max_parallel and resync-after would stay
+ * paused on the dependency, starving the volume it is waiting for.
+ */
+static bool device_held_by_max_parallel(struct drbd_device *device)
+{
+	struct drbd_peer_device *peer_device;
+
+	for_each_peer_device_rcu(peer_device, device) {
+		enum drbd_repl_state s = peer_device->repl_state[NOW];
+
+		if ((s != L_PAUSED_SYNC_S && s != L_PAUSED_SYNC_T) ||
+		    !peer_device->resync_susp_max_parallel[NOW])
+			continue;
+
+		if (peer_device->resync_susp_user[NOW] ||
+		    peer_device->resync_susp_peer[NOW] ||
+		    peer_device->resync_susp_dependency[NOW] ||
+		    peer_device->resync_susp_other_c[NOW])
+			continue;
+
+		return true;
+	}
+	return false;
+}
+
+static bool set_suspend_resync_device_max_parallel(struct drbd_device *device, bool value)
+{
+	struct drbd_resource *resource = device->resource;
+	struct drbd_peer_device *peer_device;
+
+	begin_state_change_locked(resource, CS_HARD);
+	for_each_peer_device_rcu(peer_device, device) {
+		if (peer_device->resync_susp_max_parallel[NOW] != value)
+			__change_resync_susp_max_parallel(peer_device, value);
+	}
+	return end_state_change_locked(resource, "resync-max-parallel") != SS_NOTHING_TO_DO;
+}
+
+/* Re-evaluate the parallel-resync limit across all volumes and toggle
+ * resync_susp_max_parallel to enforce drbd_max_parallel_resyncs. limit == 0
+ * means unlimited (clear all max_parallel suspensions).
+ */
+void drbd_apply_resync_max_parallel(void)
+{
+	unsigned int limit = READ_ONCE(drbd_max_parallel_resyncs);
+	struct drbd_resource *resource;
+	struct drbd_device *device;
+	unsigned int running = 0;
+	int vnr;
+
+	lock_all_resources();
+	rcu_read_lock();
+
+	if (limit == 0) {
+		for_each_resource_rcu(resource, &drbd_resources) {
+			idr_for_each_entry(&resource->devices, device, vnr)
+				set_suspend_resync_device_max_parallel(device, false);
+		}
+		goto out;
+	}
+
+	for_each_resource_rcu(resource, &drbd_resources) {
+		idr_for_each_entry(&resource->devices, device, vnr) {
+			if (__device_is_resyncing(device))
+				running++;
+		}
+	}
+
+	if (running > limit) {
+		unsigned int excess = running - limit;
+
+		for_each_resource_rcu(resource, &drbd_resources) {
+			if (excess == 0)
+				break;
+			idr_for_each_entry(&resource->devices, device, vnr) {
+				if (excess == 0)
+					break;
+				if (__device_is_resyncing(device)) {
+					if (set_suspend_resync_device_max_parallel(device, true))
+						excess--;
+				}
+			}
+		}
+	} else if (running < limit) {
+		unsigned int slots = limit - running;
+
+		/* Pass 1: top up resources that already have a running resync,
+		 * so we finish all volumes of one resource before starting
+		 * volumes of the next.
+		 */
+		for_each_resource_rcu(resource, &drbd_resources) {
+			if (slots == 0)
+				break;
+			if (!__resource_has_resyncing_device(resource))
+				continue;
+			idr_for_each_entry(&resource->devices, device, vnr) {
+				if (slots == 0)
+					break;
+				if (device_held_by_max_parallel(device)) {
+					if (set_suspend_resync_device_max_parallel(device, false))
+						slots--;
+				}
+			}
+		}
+
+		/* Pass 2: any remaining slots go to volumes of fresh
+		 * resources.
+		 */
+		for_each_resource_rcu(resource, &drbd_resources) {
+			if (slots == 0)
+				break;
+			idr_for_each_entry(&resource->devices, device, vnr) {
+				if (slots == 0)
+					break;
+				if (device_held_by_max_parallel(device)) {
+					if (set_suspend_resync_device_max_parallel(device, false))
+						slots--;
+				}
+			}
+		}
+	}
+
+out:
+	rcu_read_unlock();
+	unlock_all_resources();
+}
+
+/* Caller already holds lock_all_resources(). Returns true if @device is
+ * allowed to start a new resync under the parallel-resync limit.
+ */
+static bool __device_max_parallel_admit(struct drbd_device *device)
+{
+	unsigned int limit = READ_ONCE(drbd_max_parallel_resyncs);
+	struct drbd_resource *resource;
+	struct drbd_device *d;
+	unsigned int running = 0;
+	int vnr;
+
+	if (limit == 0)
+		return true;
+
+	if (__device_is_resyncing(device))
+		return true;	/* already counted */
+
+	for_each_resource_rcu(resource, &drbd_resources) {
+		idr_for_each_entry(&resource->devices, d, vnr) {
+			if (d == device)
+				continue;
+			if (__device_is_resyncing(d))
+				running++;
+		}
+	}
+	return running < limit;
+}
+
 /* caller must hold resources_mutex */
 enum drbd_ret_code drbd_resync_after_valid(struct drbd_device *device, int resync_after)
 {
@@ -2927,7 +3107,7 @@ static void do_start_resync(struct drbd_peer_device *peer_device)
 	}
 
 	drbd_start_resync(peer_device, peer_device->start_resync_side, "postponed-resync");
-	clear_bit(AHEAD_TO_SYNC_SOURCE, &peer_device->flags);
+	clear_bit(AHEAD_TO_SYNC_SOURCE, peer_device->flags);
 }
 
 static void handle_congestion(struct drbd_peer_device *peer_device)
@@ -2954,7 +3134,7 @@ static void handle_congestion(struct drbd_peer_device *peer_device)
 	}
 	rcu_read_unlock();
 
-	clear_bit(HANDLING_CONGESTION, &peer_device->flags);
+	clear_bit(HANDLING_CONGESTION, peer_device->flags);
 }
 
 /**
@@ -2988,7 +3168,7 @@ void drbd_start_resync(struct drbd_peer_device *peer_device, enum drbd_repl_stat
 		return;
 	}
 
-	if (!test_bit(B_RS_H_DONE, &peer_device->flags)) {
+	if (!test_bit(B_RS_H_DONE, peer_device->flags)) {
 		if (side == L_SYNC_TARGET) {
 			r = drbd_maybe_khelper(device, connection, "before-resync-target");
 			if (r == DRBD_UMH_DISABLED)
@@ -3042,14 +3222,14 @@ skip_helper:
 	if (down_trylock(&device->resource->state_sem)) {
 		/* Retry later and let the worker make progress in the
 		 * meantime; two-phase commits depend on that.  */
-		set_bit(B_RS_H_DONE, &peer_device->flags);
+		set_bit(B_RS_H_DONE, peer_device->flags);
 		peer_device->start_resync_side = side;
 		mod_timer(&peer_device->start_resync_timer, jiffies + HZ/5);
 		return;
 	}
 
 	lock_all_resources();
-	clear_bit(B_RS_H_DONE, &peer_device->flags);
+	clear_bit(B_RS_H_DONE, peer_device->flags);
 	if (connection->cstate[NOW] < C_CONNECTED ||
 	    !get_ldev_if_state(device, D_NEGOTIATING)) {
 		unlock_all_resources();
@@ -3058,6 +3238,8 @@ skip_helper:
 
 	begin_state_change_locked(device->resource, CS_VERBOSE);
 	__change_resync_susp_dependency(peer_device, !__drbd_may_sync_now(peer_device));
+	__change_resync_susp_max_parallel(peer_device,
+					  !__device_max_parallel_admit(device));
 	__change_repl_state(peer_device, side);
 	if (side == L_SYNC_TARGET)
 		init_resync_stable_bits(peer_device);
@@ -3260,6 +3442,7 @@ void drbd_check_peers_new_current_uuid(struct drbd_device *device)
 
 	drbd_check_peers(resource);
 
+	/* gen-rotate reason: DEGRADE (peer disconnected; create deferred bump once quorate) */
 	if (device->have_quorum[NOW] && drbd_data_accessible(device, NOW))
 		drbd_uuid_new_current(device, false);
 }
@@ -3293,6 +3476,8 @@ static void do_peer_device_work(struct drbd_peer_device *peer_device, const unsi
 		do_start_resync(peer_device);
 	if (test_bit(HANDLE_CONGESTION, &todo))
 		handle_congestion(peer_device);
+	if (test_bit(SEND_RECONCILE_UUID, &todo))
+		send_reconcile_current_uuid(peer_device);
 }
 
 #define DRBD_DEVICE_WORK_MASK	\
@@ -3307,6 +3492,7 @@ static void do_peer_device_work(struct drbd_peer_device *peer_device, const unsi
 	|(1UL << RS_PROGRESS)		\
 	|(1UL << RS_DONE)		\
 	|(1UL << HANDLE_CONGESTION)     \
+	|(1UL << SEND_RECONCILE_UUID)   \
 	)
 
 static void __do_unqueued_peer_device_work(struct drbd_connection *connection)
@@ -3317,7 +3503,7 @@ static void __do_unqueued_peer_device_work(struct drbd_connection *connection)
 	rcu_read_lock();
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
 		struct drbd_device *device = peer_device->device;
-		unsigned long todo = get_work_bits(DRBD_PEER_DEVICE_WORK_MASK, &peer_device->flags);
+		unsigned long todo = get_work_bits(DRBD_PEER_DEVICE_WORK_MASK, peer_device->flags);
 		if (!todo)
 			continue;
 
@@ -3416,7 +3602,7 @@ static void maybe_send_state_after_ahead(struct drbd_connection *connection)
 
 	rcu_read_lock();
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
-		if (test_and_clear_bit(SEND_STATE_AFTER_AHEAD, &peer_device->flags)) {
+		if (test_and_clear_bit(SEND_STATE_AFTER_AHEAD, peer_device->flags)) {
 			peer_device->todo.was_sending_out_of_sync = false;
 			rcu_read_unlock();
 			drbd_send_current_state(peer_device);
@@ -3533,6 +3719,7 @@ static void wait_for_sender_todo(struct drbd_connection *connection)
 			continue;
 		}
 
+
 		/* drbd_send() may have called flush_signals() */
 		if (get_t_state(&connection->sender) != RUNNING)
 			break;
@@ -3582,6 +3769,23 @@ static void maybe_send_barrier(struct drbd_connection *connection, unsigned int 
 	}
 }
 
+/* The reconcile peer we asserted UpToDate on its predecessor generation has
+ * settled UpToDate; the handshake is complete and it knows we are Primary.
+ * Relabel it forward to our real current generation now.  Running on the sender,
+ * this P_CURRENT_UUID is ordered after the replayed transfer-log writes, and the
+ * peer is UpToDate, so it takes the adopt path in receive_current_uuid (rather
+ * than outdating).  See diskless_with_peers_different_current_uuids().
+ */
+static void send_reconcile_current_uuid(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+
+	if (!test_and_clear_bit(RECONCILE_INJECT_CUR_UUID, peer_device->flags))
+		return;
+	drbd_send_current_uuid(peer_device, device->exposed_data_uuid,
+			       drbd_weak_nodes_device(device));
+}
+
 static int process_one_request(struct drbd_connection *connection)
 {
 	struct bio_and_error m;
@@ -3606,6 +3810,7 @@ static int process_one_request(struct drbd_connection *connection)
 
 			re_init_if_first_write(connection, req->epoch);
 			maybe_send_barrier(connection, req->epoch);
+
 			if (current_dagtag_sector != connection->send.current_dagtag_sector)
 				drbd_send_dagtag(connection, current_dagtag_sector);
 
@@ -3613,7 +3818,7 @@ static int process_one_request(struct drbd_connection *connection)
 			connection->send.current_dagtag_sector = req->dagtag_sector;
 
 			if (peer_device->todo.was_sending_out_of_sync) {
-				clear_bit(SEND_STATE_AFTER_AHEAD, &peer_device->flags);
+				clear_bit(SEND_STATE_AFTER_AHEAD, peer_device->flags);
 				peer_device->todo.was_sending_out_of_sync = false;
 				drbd_send_current_state(peer_device);
 			}

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * drbd_transport_lb-tcp.c
- *
- * This file is part of DRBD.
- *
- *  Copyright (C) 2014-2023, LINBIT HA-Solutions GmbH.
+ * Copyright (C) 2023, LINBIT HA-Solutions GmbH.
  */
+
 #include <linux/module.h>
 #include <linux/errno.h>
 #include <linux/socket.h>
@@ -80,13 +77,16 @@ struct dtl_transport {
 	unsigned long flags;
 	struct timer_list control_timer;
 	struct delayed_work connect_work;
+	struct work_struct notify_work;
 	wait_queue_head_t data_ready;
 	wait_queue_head_t write_space;
 	struct dtl_stream streams[2];
 	struct buffer rbuf;
-	int connected_paths;
+	atomic_t connected_paths;
 	wait_queue_head_t connected_paths_change;
 	int err;
+	struct mutex connecting_socket_mutex;
+	struct socket *connecting_socket;
 };
 
 struct dtl_listener {
@@ -116,9 +116,18 @@ struct dtl_flow {
 	enum drbd_stream stream_nr;
 };
 
+enum dtl_path_flags {
+	DTL_ACTIVE_SHUT_DOWN,
+	DTL_PASSIVE_SHUT_DOWN_DATA,
+	DTL_PASSIVE_SHUT_DOWN_CONTROL,
+	DTL_REESTABLISH_PATH,
+	DTL_NOTIFY_PENDING,
+};
+
 struct dtl_path {
 	struct drbd_path path;
 	struct dtl_flow flow[2];
+	unsigned long flags;
 };
 
 static int dtl_init(struct drbd_transport *transport);
@@ -148,6 +157,7 @@ static void dtl_remove_path(struct drbd_path *);
 static void dtl_control_timer_fn(struct timer_list *t);
 static void dtl_write_space(struct sock *sk);
 static void dtl_connect_work_fn(struct work_struct *work);
+static void dtl_notify_work_fn(struct work_struct *work);
 static void dtl_accept_work_fn(struct work_struct *work);
 static int dtl_set_active(struct drbd_transport *transport, bool active);
 static int dtl_path_adjust_listener(struct dtl_path *path, bool active);
@@ -195,6 +205,7 @@ static int dtl_init(struct drbd_transport *transport)
 		container_of(transport, struct dtl_transport, transport);
 
 	spin_lock_init(&dtl_transport->control_recv_lock);
+	mutex_init(&dtl_transport->connecting_socket_mutex);
 
 	dtl_transport->transport.class = &dtl_transport_class;
 	timer_setup(&dtl_transport->control_timer, dtl_control_timer_fn, 0);
@@ -202,7 +213,8 @@ static int dtl_init(struct drbd_transport *transport)
 	init_waitqueue_head(&dtl_transport->data_ready);
 	init_waitqueue_head(&dtl_transport->write_space);
 	INIT_DELAYED_WORK(&dtl_transport->connect_work, dtl_connect_work_fn);
-	dtl_transport->connected_paths = 0;
+	INIT_WORK(&dtl_transport->notify_work, dtl_notify_work_fn);
+	atomic_set(&dtl_transport->connected_paths, 0);
 	dtl_transport->flags = 0;
 	init_waitqueue_head(&dtl_transport->connected_paths_change);
 
@@ -232,6 +244,7 @@ static void dtl_free(struct drbd_transport *transport, enum drbd_tr_free_op free
 
 	timer_delete_sync(&dtl_transport->control_timer);
 	cancel_delayed_work_sync(&dtl_transport->connect_work);
+	cancel_work_sync(&dtl_transport->notify_work);
 
 	if (free_op == DESTROY_TRANSPORT) {
 		free_page((unsigned long)dtl_transport->rbuf.base);
@@ -330,8 +343,6 @@ static int dtl_wait_data_cond(struct dtl_transport *dtl_transport,
 			continue;
 		sk = flow->sock->sk;
 		tp = tcp_sk(sk);
-		if (sk->sk_state != TCP_ESTABLISHED)
-			continue;
 		if (flow->recv_sequence == stream->recv_sequence + 1)
 			goto found;
 		err = -EAGAIN;
@@ -408,13 +419,74 @@ static int dtl_select_recv_flow(struct dtl_transport *dtl_transport, enum drbd_s
 	return 0;
 }
 
+/* Emit deferred path events in process context. dtl_check_graceful_shutdown()
+ * runs in softirq context (from dtl_state_change(), out of tcp_fin()).
+ */
+static void dtl_notify_work_fn(struct work_struct *work)
+{
+	struct dtl_transport *dtl_transport =
+		container_of(work, struct dtl_transport, notify_work);
+	struct drbd_transport *transport = &dtl_transport->transport;
+	struct drbd_path *drbd_path;
+
+	for_each_path_ref(drbd_path, transport) {
+		struct dtl_path *path = container_of(drbd_path, struct dtl_path, path);
+
+		if (test_and_clear_bit(DTL_NOTIFY_PENDING, &path->flags))
+			drbd_path_event(transport, drbd_path);
+	}
+}
+
+static void dtl_check_graceful_shutdown(struct dtl_path *path)
+{
+	struct drbd_path *drbd_path = &path->path;
+	struct drbd_transport *transport = path->path.transport;
+	struct dtl_transport *dtl_transport =
+		container_of(transport, struct dtl_transport, transport);
+	struct socket *sock = path->flow[DATA_STREAM].sock;
+	bool passive_shutdown, data_stream_consumed = true;
+	int available = 0;
+
+	if (sock) {
+		struct sock *sk = sock->sk;
+		struct tcp_sock *tp = tcp_sk(sk);
+
+		available = READ_ONCE(tp->rcv_nxt) - READ_ONCE(tp->copied_seq);
+		data_stream_consumed = (sk->sk_shutdown & RCV_SHUTDOWN) && available <= 1;
+	}
+
+	passive_shutdown = test_bit(DTL_PASSIVE_SHUT_DOWN_DATA, &path->flags) &&
+			   test_bit(DTL_PASSIVE_SHUT_DOWN_CONTROL, &path->flags);
+
+	if (data_stream_consumed && passive_shutdown) {
+		if (!test_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags)) {
+			set_bit(DTL_REESTABLISH_PATH, &path->flags);
+			mod_delayed_work(system_wq, &dtl_transport->connect_work, 1);
+		}
+
+		if (test_and_clear_bit(TR_ESTABLISHED, &drbd_path->flags)) {
+			atomic_dec(&dtl_transport->connected_paths);
+			wake_up_all(&dtl_transport->connected_paths_change);
+			set_bit(DTL_NOTIFY_PENDING, &path->flags);
+			schedule_work(&dtl_transport->notify_work);
+		}
+	}
+}
+
 static void dtl_received(struct dtl_transport *dtl_transport, struct dtl_flow *flow, int size)
 {
+	struct dtl_path *path = container_of(flow, struct dtl_path, flow[flow->stream_nr]);
+
 	if (test_bit(DTL_LOAD_BALANCE, &dtl_transport->flags)) {
 		flow->recv_bytes -= size;
 		if (flow->recv_bytes == 0)
 			dtl_transport->streams[flow->stream_nr].recv_flow = NULL;
 	}
+
+	if (size == 0 ||
+	    test_bit(DTL_PASSIVE_SHUT_DOWN_DATA, &path->flags) ||
+	    test_bit(DTL_PASSIVE_SHUT_DOWN_CONTROL, &path->flags))
+		dtl_check_graceful_shutdown(path);
 }
 
 static int
@@ -447,7 +519,7 @@ dtl_recv(struct drbd_transport *transport, enum drbd_stream st, void **buf, size
 			*buf = buffer;
 	}
 
-	if (err > 0) {
+	if (err >= 0) {
 		dtl_received(dtl_transport, flow, err);
 		dtl_transport->rbuf.pos = buffer + err;
 	}
@@ -573,6 +645,8 @@ static bool dtl_path_cmp_addr(struct dtl_path *path)
 static int
 dtl_try_connect(struct drbd_transport *transport, struct dtl_path *path, struct socket **ret_sock)
 {
+	struct dtl_transport *dtl_transport =
+		container_of(transport, struct dtl_transport, transport);
 	const char *what;
 	struct socket *sock;
 	struct sockaddr_storage my_addr, peer_addr;
@@ -626,8 +700,14 @@ dtl_try_connect(struct drbd_transport *transport, struct dtl_path *path, struct 
 
 	/* connect may fail, peer not yet available. stay C_CONNECTING */
 	what = "connect";
+	mutex_lock(&dtl_transport->connecting_socket_mutex);
+	dtl_transport->connecting_socket = sock;
+	mutex_unlock(&dtl_transport->connecting_socket_mutex);
 	err = sock->ops->connect(sock, (struct sockaddr_unsized *) &peer_addr,
 				   path->path.peer_addr_len, 0);
+	mutex_lock(&dtl_transport->connecting_socket_mutex);
+	dtl_transport->connecting_socket = NULL;
+	mutex_unlock(&dtl_transport->connecting_socket_mutex);
 	if (err < 0) {
 		switch (err) {
 		case -ETIMEDOUT:
@@ -777,11 +857,11 @@ static bool dtl_path_established(struct drbd_transport *transport, struct dtl_pa
 
 	if (!established) {
 		if (test_and_clear_bit(TR_ESTABLISHED, &drbd_path->flags)) {
-			dtl_transport->connected_paths--;
+			atomic_dec(&dtl_transport->connected_paths);
 			drbd_path_event(transport, drbd_path);
 		}
 	} else if (!test_and_set_bit(TR_ESTABLISHED, &drbd_path->flags)) {
-		dtl_transport->connected_paths++;
+		atomic_inc(&dtl_transport->connected_paths);
 
 		for (i = DATA_STREAM; i <= CONTROL_STREAM; i++) {
 			if (lb) {
@@ -978,7 +1058,7 @@ static void dtl_control_data_ready(struct sock *sk)
 	spin_unlock_bh(&dtl_transport->control_recv_lock);
 }
 
-static void dtl_control_state_change(struct sock *sk)
+static void dtl_state_change(struct sock *sk)
 {
 	struct dtl_flow *flow = sk->sk_user_data;
 	struct dtl_path *path = container_of(flow, struct dtl_path, flow[flow->stream_nr]);
@@ -986,19 +1066,35 @@ static void dtl_control_state_change(struct sock *sk)
 		container_of(path->path.transport, struct dtl_transport, transport);
 	struct drbd_transport *transport = &dtl_transport->transport;
 
-	switch (sk->sk_state) {
-	case TCP_FIN_WAIT1:
-	case TCP_CLOSE_WAIT:
-	case TCP_CLOSE:
-	case TCP_LAST_ACK:
-	case TCP_CLOSING:
-		drbd_control_event(transport, CLOSED_BY_PEER);
-		break;
-	default:
-		tr_warn(transport, "unhandled state %d\n", sk->sk_state);
+	flow->original_sk_state_change(sk);
+
+	if (!test_bit(TR_ESTABLISHED, &path->path.flags))
+		return;
+
+	/* RCV_SHUTDOWN is set whenever we receive the peer's FIN */
+	if (sk->sk_shutdown & RCV_SHUTDOWN) {
+		if (flow->stream_nr == DATA_STREAM)
+			set_bit(DTL_PASSIVE_SHUT_DOWN_DATA, &path->flags);
+		else
+			set_bit(DTL_PASSIVE_SHUT_DOWN_CONTROL, &path->flags);
 	}
 
-	flow->original_sk_state_change(sk);
+	dtl_check_graceful_shutdown(path);
+
+	if (atomic_read(&dtl_transport->connected_paths) == 0 &&
+	    test_bit(DTL_PASSIVE_SHUT_DOWN_DATA, &path->flags) &&
+	    test_bit(DTL_PASSIVE_SHUT_DOWN_CONTROL, &path->flags)) {
+		clear_bit(DTL_CONNECTING, &dtl_transport->flags);
+		if (flow->stream_nr == CONTROL_STREAM)
+			drbd_control_event(transport, CLOSED_BY_PEER);
+		return;
+	}
+
+	/* connection reset (RST sets sk_err) or unexpected close */
+	if (sk->sk_err ||
+	    (!test_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags) &&
+	     sk->sk_state == TCP_CLOSE && !(sk->sk_shutdown & RCV_SHUTDOWN)))
+		drbd_control_event(transport, CLOSED_BY_PEER);
 }
 
 static void dtl_incoming_connection(struct sock *sk)
@@ -1158,14 +1254,14 @@ static void dtl_set_socket_callbacks(struct dtl_transport *dtl_transport, struct
 	    sock->sk->sk_data_ready != dtl_control_data_ready) {
 		sock->sk->sk_user_data = flow;
 		flow->original_sk_data_ready = sock->sk->sk_data_ready;
+		flow->original_sk_state_change = sock->sk->sk_state_change;
+		sock->sk->sk_state_change = dtl_state_change;
 		if (use_for_data) {
 			flow->original_sk_write_space = sock->sk->sk_write_space;
 			sock->sk->sk_data_ready = dtl_data_ready;
 			sock->sk->sk_write_space = dtl_write_space;
 		} else {
-			flow->original_sk_state_change = sock->sk->sk_state_change;
 			sock->sk->sk_data_ready = dtl_control_data_ready;
-			sock->sk->sk_state_change = dtl_control_state_change;
 		}
 	}
 	write_unlock_bh(&sock->sk->sk_callback_lock);
@@ -1203,7 +1299,7 @@ static void dtl_do_first_packet(struct dtl_transport *dtl_transport, struct dtl_
 	}
 
 	if (dtl_path_established(transport, path)) {
-		if (dtl_transport->connected_paths == 1 && fp == P_INITIAL_META)
+		if (atomic_read(&dtl_transport->connected_paths) == 1 && fp == P_INITIAL_META)
 			set_bit(RESOLVE_CONFLICTS, &transport->flags);
 	} else {
 		/* successful accept, not yet both -> speed up next connect attempt */
@@ -1270,8 +1366,11 @@ static void dtl_accept_work_fn(struct work_struct *work)
 		path = container_of(drbd_path, struct dtl_path, path);
 		dtl_transport = container_of(path->path.transport, struct dtl_transport, transport);
 
-		/* Do not add sockets to a path after DTL_CONNECTING was cleared! */
-		if (test_bit(DTL_CONNECTING, &dtl_transport->flags)) {
+		/* Do not add sockets to a path after DTL_CONNECTING was cleared
+		 * or to a path that is being removed (DTL_ACTIVE_SHUT_DOWN).
+		 */
+		if (test_bit(DTL_CONNECTING, &dtl_transport->flags) &&
+		    !test_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags)) {
 			dtl_do_first_packet(dtl_transport, path, s);
 		} else {
 			kernel_sock_shutdown(s, SHUT_RDWR);
@@ -1287,7 +1386,7 @@ static void dtl_connect_work_fn(struct work_struct *work)
 	struct dtl_transport *dtl_transport =
 		container_of(work, struct dtl_transport, connect_work.work);
 	struct drbd_transport *transport = &dtl_transport->transport;
-	int connected_paths = dtl_transport->connected_paths;
+	int connected_paths = atomic_read(&dtl_transport->connected_paths);
 	int err, nr_paths = 0, to_connect = 0, err_ret = 0;
 	struct drbd_path *drbd_path;
 
@@ -1297,14 +1396,42 @@ static void dtl_connect_work_fn(struct work_struct *work)
 		bool use_for_data;
 
 		nr_paths++;
-		if (_dtl_path_established(transport, path))
+
+		if (!test_bit(DTL_CONNECTING, &dtl_transport->flags)) {
+			kref_put(&drbd_path->kref, drbd_destroy_path);
+			break;
+		}
+
+		/* Skip paths being removed; don't free sockets out from under dtl_remove_path() */
+		if (test_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags) ||
+		    _dtl_path_established(transport, path))
 			continue;
+
+		if (test_and_clear_bit(DTL_REESTABLISH_PATH, &path->flags)) {
+			bool connect = test_bit(DTL_CONNECTING, &dtl_transport->flags);
+
+			path->flags = 0; /* clear DTL_PASSIVE_SHUT_DOWN* */
+			drbd_path_event(transport, drbd_path);
+			dtl_socket_free(transport, &path->flow[DATA_STREAM].sock);
+			dtl_socket_free(transport, &path->flow[CONTROL_STREAM].sock);
+			drbd_path->flags = 0; /* clear TR_ESTABLISHED */
+			dtl_path_adjust_listener(path, connect);
+			if (!connect)
+				continue;
+		}
 
 		to_connect++;
 		err = dtl_try_connect(transport, path, &s);
 		if (err < 0) {
 			if (err != -EAGAIN && err != -EADDRNOTAVAIL && !err_ret)
 				err_ret = err;
+			continue;
+		}
+
+		/* Re-check after potentially long blocking connect */
+		if (test_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags)) {
+			kernel_sock_shutdown(s, SHUT_RDWR);
+			sock_release(s);
 			continue;
 		}
 
@@ -1340,7 +1467,7 @@ static void dtl_connect_work_fn(struct work_struct *work)
 		}
 
 		if (dtl_path_established(transport, path)) {
-			if (dtl_transport->connected_paths == 1 && !use_for_data)
+			if (atomic_read(&dtl_transport->connected_paths) == 1 && !use_for_data)
 				clear_bit(RESOLVE_CONFLICTS, &transport->flags);
 		}
 	}
@@ -1361,7 +1488,7 @@ static void dtl_connect_work_fn(struct work_struct *work)
 	if (nr_paths == to_connect && err_ret && !dtl_transport->err)
 		dtl_transport->err = err_ret;
 
-	if (connected_paths != dtl_transport->connected_paths || err_ret)
+	if (connected_paths != atomic_read(&dtl_transport->connected_paths) || err_ret)
 		wake_up_all(&dtl_transport->connected_paths_change);
 }
 
@@ -1385,10 +1512,22 @@ static int dtl_set_active(struct drbd_transport *transport, bool active)
 		container_of(transport, struct dtl_transport, transport);
 	struct drbd_path *drbd_path;
 
-	if (active)
+	if (active) {
 		set_bit(DTL_CONNECTING, &dtl_transport->flags);
-	else
+	} else {
+		struct socket *sock;
+
 		clear_bit(DTL_CONNECTING, &dtl_transport->flags);
+
+		/* Abort a waiting connect(). Holding the mutex across the
+		 * shutdown keeps the socket alive.
+		 */
+		mutex_lock(&dtl_transport->connecting_socket_mutex);
+		sock = dtl_transport->connecting_socket;
+		if (sock)
+			kernel_sock_shutdown(sock, SHUT_RDWR);
+		mutex_unlock(&dtl_transport->connecting_socket_mutex);
+	}
 
 	for_each_path_ref(drbd_path, transport) {
 		struct dtl_path *path = container_of(drbd_path, struct dtl_path, path);
@@ -1421,7 +1560,7 @@ static int dtl_prepare_connect(struct drbd_transport *transport)
 	struct dtl_transport *dtl_transport =
 		container_of(transport, struct dtl_transport, transport);
 
-	dtl_transport->connected_paths = 0;
+	atomic_set(&dtl_transport->connected_paths, 0);
 	dtl_transport->err = 0;
 	flush_signals(current);
 	timer_delete_sync(&dtl_transport->control_timer);
@@ -1438,7 +1577,7 @@ static int dtl_connect(struct drbd_transport *transport)
 
 	schedule_work(&dtl_transport->connect_work.work);
 	err = wait_event_interruptible(dtl_transport->connected_paths_change,
-				       dtl_transport->connected_paths > 0);
+				       atomic_read(&dtl_transport->connected_paths) > 0);
 
 	if (err < 0)
 		dtl_transport->err = err;
@@ -1567,7 +1706,10 @@ static int dtl_select_send_flow_cond(struct dtl_transport *dtl_transport,
 		struct dtl_path *path = container_of(drbd_path, struct dtl_path, path);
 		struct dtl_flow *flow = &path->flow[st];
 
-		if (!test_bit(TR_ESTABLISHED, &drbd_path->flags))
+		if (!test_bit(TR_ESTABLISHED, &drbd_path->flags) ||
+		    test_bit(DTL_PASSIVE_SHUT_DOWN_DATA, &path->flags) ||
+		    test_bit(DTL_PASSIVE_SHUT_DOWN_CONTROL, &path->flags) ||
+		    test_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags))
 			continue;
 
 		if (flow->sock) {
@@ -1703,11 +1845,15 @@ static int dtl_bio_chunk_size_available(struct bio *bio, int wmem_available,
 	struct bio_vec bvec;
 	int chunk = 0;
 
-	while (chunk < wmem_available && iter_scan->bi_size) {
+	/* Always include at least one bvec, even when wmem_available <= 0 (the
+	 * socket's send queue is full). Otherwise we would emit a 0-byte chunk
+	 * header.
+	 */
+	do {
 		bvec = bio_iter_iovec(bio, *iter_scan);
 		chunk += bvec.bv_len;
 		bio_advance_iter_single(bio, iter_scan, bvec.bv_len);
-	}
+	} while (chunk < wmem_available && iter_scan->bi_size);
 
 	return chunk;
 }
@@ -1868,22 +2014,91 @@ static int dtl_add_path(struct drbd_path *drbd_path)
 	struct dtl_path *path = container_of(drbd_path, struct dtl_path, path);
 	bool active = test_bit(DTL_CONNECTING, &dtl_transport->flags);
 	enum drbd_stream i;
+	int err;
 
 	for (i = DATA_STREAM; i <= CONTROL_STREAM ; i++)
 		path->flow[i].stream_nr = i;
 
 	clear_bit(TR_ESTABLISHED, &drbd_path->flags);
 
-	return dtl_path_adjust_listener(path, active);
+	err = dtl_path_adjust_listener(path, active);
+	if (!err && active)
+		mod_delayed_work(system_wq, &dtl_transport->connect_work, 1);
+
+	return err;
 }
 
 static bool dtl_may_remove_path(struct drbd_path *drbd_path)
 {
-	return !test_bit(TR_ESTABLISHED, &drbd_path->flags);
+	struct drbd_transport *transport = drbd_path->transport;
+	struct dtl_transport *dtl_transport =
+		container_of(transport, struct dtl_transport, transport);
+	int connected = atomic_read(&dtl_transport->connected_paths);
+
+	return connected > 1 ||
+		(connected == 1 && !test_bit(TR_ESTABLISHED, &drbd_path->flags));
 }
 
 static void dtl_remove_path(struct drbd_path *drbd_path)
 {
+	struct drbd_transport *transport = drbd_path->transport;
+	struct dtl_transport *dtl_transport =
+		container_of(transport, struct dtl_transport, transport);
+	struct dtl_path *path = container_of(drbd_path, struct dtl_path, path);
+
+	if (test_bit(TR_ESTABLISHED, &drbd_path->flags)) {
+		struct socket *data_sock, *control_sock;
+		long timeout = HZ * 5;
+		struct net_conf *nc;
+		bool timed_out;
+
+		/* Send a FIN on both streams and let dtl_check_graceful_shutdown()
+		 * clear TR_ESTABLISHED once the peer closed and all data was drained.
+		 * Setting DTL_ACTIVE_SHUT_DOWN first keeps dtl_connect_work_fn() from
+		 * freeing these sockets concurrently; they may still have been freed
+		 * before the bit was set (e.g. a peer reset), so check for NULL.
+		 */
+		set_bit(DTL_ACTIVE_SHUT_DOWN, &path->flags);
+
+		drbd_transport_lock(transport);
+		data_sock = READ_ONCE(path->flow[DATA_STREAM].sock);
+		control_sock = READ_ONCE(path->flow[CONTROL_STREAM].sock);
+		if (data_sock)
+			kernel_sock_shutdown(data_sock, SHUT_WR);
+		if (control_sock)
+			kernel_sock_shutdown(control_sock, SHUT_WR);
+		drbd_transport_unlock(transport);
+
+		/* 10 times the ping timeout for the peer to close its end. */
+		rcu_read_lock();
+		nc = rcu_dereference(transport->net_conf);
+		if (nc)
+			timeout = nc->ping_timeo * HZ;
+		rcu_read_unlock();
+
+		wait_event_timeout(dtl_transport->connected_paths_change,
+				   !test_bit(TR_ESTABLISHED, &drbd_path->flags), timeout);
+
+		timed_out = test_bit(TR_ESTABLISHED, &drbd_path->flags);
+		if (timed_out)
+			tr_warn(transport, "graceful path removal timed out, closing anyway\n");
+
+		/* Keep DTL_ACTIVE_SHUT_DOWN set so that connect_work_fn and
+		 * accept_work_fn will not assign new sockets to this path.
+		 */
+		clear_bit(DTL_PASSIVE_SHUT_DOWN_DATA, &path->flags);
+		clear_bit(DTL_PASSIVE_SHUT_DOWN_CONTROL, &path->flags);
+		clear_bit(DTL_REESTABLISH_PATH, &path->flags);
+		drbd_path_event(transport, drbd_path);
+		dtl_socket_free(transport, &path->flow[DATA_STREAM].sock);
+		dtl_socket_free(transport, &path->flow[CONTROL_STREAM].sock);
+		if (timed_out && test_and_clear_bit(TR_ESTABLISHED, &drbd_path->flags)) {
+			atomic_dec(&dtl_transport->connected_paths);
+			drbd_path_event(transport, drbd_path);
+		}
+		drbd_path->flags = 0; /* clear TR_ESTABLISHED (may already be cleared) */
+	}
+
 	drbd_put_listener(drbd_path);
 }
 
