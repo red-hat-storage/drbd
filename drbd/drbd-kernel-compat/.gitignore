@@ -12,6 +12,3 @@ drbd_wrappers.o
 
 .gen_patch_names.cmd
 gen_patch_names
-
-cocci_cache/*
-compat.patch
