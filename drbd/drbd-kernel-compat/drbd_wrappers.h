@@ -28,14 +28,6 @@
 #define ALIGN_DOWN(x, a)       __ALIGN_KERNEL((x) - ((a) - 1), (a))
 #endif
 
-/* introduced in v3.13-rc1-4-g4f024f3797c4 */
-#ifndef COMPAT_HAVE_STRUCT_BVEC_ITER
-struct bvec_iter {
-	int bi_size;
-	int bi_idx;
-};
-#endif
-
 /* introduced in v3.13-4220-g89a0714106aa */
 #ifndef U32_MAX
 #define U32_MAX ((u32)~0U)
@@ -138,42 +130,8 @@ struct bvec_iter {
 	blkdev_issue_zeroout(BDEV, SS, NS, GFP)
 #endif
 
-#ifndef COMPAT_HAVE_SIMPLE_POSITIVE
-#include <linux/dcache.h>
-static inline int simple_positive(struct dentry *dentry)
-{
-        return dentry->d_inode && !d_unhashed(dentry);
-}
-#endif
-
-#if !(defined(COMPAT_HAVE_SHASH_DESC_ON_STACK) &&    \
-      defined COMPAT_HAVE_SHASH_DESC_ZERO)
-#include <crypto/hash.h>
-
-/* introduced in a0a77af14117 (v3.17-9284) */
-#ifndef COMPAT_HAVE_SHASH_DESC_ON_STACK
-#define SHASH_DESC_ON_STACK(shash, ctx)				  \
-	char __##shash##_desc[sizeof(struct shash_desc) +	  \
-		crypto_shash_descsize(ctx)] CRYPTO_MINALIGN_ATTR; \
-	struct shash_desc *shash = (struct shash_desc *)__##shash##_desc
-#endif
-
-/* introduced in e67ffe0af4d4 (v4.5-rc1-24) */
-#ifndef COMPAT_HAVE_SHASH_DESC_ZERO
-#ifndef barrier_data
-#define barrier_data(ptr) barrier()
-#endif
-static inline void shash_desc_zero(struct shash_desc *desc)
-{
-	/* memzero_explicit(...) */
-	memset(desc, 0, sizeof(*desc) + crypto_shash_descsize(desc->tfm));
-	barrier_data(desc);
-}
-#endif
-#endif
-
 /* RDMA related */
-#if defined(COMPAT_HAVE_IB_ALLOC_CQ) && !defined(COMPAT_HAVE_IB_ALLOC_CQ_ANY)
+#ifndef COMPAT_HAVE_IB_ALLOC_CQ_ANY
 #include <rdma/ib_verbs.h>
 
 static inline struct ib_cq *
@@ -223,10 +181,42 @@ void arch_wb_cache_pmem(void *addr, size_t size);
         list_entry((ptr)->prev, type, member)
 #endif
 
-/* Rhel-7.0 to 7.5 lack it. Rhel 7.6+ has it in linux/timer.h */
-#ifndef from_timer
-#define from_timer(var, callback_timer, timer_fieldname)		\
-        container_of(callback_timer, typeof(*var), timer_fieldname)
+
+/* For kernels before 5.1: bio_for_each_bvec polyfill.
+ * On these kernels, bio_for_each_segment() does not split multi-page bvecs
+ * into PAGE_SIZE chunks (upstream commit 3d75ca0adef4, merged in v5.1).
+ * The cocci compat patch also forces single-page allocations in
+ * drbd_alloc_pages() to avoid buffer overflows with drivers that iterate
+ * using bio_for_each_segment (e.g. brd). */
+#ifndef COMPAT_HAVE_BIO_FOR_EACH_BVEC
+#define mp_bvec_iter_page(bvec, iter)				\
+	(__bvec_iter_bvec((bvec), (iter))->bv_page)
+
+#define mp_bvec_iter_len(bvec, iter)				\
+	min((iter).bi_size,					\
+	    __bvec_iter_bvec((bvec), (iter))->bv_len - (iter).bi_bvec_done)
+
+#define mp_bvec_iter_offset(bvec, iter)				\
+	(__bvec_iter_bvec((bvec), (iter))->bv_offset + (iter).bi_bvec_done)
+
+#define mp_bvec_iter_page_idx(bvec, iter)			\
+	(mp_bvec_iter_offset((bvec), (iter)) / PAGE_SIZE)
+
+#define mp_bvec_iter_bvec(bvec, iter)				\
+((struct bio_vec) {						\
+	.bv_page	= mp_bvec_iter_page((bvec), (iter)),	\
+	.bv_len		= mp_bvec_iter_len((bvec), (iter)),	\
+	.bv_offset	= mp_bvec_iter_offset((bvec), (iter)),	\
+})
+
+#define __bio_for_each_bvec(bvl, bio, iter, start)			\
+	for (iter = (start);						\
+	     (iter).bi_size &&						\
+		((bvl = mp_bvec_iter_bvec((bio)->bi_io_vec, (iter))), 1); \
+	     bio_advance_iter((bio), &(iter), (bvl).bv_len))
+
+#define bio_for_each_bvec(bvl, bio, iter)			\
+	__bio_for_each_bvec(bvl, bio, iter, (bio)->bi_iter)
 #endif
 
-#endif /* _DRBD_WRAPPERS_H */
+#endif

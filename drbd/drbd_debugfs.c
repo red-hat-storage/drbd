@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2014, LINBIT HA-Solutions GmbH.
+ */
+
 #define pr_fmt(fmt)	KBUILD_MODNAME " debugfs: " fmt
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -102,7 +106,9 @@ static void seq_print_request_state(struct seq_file *m, struct drbd_request *req
 		seq_printf(m, "\tnet[%d]:", peer_device->node_id);
 		sep = ' ';
 		seq_print_rq_state_bit(m, s & RQ_NET_PENDING, &sep, "pending");
+		seq_print_rq_state_bit(m, s & RQ_NET_PENDING_OOS, &sep, "pending-oos");
 		seq_print_rq_state_bit(m, s & RQ_NET_QUEUED, &sep, "queued");
+		seq_print_rq_state_bit(m, s & RQ_NET_READY, &sep, "ready");
 		seq_print_rq_state_bit(m, s & RQ_NET_SENT, &sep, "sent");
 		seq_print_rq_state_bit(m, s & RQ_NET_DONE, &sep, "done");
 		seq_print_rq_state_bit(m, s & RQ_NET_SIS, &sep, "sis");
@@ -460,14 +466,15 @@ static void seq_print_resource_transfer_log_summary(struct seq_file *m,
 		/* don't disable preemption "forever" */
 		if ((count & 0x1ff) == 0x1ff) {
 			struct list_head *next_hdr;
-			/* Only get if the request hasn't already been destroyed. */
-			if (!kref_get_unless_zero(&req->kref))
+			/* Only get if the request hasn't already been removed from transfer_log. */
+			if (!refcount_inc_not_zero(&req->oos_send_ref))
 				continue;
 			rcu_read_unlock();
 			cond_resched();
 			rcu_read_lock();
 			next_hdr = rcu_dereference(list_next_rcu(&req->tl_requests));
-			if (kref_put(&req->kref, drbd_req_destroy_lock)) {
+			drbd_put_ref_tl_walk(req, 0, 1);
+			if (!refcount_read(&req->done_ref)) {
 				if (next_hdr == &resource->transfer_log)
 					break;
 				req = list_entry_rcu(next_hdr,
@@ -1337,6 +1344,14 @@ static int device_ed_gen_id_show(struct seq_file *m, void *ignored)
 	return 0;
 }
 
+static int device_multi_bio_cnt_show(struct seq_file *m, void *ignored)
+{
+	struct drbd_device *device = m->private;
+
+	seq_printf(m, "%u\n", device->multi_bio_cnt);
+	return 0;
+}
+
 #define show_per_peer(M) do {							\
 		seq_printf(m, "%-16s", #M ":");					\
 		for_each_peer_device(peer_device, device)			\
@@ -1458,6 +1473,7 @@ drbd_debugfs_device_attr(openers)
 drbd_debugfs_device_attr(md_io)
 drbd_debugfs_device_attr(interval_tree)
 drbd_debugfs_device_attr(al_updates)
+drbd_debugfs_device_attr(multi_bio_cnt)
 #ifdef CONFIG_DRBD_TIMING_STATS
 __drbd_debugfs_device_attr(req_timing, device_req_timing_write)
 #endif
@@ -1499,6 +1515,7 @@ void drbd_debugfs_device_add(struct drbd_device *device)
 	vol_dcf(md_io);
 	vol_dcf(interval_tree);
 	vol_dcf(al_updates);
+	vol_dcf(multi_bio_cnt);
 #ifdef CONFIG_DRBD_TIMING_STATS
 	drbd_dcf(device->debugfs_vol, device, req_timing, 0600);
 #endif
@@ -1529,6 +1546,7 @@ void drbd_debugfs_device_cleanup(struct drbd_device *device)
 	drbd_debugfs_remove(&device->debugfs_vol_md_io);
 	drbd_debugfs_remove(&device->debugfs_vol_interval_tree);
 	drbd_debugfs_remove(&device->debugfs_vol_al_updates);
+	drbd_debugfs_remove(&device->debugfs_vol_multi_bio_cnt);
 #ifdef CONFIG_DRBD_TIMING_STATS
 	drbd_debugfs_remove(&device->debugfs_vol_req_timing);
 #endif
@@ -1600,11 +1618,11 @@ static void seq_printf_with_thousands_grouping(struct seq_file *seq, long v)
 /* like bit_to_kb(), but accepts a signed bit count so we can express a
  * negative kB/sec rate when the out-of-sync set is growing.
  */
-static long signed_bit_to_kb(long bits)
+static long signed_bit_to_kb(long bits, unsigned int bm_block_shift)
 {
 	if (bits < 0)
-		return -(long)Bit2KB(-bits);
-	return Bit2KB(bits);
+		return -(long)bit_to_kb(-bits, bm_block_shift);
+	return bit_to_kb(bits, bm_block_shift);
 }
 
 static void drbd_get_syncer_progress(struct drbd_peer_device *pd,
@@ -1658,6 +1676,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 	unsigned int res;
 	int i, x, y;
 	int stalled = 0;
+	unsigned int bm_block_shift = pd->device->last_bm_block_shift;
 
 	drbd_get_syncer_progress(pd, repl_state, &rs_total, &rs_left, &res);
 
@@ -1678,14 +1697,14 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 	seq_printf(seq, "%3u.%u%% ", res / 10, res % 10);
 
 	/* if more than a few GB, display in MB */
-	if (rs_total > (4UL << (30 - BM_BLOCK_SHIFT)))
-		seq_printf(seq, "(%lu/%lu)M",
-			    (unsigned long) Bit2KB(rs_left >> 10),
-			    (unsigned long) Bit2KB(rs_total >> 10));
+	if (rs_total > (4UL << (30 - bm_block_shift)))
+		seq_printf(seq, "(%llu/%llu)M",
+			    bit_to_kb(rs_left >> 10, bm_block_shift),
+			    bit_to_kb(rs_total >> 10, bm_block_shift));
 	else
-		seq_printf(seq, "(%lu/%lu)K",
-			    (unsigned long) Bit2KB(rs_left),
-			    (unsigned long) Bit2KB(rs_total));
+		seq_printf(seq, "(%llu/%llu)K",
+			    bit_to_kb(rs_left, bm_block_shift),
+			    bit_to_kb(rs_total, bm_block_shift));
 
 	seq_puts(seq, "\n\t");
 
@@ -1721,7 +1740,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 			rt / 3600, (rt % 3600) / 60, rt % 60);
 	}
 
-	dbdt = signed_bit_to_kb(db / (long)dt);
+	dbdt = signed_bit_to_kb(db / (long)dt, bm_block_shift);
 	seq_puts(seq, " speed: ");
 	seq_printf_with_thousands_grouping(seq, dbdt);
 	seq_puts(seq, " (");
@@ -1733,7 +1752,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 		if (!dt)
 			dt++;
 		db = (long)pd->rs_mark_left[i] - (long)rs_left;
-		dbdt = signed_bit_to_kb(db / (long)dt);
+		dbdt = signed_bit_to_kb(db / (long)dt, bm_block_shift);
 		seq_printf_with_thousands_grouping(seq, dbdt);
 		seq_puts(seq, " -- ");
 	}
@@ -1745,7 +1764,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 	if (dt == 0)
 		dt = 1;
 	db = (long)rs_total - (long)rs_left;
-	dbdt = signed_bit_to_kb(db / (long)dt);
+	dbdt = signed_bit_to_kb(db / (long)dt, bm_block_shift);
 	seq_printf_with_thousands_grouping(seq, dbdt);
 	seq_putc(seq, ')');
 
@@ -1774,8 +1793,8 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 		seq_printf(seq,
 			"\t%3d%% sector pos: %llu/%llu",
 			(int)(bit_pos / (bm_bits/100+1)),
-			(unsigned long long)bit_pos * BM_SECT_PER_BIT,
-			(unsigned long long)bm_bits * BM_SECT_PER_BIT);
+			(unsigned long long)bit_pos * sect_per_bit(bm_block_shift),
+			(unsigned long long)bm_bits * sect_per_bit(bm_block_shift));
 		if (stop_sector != 0 && stop_sector != ULLONG_MAX)
 			seq_printf(seq, " stop sector: %llu", stop_sector);
 		seq_putc(seq, '\n');
@@ -1842,8 +1861,9 @@ static int peer_device_proc_drbd_show(struct seq_file *m, void *ignored)
 		   peer_device->connection->epochs,
 		   device->resource->write_ordering
 		);
-	seq_printf(m, " oos:%llu\n", have_ldev ?
-				Bit2KB((unsigned long long) drbd_bm_total_weight(peer_device)) : 0);
+
+	seq_printf(m, " oos:%llu\n",
+		   have_ldev ? device_bit_to_kb(device, drbd_bm_total_weight(peer_device)) : 0);
 
 	if (have_ldev) {
 		if (state.conn == L_SYNC_SOURCE ||

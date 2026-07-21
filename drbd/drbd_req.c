@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_req.c
-
-   This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-   Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
-   Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-   Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-
-
+ * Copyright (C) 1999-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2002-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2001-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
  */
 
 #include <linux/module.h>
@@ -49,7 +44,11 @@ static struct drbd_request *drbd_req_new(struct drbd_device *device, struct bio 
 
 	/* one reference to be put by __drbd_make_request */
 	atomic_set(&req->completion_ref, 1);
-	/* one kref as long as completion_ref > 0 */
+	/* one reference as long as completion_ref > 0 */
+	refcount_set(&req->done_ref, 1);
+	/* one reference as long as done_ref > 0 */
+	refcount_set(&req->oos_send_ref, 1);
+	/* one kref as long as oos_send_ref > 0 */
 	kref_init(&req->kref);
 	spin_lock_init(&req->rq_lock);
 
@@ -63,6 +62,10 @@ static struct drbd_request *drbd_req_new(struct drbd_device *device, struct bio 
 void drbd_reclaim_req(struct rcu_head *rp)
 {
 	struct drbd_request *req = container_of(rp, struct drbd_request, rcu);
+
+	kref_debug_put(&req->device->kref_debug, 6);
+	kref_put(&req->device->kref, drbd_destroy_device);
+
 	mempool_free(req, &drbd_request_mempool);
 }
 
@@ -156,7 +159,7 @@ int w_queue_peer_ack(struct drbd_work *w, int cancel)
 		spin_unlock(&resource->peer_ack_lock);
 		read_unlock_irq(&resource->state_rwlock);
 
-		call_rcu(&req->rcu, drbd_reclaim_req);
+		kref_put(&req->kref, drbd_req_destroy);
 	}
 	return 0;
 }
@@ -194,31 +197,30 @@ static void drbd_remove_request_interval(struct rb_root *root,
 					 struct drbd_request *req)
 {
 	struct drbd_device *device = req->device;
+	unsigned long flags;
 
-	lockdep_assert_irqs_disabled();
-
-	spin_lock(&device->interval_lock);
+	spin_lock_irqsave(&device->interval_lock, flags);
 	drbd_remove_interval(root, &req->i);
-	spin_unlock(&device->interval_lock);
+	spin_unlock_irqrestore(&device->interval_lock, flags);
 }
 
 void drbd_req_destroy(struct kref *kref)
 {
 	struct drbd_request *req = container_of(kref, struct drbd_request, kref);
-	struct drbd_resource *resource = req->device->resource;
-	struct drbd_request *destroy_next;
-	struct drbd_device *device;
+
+	call_rcu(&req->rcu, drbd_reclaim_req);
+}
+
+static void drbd_req_done(struct drbd_request *req)
+{
+	struct drbd_device *device = req->device;
+	struct drbd_resource *resource = device->resource;
 	struct drbd_peer_device *peer_device;
-	unsigned int s;
-	bool was_last_ref;
+	unsigned int s = req->local_rq_state;
+	unsigned long modified_mask = 0;
 
 	lockdep_assert_held(&resource->state_rwlock);
 	lockdep_assert_irqs_disabled();
-
- tail_recursion:
-	was_last_ref = false;
-	device = req->device;
-	s = req->local_rq_state;
 
 #ifdef CONFIG_DRBD_TIMING_STATS
 	if (s & RQ_WRITE && req->i.size != 0) {
@@ -248,93 +250,117 @@ void drbd_req_destroy(struct kref *kref)
 			continue;
 
 		drbd_err(device,
-			"drbd_req_destroy: Logic BUG rq_state: (0:%x, %d:%x), completion_ref = %d\n",
-			s, peer_device->node_id, ns, atomic_read(&req->completion_ref));
+			"%s: Logic BUG rq_state: (0:%x, %d:%x), completion_ref = %d\n",
+			__func__, s, peer_device->node_id, ns, atomic_read(&req->completion_ref));
 		return;
 	}
 
 	/* more paranoia */
 	if ((req->master_bio && !(s & RQ_POSTPONED)) ||
 		atomic_read(&req->completion_ref) || (s & RQ_LOCAL_PENDING)) {
-		drbd_err(device, "drbd_req_destroy: Logic BUG rq_state: %x, completion_ref = %d\n",
-				s, atomic_read(&req->completion_ref));
+		drbd_err(device, "%s: Logic BUG master_bio:%d rq_state: %x, completion_ref = %d\n",
+				__func__, !!req->master_bio, s, atomic_read(&req->completion_ref));
 		return;
 	}
 
-	spin_lock(&resource->tl_update_lock); /* local irq already disabled */
-	destroy_next = req->destroy_next;
-	list_del_rcu(&req->tl_requests);
-	if (resource->tl_previous_write == req)
-		resource->tl_previous_write = NULL;
-	spin_unlock(&resource->tl_update_lock);
-
 	/* finally remove the request from the conflict detection
 	 * respective block_id verification interval tree. */
-	if (!drbd_interval_empty(&req->i)) {
-		struct rb_root *root;
+	if (s & RQ_WRITE && !drbd_interval_empty(&req->i))
+		drbd_remove_request_interval(&device->requests, req);
 
-		if (s & RQ_WRITE)
-			root = &device->requests;
-		else
-			root = &device->read_requests;
-		drbd_remove_request_interval(root, req);
+	/* There is a special case:
+	 * we may notice late that IO was suspended,
+	 * and postpone, or schedule for retry, a write,
+	 * before it even was submitted or sent.
+	 * In that case we do not want to touch the bitmap at all.
+	 */
+	if ((s & RQ_WRITE) && (s & (RQ_POSTPONED|RQ_LOCAL_MASK)) != RQ_POSTPONED &&
+			req->i.size && get_ldev_if_state(device, D_DETACHING)) {
+		struct drbd_peer_md *peer_md = device->ldev->md.peers;
+		unsigned long bits = -1, mask = -1;
+		int node_id, max_node_id = device->resource->max_node_id;
+
+		for (node_id = 0; node_id <= max_node_id; node_id++) {
+			unsigned int net_rq_state;
+
+			net_rq_state = req->net_rq_state[node_id];
+			if (net_rq_state & RQ_NET_OK) {
+				int bitmap_index = peer_md[node_id].bitmap_index;
+
+				if (bitmap_index == -1)
+					continue;
+
+				if (net_rq_state & RQ_NET_SIS)
+					clear_bit(bitmap_index, &bits);
+				else
+					clear_bit(bitmap_index, &mask);
+			}
+		}
+		if (device->bitmap)
+			modified_mask =
+				drbd_set_sync(device, req->i.sector, req->i.size, bits, mask);
+		put_ldev(device);
 	}
 
 	if (s & RQ_WRITE) {
-		/* There is a special case:
-		 * we may notice late that IO was suspended,
-		 * and postpone, or schedule for retry, a write,
-		 * before it even was submitted or sent.
-		 * In that case we do not want to touch the bitmap at all.
-		 */
-		if ((s & (RQ_POSTPONED|RQ_LOCAL_MASK)) != RQ_POSTPONED &&
-		    req->i.size && get_ldev_if_state(device, D_DETACHING)) {
-			struct drbd_peer_md *peer_md = device->ldev->md.peers;
-			unsigned long bits = -1, mask = -1;
-			int node_id, max_node_id = device->resource->max_node_id;
+		for_each_peer_device(peer_device, device) {
+			if (!(req->net_rq_state[peer_device->node_id] & RQ_NET_PENDING_OOS))
+				continue;
 
-			for (node_id = 0; node_id <= max_node_id; node_id++) {
-				unsigned int net_rq_state;
-
-				net_rq_state = req->net_rq_state[node_id];
-				if (net_rq_state & RQ_NET_OK) {
-					int bitmap_index = peer_md[node_id].bitmap_index;
-
-					if (bitmap_index == -1)
-						continue;
-
-					if (net_rq_state & RQ_NET_SIS)
-						clear_bit(bitmap_index, &bits);
-					else
-						clear_bit(bitmap_index, &mask);
-				}
+			if (s & RQ_POSTPONED) {
+				drbd_err(device, "%s: Logic BUG RQ_NET_PENDING_OOS|RQ_POSTPONED\n",
+						__func__);
+				continue;
 			}
-			drbd_set_sync(device, req->i.sector, req->i.size, bits, mask);
-			put_ldev(device);
-		}
 
-		/* one might be tempted to move the drbd_al_complete_io
-		 * to the local io completion callback drbd_request_endio.
-		 * but, if this was a mirror write, we may only
-		 * drbd_al_complete_io after this is RQ_NET_DONE,
-		 * otherwise the extent could be dropped from the al
-		 * before it has actually been written on the peer.
-		 * if we crash before our peer knows about the request,
-		 * but after the extent has been dropped from the al,
-		 * we would forget to resync the corresponding extent.
-		 */
-		if (s & RQ_IN_ACT_LOG) {
-			if (get_ldev_if_state(device, D_DETACHING)) {
-				was_last_ref = drbd_al_complete_io(device, &req->i);
-				put_ldev(device);
-			} else if (drbd_device_ratelimit(device, BACKEND)) {
-				drbd_warn(device, "Should have called drbd_al_complete_io(, %llu, %u), "
-					  "but my Disk seems to have failed :(\n",
-					  (unsigned long long) req->i.sector, req->i.size);
+			/*
+			 * As an optimization, we only send out-of-sync if we
+			 * set some bit for this peer. If we are not
+			 * replicating to this peer and the same block(s) are
+			 * overwritten several times, the peer only needs to be
+			 * informed of the first change.
+			 */
+			if (peer_device->bitmap_index != -1 &&
+					test_bit(peer_device->bitmap_index, &modified_mask))
+				_req_mod(req, READY_FOR_NET, peer_device);
+			else
+				_req_mod(req, SKIP_OOS, peer_device);
 
-			}
+			wake_up(&peer_device->connection->sender_work.q_wait);
 		}
 	}
+
+	/* one might be tempted to move the drbd_al_complete_io
+	 * to the local io completion callback drbd_request_endio.
+	 * but, if this was a mirror write, we may only
+	 * drbd_al_complete_io after this is RQ_NET_DONE,
+	 * otherwise the extent could be dropped from the al
+	 * before it has actually been written on the peer.
+	 * if we crash before our peer knows about the request,
+	 * but after the extent has been dropped from the al,
+	 * we would forget to resync the corresponding extent.
+	 */
+	if (s & RQ_IN_ACT_LOG) {
+		if (get_ldev_if_state(device, D_DETACHING)) {
+			if (drbd_al_complete_io(device, &req->i))
+				set_bit(INTERVAL_AL_EXTENT_LAST, &req->i.flags);
+			put_ldev(device);
+		} else if (drbd_device_ratelimit(device, BACKEND)) {
+			drbd_warn(device, "Should have called drbd_al_complete_io(, %llu, %u), but my Disk seems to have failed :(\n",
+					(unsigned long long) req->i.sector, req->i.size);
+
+		}
+	}
+}
+
+static void drbd_req_oos_sent(struct drbd_request *req)
+{
+	struct drbd_device *device = req->device;
+	struct drbd_resource *resource = device->resource;
+	unsigned int s = req->local_rq_state;
+
+	lockdep_assert_held(&resource->state_rwlock);
+	lockdep_assert_irqs_disabled();
 
 	if (s & RQ_WRITE && req->i.size) {
 		struct drbd_resource *resource = device->resource;
@@ -343,13 +369,15 @@ void drbd_req_destroy(struct kref *kref)
 		spin_lock(&resource->peer_ack_lock); /* local irq already disabled */
 		peer_ack_req = resource->peer_ack_req;
 		if (peer_ack_req) {
+			bool al_extent_last = test_bit(INTERVAL_AL_EXTENT_LAST, &req->i.flags);
+
 			if (peer_ack_differs(req, peer_ack_req) ||
-			    (was_last_ref && atomic_read(&device->ap_actlog_cnt)) ||
+			    (al_extent_last && atomic_read(&device->ap_actlog_cnt)) ||
 			    peer_ack_window_full(req)) {
 				drbd_queue_peer_ack(resource, peer_ack_req);
 				peer_ack_req = NULL;
 			} else
-				call_rcu(&peer_ack_req->rcu, drbd_reclaim_req);
+				kref_put(&peer_ack_req->kref, drbd_req_destroy);
 		}
 		resource->peer_ack_req = req;
 
@@ -360,22 +388,7 @@ void drbd_req_destroy(struct kref *kref)
 		mod_timer(&resource->peer_ack_timer,
 			  jiffies + resource->res_opts.peer_ack_delay * HZ / 1000);
 	} else
-		call_rcu(&req->rcu, drbd_reclaim_req);
-
-	/* In both branches of the if above, the reference to device gets released */
-	kref_debug_put(&device->kref_debug, 6);
-	kref_put(&device->kref, drbd_destroy_device);
-
-	/*
-	 * Do the equivalent of:
-	 *   kref_put(&req->kref, drbd_req_destroy)
-	 * without recursing into the destructor.
-	 */
-	if (destroy_next) {
-		req = destroy_next;
-		if (refcount_dec_and_test(&req->kref.refcount))
-			goto tail_recursion;
-	}
+		kref_put(&req->kref, drbd_req_destroy);
 }
 
 static void wake_all_senders(struct drbd_resource *resource)
@@ -521,6 +534,50 @@ void drbd_release_conflicts(struct drbd_device *device, struct drbd_interval *re
 		queue_work(submit_conflict->wq, &submit_conflict->worker);
 }
 
+void drbd_put_ref_tl_walk(struct drbd_request *req, int done_put, int oos_send_put)
+{
+	struct drbd_resource *resource = req->device->resource;
+
+	lockdep_assert_held(&resource->state_rwlock);
+
+	while (req) {
+		struct drbd_request *next_write;
+		bool done = false;
+		bool oos_sent = false;
+
+		if (done_put && refcount_sub_and_test(done_put, &req->done_ref)) {
+			done = true;
+			drbd_req_done(req);
+			oos_send_put++;
+		}
+
+		if (oos_send_put && refcount_sub_and_test(oos_send_put, &req->oos_send_ref))
+			oos_sent = true;
+
+		if (!done && !oos_sent)
+			break;
+
+		spin_lock(&resource->tl_update_lock); /* local irq already disabled */
+		next_write = req->next_write;
+		if (oos_sent) {
+			list_del_rcu(&req->tl_requests);
+			if (resource->tl_previous_write == req)
+				resource->tl_previous_write = NULL;
+		} else if (done) {
+			set_bit(INTERVAL_DONE, &req->i.flags);
+		}
+		spin_unlock(&resource->tl_update_lock);
+
+		if (oos_sent)
+			/* potentially destroy */
+			drbd_req_oos_sent(req);
+
+		req = next_write;
+		done_put = done ? 1 : 0;
+		oos_send_put = oos_sent ? 1 : 0;
+	}
+}
+
 /* Helper for __req_mod().
  * Set m->bio to the master bio, if it is fit to be completed,
  * or leave it alone (it is initialized to NULL in __req_mod),
@@ -571,6 +628,8 @@ void drbd_req_complete(struct drbd_request *req, struct bio_and_error *m)
 		 *	the bio_endio completion callbacks.
 		 */
 		if (!(ns & RQ_NET_MASK))
+			continue;
+		if (ns & RQ_NET_PENDING_OOS)
 			continue;
 		if (!(ns & (RQ_NET_PENDING|RQ_NET_QUEUED)))
 			continue;
@@ -647,16 +706,21 @@ void drbd_req_complete(struct drbd_request *req, struct bio_and_error *m)
 		m->bio = req->master_bio;
 		req->master_bio = NULL;
 
-		spin_lock_irqsave(&device->interval_lock, flags);
-		/* We leave it in the tree, to be able to verify later
-		 * write-acks in protocol != C during resync.
-		 * But we mark it as "complete", so it won't be counted as
-		 * conflict in a multi-primary setup. */
-		set_bit(INTERVAL_COMPLETED, &req->i.flags);
-		if (req->local_rq_state & RQ_WRITE)
+		if (req->local_rq_state & RQ_WRITE) {
+			spin_lock_irqsave(&device->interval_lock, flags);
+			/* We leave it in the tree, to be able to verify later
+			 * write-acks in protocol != C during resync.
+			 * But we mark it as "complete", so it won't be counted as
+			 * conflict in a multi-primary setup.
+			 */
+			set_bit(INTERVAL_COMPLETED, &req->i.flags);
 			drbd_release_conflicts(device, &req->i);
-		spin_unlock_irqrestore(&device->interval_lock, flags);
+			spin_unlock_irqrestore(&device->interval_lock, flags);
+		}
 	}
+
+	if (!(req->local_rq_state & RQ_WRITE))
+		drbd_remove_request_interval(&device->read_requests, req);
 
 	/* Either we are about to complete to upper layers,
 	 * or we will restart this request.
@@ -693,7 +757,7 @@ static void drbd_req_put_completion_ref(struct drbd_request *req, struct bio_and
 		return;
 	}
 
-	kref_put(&req->kref, drbd_req_destroy);
+	drbd_put_ref_tl_walk(req, 1, 0);
 }
 
 void drbd_set_pending_out_of_sync(struct drbd_peer_device *peer_device)
@@ -707,8 +771,10 @@ void drbd_set_pending_out_of_sync(struct drbd_peer_device *peer_device)
 	list_for_each_entry_rcu(req, &resource->transfer_log, tl_requests) {
 		unsigned int local_rq_state, net_rq_state;
 
-		/* This is similar to the bitmap modification performed in
-		 * drbd_req_destroy(), but simplified for this special case. */
+		/*
+		 * This is similar to the bitmap modification performed in
+		 * drbd_req_done(), but simplified for this special case.
+		 */
 
 		spin_lock_irq(&req->rq_lock);
 		local_rq_state = req->local_rq_state;
@@ -741,12 +807,7 @@ static void advance_conn_req_next(struct drbd_connection *connection, struct drb
 	rcu_read_lock();
 	list_for_each_entry_continue_rcu(req, &connection->resource->transfer_log, tl_requests) {
 		const unsigned s = req->net_rq_state[connection->peer_node_id];
-		/* Found a request which is for this peer but not yet queued.
-		 * Do not skip past it. */
-		if (unlikely(s & RQ_NET_PENDING && !(s & (RQ_NET_QUEUED|RQ_NET_SENT))))
-			break;
 
-		connection->send.seen_dagtag_sector = req->dagtag_sector;
 		if (likely(s & RQ_NET_QUEUED)) {
 			found_req = req;
 			break;
@@ -846,16 +907,23 @@ static unsigned int req_payload_sectors(struct drbd_request *req)
 	return req->i.size >> 9;
 }
 
+static bool drbd_sender_needs_master_bio(unsigned int net_rq_state)
+{
+	return (net_rq_state & RQ_NET_QUEUED) && !(net_rq_state & RQ_NET_DONE);
+}
+
 /* I'd like this to be the only place that manipulates
  * req->completion_ref and req->kref. */
 static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 		struct drbd_peer_device *peer_device,
 		int clear, int set)
 {
-	unsigned old_local, old_net = 0;
-	unsigned set_local = set & RQ_STATE_0_MASK;
-	unsigned clear_local = clear & RQ_STATE_0_MASK;
+	unsigned int old_local, old_net = 0, new_net = 0;
+	unsigned int set_local = set & RQ_STATE_0_MASK;
+	unsigned int clear_local = clear & RQ_STATE_0_MASK;
 	int c_put = 0;
+	int d_put = 0;
+	int o_put = 0;
 	const int idx = peer_device ? peer_device->node_id : -1;
 	struct drbd_connection *connection = NULL;
 	bool unchanged;
@@ -879,7 +947,8 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 
 	if (idx != -1) {
 		old_net = req->net_rq_state[idx];
-		WRITE_ONCE(req->net_rq_state[idx], (req->net_rq_state[idx] & ~clear) | set);
+		new_net = (req->net_rq_state[idx] & ~clear) | set;
+		WRITE_ONCE(req->net_rq_state[idx], new_net);
 		connection = peer_device->connection;
 	}
 
@@ -894,8 +963,6 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 
 	/* intent: get references */
 
-	kref_get(&req->kref);
-
 	if (!(old_local & RQ_LOCAL_PENDING) && (set_local & RQ_LOCAL_PENDING))
 		atomic_inc(&req->completion_ref);
 
@@ -905,15 +972,25 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 	}
 
 	if (!(old_net & RQ_NET_QUEUED) && (set & RQ_NET_QUEUED)) {
-		set_cache_ptr_if_null(connection, &connection->req_not_net_done, req);
-		atomic_inc(&req->completion_ref);
-		/* This completion ref is necessary to avoid premature completion
-		   in case a WRITE_ACKED_BY_PEER comes in before the sender can do
-		   HANDED_OVER_TO_NETWORK. */
+		/* Keep request on transfer log while queued for sender */
+		refcount_inc(&req->oos_send_ref);
 	}
 
+	if (!drbd_sender_needs_master_bio(old_net) && drbd_sender_needs_master_bio(new_net)) {
+		/*
+		 * This completion ref is necessary to avoid premature
+		 * completion in case a WRITE_ACKED_BY_PEER comes in before the
+		 * sender can do HANDED_OVER_TO_NETWORK.
+		 */
+		atomic_inc(&req->completion_ref);
+	}
+
+	if (!(old_net & RQ_NET_READY) && (set & RQ_NET_READY) &&
+			!(req->net_rq_state[idx] & RQ_NET_DONE))
+		set_cache_ptr_if_null(connection, &connection->req_not_net_done, req);
+
 	if (!(old_net & RQ_EXP_BARR_ACK) && (set & RQ_EXP_BARR_ACK))
-		kref_get(&req->kref); /* wait for the DONE */
+		refcount_inc(&req->done_ref); /* wait for the DONE */
 
 	if (!(old_net & RQ_NET_SENT) && (set & RQ_NET_SENT)) {
 		/* potentially already completed in the ack_receiver thread */
@@ -942,7 +1019,7 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 		struct drbd_device *device = req->device;
 
 		if (req->local_rq_state & RQ_LOCAL_ABORTED)
-			kref_put(&req->kref, drbd_req_destroy);
+			++d_put;
 		else
 			++c_put;
 		spin_lock(&device->pending_completion_lock); /* local irq already disabled */
@@ -959,21 +1036,28 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 	}
 
 	if ((old_net & RQ_NET_QUEUED) && (clear & RQ_NET_QUEUED)) {
-		++c_put;
+		++o_put;
 		advance_conn_req_next(connection, req);
 	}
 
-	if (!(old_net & RQ_NET_DONE) && (set & RQ_NET_DONE)) {
-		atomic_t *ap_in_flight = &peer_device->connection->ap_in_flight;
+	if (drbd_sender_needs_master_bio(old_net) && !drbd_sender_needs_master_bio(new_net))
+		++c_put;
 
+	if (!(old_net & RQ_NET_DONE) && (set & RQ_NET_DONE)) {
 		if (old_net & RQ_NET_SENT)
-			atomic_sub(req_payload_sectors(req), ap_in_flight);
+			atomic_sub(req_payload_sectors(req),
+					&peer_device->connection->ap_in_flight);
 		if (old_net & RQ_EXP_BARR_ACK)
-			kref_put(&req->kref, drbd_req_destroy);
+			++d_put;
 		ktime_get_accounting(req->net_done_kt[peer_device->node_id]);
 
+		advance_cache_ptr(connection, &connection->req_not_net_done,
+				  req, 0, RQ_NET_DONE);
+	}
+
+	if ((old_net & RQ_NET_PENDING_OOS) && (clear & RQ_NET_PENDING_OOS)) {
 		if (peer_device->repl_state[NOW] == L_AHEAD &&
-		    atomic_read(ap_in_flight) == 0) {
+		    atomic_read(&peer_device->connection->ap_in_flight) == 0) {
 			struct drbd_peer_device *pd;
 			int vnr;
 			/* The first peer device to notice that it is time to
@@ -983,26 +1067,21 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 			idr_for_each_entry(&peer_device->connection->peer_devices, pd, vnr) {
 				if (pd->repl_state[NOW] != L_AHEAD)
 					continue;
-				if (test_and_set_bit(AHEAD_TO_SYNC_SOURCE, &pd->flags))
+				if (test_and_set_bit(AHEAD_TO_SYNC_SOURCE, pd->flags))
 					continue; /* already done */
 				pd->start_resync_side = L_SYNC_SOURCE;
 				mod_timer(&pd->start_resync_timer, jiffies + HZ);
 			}
 		}
-
-		/* in ahead/behind mode, or just in case,
-		 * before we finally destroy this request,
-		 * the caching pointers must not reference it anymore */
-		advance_conn_req_next(connection, req);
-		advance_cache_ptr(connection, &connection->req_ack_pending,
-				  req, RQ_NET_SENT | RQ_NET_PENDING, 0);
-		advance_cache_ptr(connection, &connection->req_not_net_done,
-				  req, 0, RQ_NET_DONE);
 	}
 
 	/* potentially complete and destroy */
 	drbd_req_put_completion_ref(req, m, c_put);
-	kref_put(&req->kref, drbd_req_destroy);
+
+	/* req cannot have been destroyed if there are still references */
+	if (d_put || o_put)
+		/* potentially destroy */
+		drbd_put_ref_tl_walk(req, d_put, o_put);
 }
 
 static void drbd_report_io_error(struct drbd_device *device, struct drbd_request *req)
@@ -1083,7 +1162,7 @@ void drbd_peer_maybe_confirm_rotated_gen(struct drbd_peer_device *peer_device,
 	struct drbd_request *req;
 	int idx = peer_device->node_id;
 
-	if (!test_bit(CURRENT_UUID_UNCONFIRMED, &peer_device->flags))
+	if (!test_bit(CURRENT_UUID_UNCONFIRMED, peer_device->flags))
 		return;
 
 	rcu_read_lock();
@@ -1104,7 +1183,7 @@ void drbd_peer_maybe_confirm_rotated_gen(struct drbd_peer_device *peer_device,
 	rcu_read_unlock();
 
 	if ((int)(acked_epoch - device->exposed_gen_epoch) >= 0)
-		clear_bit(CURRENT_UUID_UNCONFIRMED, &peer_device->flags);
+		clear_bit(CURRENT_UUID_UNCONFIRMED, peer_device->flags);
 }
 
 /* obviously this could be coded as many single functions
@@ -1202,7 +1281,7 @@ void __req_mod(struct drbd_request *req, enum drbd_req_event what,
 
 		D_ASSERT(device, !(req->net_rq_state[idx] & RQ_NET_MASK));
 		D_ASSERT(device, !(req->local_rq_state & RQ_LOCAL_MASK));
-		mod_rq_state(req, m, peer_device, 0, RQ_NET_PENDING);
+		mod_rq_state(req, m, peer_device, 0, RQ_NET_PENDING|RQ_NET_QUEUED);
 		break;
 
 	case NEW_NET_WRITE:
@@ -1226,7 +1305,7 @@ void __req_mod(struct drbd_request *req, enum drbd_req_event what,
 		D_ASSERT(device, !(req->net_rq_state[idx] & RQ_NET_MASK));
 
 		/* queue work item to send data */
-		mod_rq_state(req, m, peer_device, 0, RQ_NET_PENDING|RQ_EXP_BARR_ACK|
+		mod_rq_state(req, m, peer_device, 0, RQ_NET_PENDING|RQ_NET_QUEUED|RQ_EXP_BARR_ACK|
 				drbd_protocol_state_bits(peer_device->connection));
 
 		/* Close the epoch, in case it outgrew the limit.
@@ -1252,19 +1331,34 @@ void __req_mod(struct drbd_request *req, enum drbd_req_event what,
 		break;
 
 	case NEW_NET_OOS:
-		mod_rq_state(req, m, peer_device, 0, RQ_NET_PENDING);
+		/* We will just send P_OUT_OF_SYNC to this peer. The request is
+		 * "done" from the start in the sense that everything necessary
+		 * in the data stage has been done.
+		 */
+		mod_rq_state(req, m, peer_device, 0, RQ_NET_PENDING_OOS|RQ_NET_QUEUED|RQ_NET_DONE);
 		break;
 
-	case ADDED_TO_TRANSFER_LOG:
-		mod_rq_state(req, m, peer_device, 0, RQ_NET_QUEUED);
+	case READY_FOR_NET:
+		mod_rq_state(req, m, peer_device, 0, RQ_NET_READY);
 		break;
 
+	case SKIP_OOS:
+		mod_rq_state(req, m, peer_device, RQ_NET_PENDING_OOS, RQ_NET_READY);
+		break;
+
+	case OOS_HANDED_TO_NETWORK:
 	case SEND_CANCELED:
 	case SEND_FAILED:
-		/* Just update flags so it is no longer marked as on the sender
-		 * queue; real cleanup will be done from
-		 * tl_walk(,CONNECTION_LOST*). */
-		mod_rq_state(req, m, peer_device, RQ_NET_QUEUED, 0);
+		/* Sending P_OUT_OF_SYNC is irrelevant if the connection was
+		 * lost. Hence, when the intention was to send P_OUT_OF_SYNC,
+		 * the effect of successfully sending the packet and connection
+		 * loss are the same.
+		 *
+		 * Otherwise just update flags so it is no longer marked as on
+		 * the sender queue; real cleanup will be done from
+		 * tl_walk(,CONNECTION_LOST*).
+		 */
+		mod_rq_state(req, m, peer_device, RQ_NET_PENDING_OOS|RQ_NET_QUEUED, 0);
 		break;
 
 	case HANDED_OVER_TO_NETWORK:
@@ -1279,12 +1373,6 @@ void __req_mod(struct drbd_request *req, enum drbd_req_event what,
 		/* It is still not yet RQ_NET_DONE until the
 		 * corresponding epoch barrier got acked as well,
 		 * so we know what to dirty on connection loss. */
-		break;
-
-	case OOS_HANDED_TO_NETWORK:
-		/* No longer PENDING or QUEUED, so is now DONE
-		 * as far as this connection is concerned. */
-		mod_rq_state(req, m, peer_device, RQ_NET_PENDING|RQ_NET_QUEUED, RQ_NET_DONE);
 		break;
 
 	case CONNECTION_LOST:
@@ -1451,6 +1539,7 @@ barrier_acked:
 static bool drbd_may_do_local_read(struct drbd_device *device, sector_t sector, int size)
 {
 	struct drbd_md *md = &device->ldev->md;
+	struct drbd_bitmap *bm;
 	unsigned int node_id;
 	unsigned int n_checked = 0;
 
@@ -1466,8 +1555,12 @@ static bool drbd_may_do_local_read(struct drbd_device *device, sector_t sector, 
 	D_ASSERT(device, sector  < nr_sectors);
 	D_ASSERT(device, esector < nr_sectors);
 
-	sbnr = BM_SECT_TO_BIT(sector);
-	ebnr = BM_SECT_TO_BIT(esector);
+	bm = device->bitmap;
+	if (!bm)
+		return true;
+
+	sbnr = bm_sect_to_bit(bm, sector);
+	ebnr = bm_sect_to_bit(bm, esector);
 
 	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
 		struct drbd_peer_md *peer_md = &md->peers[node_id];
@@ -1546,8 +1639,8 @@ static void __maybe_pull_ahead(struct drbd_device *device, struct drbd_connectio
 	if (on_congestion == OC_BLOCK)
 		return;
 
-	if (on_congestion == OC_PULL_AHEAD && peer_device->repl_state[NOW] == L_AHEAD)
-		return; /* nothing to do ... */
+	if (!drbd_should_do_remote(peer_device, NOW))
+		return; /* Ignore congestion if we are not replicating writes */
 
 	/* If I don't even have good local storage, we can not reasonably try
 	 * to pull ahead of the peer. We also need the local reference to make
@@ -1556,7 +1649,7 @@ static void __maybe_pull_ahead(struct drbd_device *device, struct drbd_connectio
 	if (!get_ldev_if_state(device, D_UP_TO_DATE))
 		return;
 
-	if (test_and_set_bit(HANDLING_CONGESTION, &peer_device->flags))
+	if (test_and_set_bit(HANDLING_CONGESTION, peer_device->flags))
 		goto out;
 
 	/* if an other volume already found that we are congested, short circuit. */
@@ -1581,7 +1674,7 @@ static void __maybe_pull_ahead(struct drbd_device *device, struct drbd_connectio
 		set_bit(CONN_CONGESTED, &connection->flags);
 		drbd_peer_device_post_work(peer_device, HANDLE_CONGESTION);
 	} else {
-		clear_bit(HANDLING_CONGESTION, &peer_device->flags);
+		clear_bit(HANDLING_CONGESTION, peer_device->flags);
 	}
 out:
 	put_ldev(device);
@@ -1602,9 +1695,10 @@ bool drbd_should_do_remote(struct drbd_peer_device *peer_device, enum which_stat
 {
 	enum drbd_disk_state peer_disk_state = peer_device->disk_state[which];
 	enum drbd_repl_state repl_state = peer_device->repl_state[which];
+	bool replication = peer_device->replication[which];
 
 	return peer_disk_state == D_UP_TO_DATE ||
-		(peer_disk_state == D_INCONSISTENT &&
+		(peer_disk_state == D_INCONSISTENT && replication &&
 		 (repl_state == L_ESTABLISHED ||
 		  (repl_state >= L_WF_BITMAP_T && repl_state < L_AHEAD)));
 	/* Before proto 96 that was >= CONNECTED instead of >= L_WF_BITMAP_T.
@@ -1616,10 +1710,13 @@ static bool drbd_should_send_out_of_sync(struct drbd_peer_device *peer_device)
 {
 	enum drbd_disk_state peer_disk_state = peer_device->disk_state[NOW];
 	enum drbd_repl_state repl_state = peer_device->repl_state[NOW];
+	bool replication = peer_device->replication[NOW];
 
 	return repl_state == L_AHEAD ||
 		repl_state == L_WF_BITMAP_S ||
-		(peer_disk_state == D_OUTDATED && repl_state >= L_ESTABLISHED);
+		(repl_state >= L_ESTABLISHED &&
+		 (peer_disk_state == D_OUTDATED ||
+		  (peer_disk_state == D_INCONSISTENT && !replication)));
 
 	/* proto 96 check omitted, there was no L_AHEAD back then,
 	 * peer disk was never Outdated while connection was established,
@@ -1786,14 +1883,15 @@ static int drbd_process_write_request(struct drbd_request *req)
 	return count;
 }
 
-static void drbd_queue_request(struct drbd_request *req)
+static void drbd_request_ready_for_net(struct drbd_request *req)
 {
 	struct drbd_device *device = req->device;
 	struct drbd_peer_device *peer_device;
 
 	for_each_peer_device(peer_device, device) {
+		/* Do not mark RQ_NET_PENDING_OOS requests ready yet */
 		if (req->net_rq_state[peer_device->node_id] & RQ_NET_PENDING)
-			_req_mod(req, ADDED_TO_TRANSFER_LOG, peer_device);
+			_req_mod(req, READY_FOR_NET, peer_device);
 	}
 }
 
@@ -2109,8 +2207,10 @@ static void drbd_send_and_submit(struct drbd_request *req)
 			resource->tl_previous_write = req;
 
 			if (prev_write) {
-				kref_get(&req->kref);
-				prev_write->destroy_next = req;
+				if (!test_bit(INTERVAL_DONE, &prev_write->i.flags))
+					refcount_inc(&req->done_ref);
+				refcount_inc(&req->oos_send_ref);
+				prev_write->next_write = req;
 			}
 
 			if (!drbd_process_write_request(req))
@@ -2129,7 +2229,7 @@ static void drbd_send_and_submit(struct drbd_request *req)
 		/* Do this after adding to the transfer log so that the
 		 * caching pointer req_not_net_done is set if
 		 * necessary. */
-		drbd_queue_request(req);
+		drbd_request_ready_for_net(req);
 	}
 	spin_unlock(&resource->tl_update_lock);
 
@@ -2280,6 +2380,18 @@ static bool inc_ap_bio_cond(struct drbd_device *device, int rw)
 		if (ap_bio_cnt >= nr_requests)
 			return false;
 	} while (atomic_cmpxchg(&device->ap_bio_cnt[rw], ap_bio_cnt, ap_bio_cnt + 1) != ap_bio_cnt);
+
+	/* Re-check suspend_cnt after publishing our ap_bio_cnt increment.
+	 * atomic_cmpxchg() is a full barrier, so this load is ordered after
+	 * the increment; it pairs with the smp_mb__after_atomic() in
+	 * drbd_suspend_io(). If a suspend raced in, at least one side sees
+	 * the other: either drbd_suspend_io() observes our increment and
+	 * waits, or we observe suspend_cnt here and roll back.
+	 */
+	if (atomic_read(&device->suspend_cnt)) {
+		dec_ap_bio(device, rw);
+		return false;
+	}
 
 	return true;
 }
@@ -2704,11 +2816,25 @@ static bool drbd_reject_write_early(struct drbd_device *device, struct bio *bio)
 	return false;
 }
 
-static bool request_size_bad(struct drbd_device *device, struct bio *bio)
+/* Check if bio is "bad", likely to be rejected by lower layers or peers:
+ * Must not be too large, must not be unaligned.
+ */
+static bool bio_bad(struct drbd_device *device, struct bio *bio)
 {
+	unsigned int bss_mask = queue_logical_block_size(device->rq_queue) / SECTOR_SIZE - 1;
+	unsigned int bs_mask = queue_logical_block_size(device->rq_queue) - 1;
+	unsigned long long sector = bio->bi_iter.bi_sector;
 	unsigned int size = bio->bi_iter.bi_size;
-	if (!expect(device, size <= DRBD_MAX_BATCH_BIO_SIZE && IS_ALIGNED(size, SECTOR_SIZE)))
+
+	if (size > DRBD_MAX_BATCH_BIO_SIZE || (size & bs_mask) || (sector & bss_mask)) {
+		char comm[TASK_COMM_LEN];
+
+		get_task_comm(comm, current);
+		drbd_warn(device, "bad bio: %llu +%u 0x%x submitted by %s[%u]\n",
+			sector, size, bio->bi_opf, comm, task_pid_nr(current));
 		return true;
+	}
+
 	return false;
 }
 
@@ -2755,7 +2881,7 @@ void drbd_submit_bio(struct bio *bio)
 	if (!bio)
 		return;
 
-	if (device->cached_err_io || request_size_bad(device, bio)) {
+	if (device->cached_err_io || bio_bad(device, bio)) {
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
 		return;

@@ -31,7 +31,7 @@ ARCH ?= amd64
 ifneq ($(strip $(ARCH)),)
 DOCKERREGISTRY := $(DOCKERREGISTRY)/$(ARCH)
 endif
-DOCKERIMAGES = rhel7 rhel8 rhel9 rhel10 focal jammy noble resolute flatcar amzn2 sles15
+DOCKERIMAGES = rhel8 rhel9 rhel10 focal jammy noble resolute flatcar amzn2 sles15
 DOCKERIMAGESTARGETS = $(addprefix dockerimage.,$(DOCKERIMAGES))
 
 # Use the SPAAS (spatch as a service) online service
@@ -94,13 +94,9 @@ endif
 
 export REL_VERSION FDIST_VERSION
 
-all: module tools
+all: module
 
-.PHONY: all tools module
-tools: | $(if $(filter module all,$(if $(MAKECMDGOALS),,all)),module)
-	@cat README.drbd-utils
-doc:
-	@echo "Man page sources moved to https://github.com/LINBIT/drbd-utils/"
+.PHONY: all module
 
 # we cannot use 'git submodule foreach':
 # foreach only works if submodule already checked out
@@ -167,7 +163,7 @@ check check_changelogs_up2date:
 	then									\
 	   printf "\nChangeLog:3:\tneeds update\n"; 				\
 	   up2date=false; fi ; 							\
-	for df in 7 8 9 10; do							\
+	for df in 8 9 10; do							\
 	if ! grep "^ENV DRBD_VERSION $$dver" docker/Dockerfile.rhel$$df ;	\
 	then 									\
 		printf "\nDockerfile.rhel$$df: needs update\n"; 		\

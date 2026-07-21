@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_transport_rdma.c
-
-   This file is part of DRBD.
-
-   Copyright (C) 2014-2021, LINBIT HA-Solutions GmbH.
-*/
+ * Copyright (C) 2014, LINBIT HA-Solutions GmbH.
+ */
 
 #undef pr_fmt
 #define pr_fmt(fmt)	"drbd_rdma: " fmt
@@ -322,8 +318,8 @@ static void dtr_set_rcvtimeo(struct drbd_transport *transport, enum drbd_stream 
 static long dtr_get_rcvtimeo(struct drbd_transport *transport, enum drbd_stream stream);
 static int dtr_send_page(struct drbd_transport *transport, enum drbd_stream stream, struct page *page,
 		int offset, size_t size, unsigned msg_flags);
-static int dtr_send_zc_bio(struct drbd_transport *, struct bio *bio);
-static int dtr_recv_pages(struct drbd_transport *transport, struct drbd_page_chain_head *chain, size_t size);
+static int dtr_send_bio(struct drbd_transport *, struct bio *bio, unsigned int msg_flags);
+static int dtr_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size);
 static bool dtr_stream_ok(struct drbd_transport *transport, enum drbd_stream stream);
 static bool dtr_hint(struct drbd_transport *transport, enum drbd_stream stream, enum drbd_tr_hints hint);
 static void dtr_debugfs_show(struct drbd_transport *, struct seq_file *m);
@@ -393,8 +389,8 @@ static struct drbd_transport_class rdma_transport_class = {
 		.set_rcvtimeo = dtr_set_rcvtimeo,
 		.get_rcvtimeo = dtr_get_rcvtimeo,
 		.send_page = dtr_send_page,
-		.send_zc_bio = dtr_send_zc_bio,
-		.recv_pages = dtr_recv_pages,
+		.send_bio = dtr_send_bio,
+		.recv_bio = dtr_recv_bio,
 		.stream_ok = dtr_stream_ok,
 		.hint = dtr_hint,
 		.debugfs_show = dtr_debugfs_show,
@@ -612,13 +608,14 @@ out:
 }
 
 
-static int dtr_recv_pages(struct drbd_transport *transport, struct drbd_page_chain_head *chain, size_t size)
+static int dtr_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size)
 {
 	struct dtr_transport *rdma_transport =
 		container_of(transport, struct dtr_transport, transport);
 	struct dtr_stream *rdma_stream = &rdma_transport->stream[DATA_STREAM];
-	struct page *page, *head = NULL, *tail = NULL;
-	int i = 0;
+	size_t remaining = size;
+	struct page *page;
+	int err, i = 0;
 
 	if (!dtr_transport_ok(transport))
 		return -ECONNRESET;
@@ -628,7 +625,7 @@ static int dtr_recv_pages(struct drbd_transport *transport, struct drbd_page_cha
 	dtr_recycle_rx_desc(transport, DATA_STREAM, &rdma_stream->current_rx.desc, GFP_NOIO);
 	dtr_refill_rx_desc(rdma_transport, DATA_STREAM);
 
-	while (size) {
+	while (remaining) {
 		struct dtr_rx_desc *rx_desc = NULL;
 		long t;
 
@@ -636,15 +633,8 @@ static int dtr_recv_pages(struct drbd_transport *transport, struct drbd_page_cha
 					dtr_receive_rx_desc(rdma_transport, DATA_STREAM, &rx_desc),
 					rdma_stream->recv_timeout);
 
-		if (t <= 0) {
-			/*
-			 * Cannot give back pages that may still be in use!
-			 * (More reason why we only have one rx_desc per page,
-			 * and don't get_page() in dtr_create_rx_desc).
-			 */
-			drbd_free_pages(transport, head);
+		if (t <= 0)
 			return t == 0 ? -EAGAIN : -EINTR;
-		}
 
 		page = rx_desc->page;
 		/* put_page() if we would get_page() in
@@ -652,30 +642,16 @@ static int dtr_recv_pages(struct drbd_transport *transport, struct drbd_page_cha
 		 * chain to the user, which is supposed to give it back to
 		 * drbd_free_pages() eventually. */
 		rx_desc->page = NULL;
-		size -= rx_desc->size;
+		remaining -= rx_desc->size;
 
 		/* If the sender did dtr_send_page every bvec of a bio with
 		 * unaligned bvecs (as xfs often creates), rx_desc->size and
 		 * offset may well be not the PAGE_SIZE and 0 we hope for.
 		 */
-		if (tail) {
-			/* See also dtr_create_rx_desc().
-			 * For PAGE_SIZE > 4k, we may create several RR per page.
-			 * We cannot link a page to itself, though.
-			 *
-			 * Adding to size would be easy enough.
-			 * But what do we do about possible holes?
-			 * FIXME
-			 */
-			BUG_ON(page == tail);
 
-			set_page_chain_next(tail, page);
-			tail = page;
-		} else
-			head = tail = page;
-
-		set_page_chain_offset(page, 0);
-		set_page_chain_size(page, rx_desc->size);
+		err = drbd_bio_add_page(transport, bios, page, rx_desc->size, 0);
+		if (err < 0)
+			return err;
 
 		atomic_dec(&rx_desc->cm->path->flow[DATA_STREAM].rx_descs_allocated);
 		dtr_free_rx_desc(rx_desc);
@@ -685,9 +661,7 @@ static int dtr_recv_pages(struct drbd_transport *transport, struct drbd_page_cha
 	}
 
 	// pr_info("%s: rcvd %d pages\n", rdma_stream->name, i);
-	chain->head = head;
-	chain->nr_pages = i;
-	return 0;
+	return size;
 }
 
 static int _dtr_recv(struct drbd_transport *transport, enum drbd_stream stream,
@@ -2025,7 +1999,7 @@ static void dtr_free_rx_desc(struct dtr_rx_desc *rx_desc)
 
 		/* put_page(), if we had more than one rx_desc per page,
 		 * but see comments in dtr_create_rx_desc */
-		drbd_free_pages(transport, rx_desc->page);
+		drbd_free_page(transport, rx_desc->page);
 	}
 	kfree(rx_desc);
 }
@@ -2034,23 +2008,17 @@ static int dtr_create_rx_desc(struct dtr_flow *flow, gfp_t gfp_mask, bool connec
 {
 	struct dtr_path *path = flow->path;
 	struct drbd_transport *transport = path->path.transport;
-	struct dtr_transport *rdma_transport =
-		container_of(transport, struct dtr_transport, transport);
 	struct dtr_rx_desc *rx_desc;
 	struct page *page;
-	int err, alloc_size = rdma_transport->rx_allocation_size;
-	int nr_pages = alloc_size / PAGE_SIZE;
+	int err;
 	struct dtr_cm *cm;
 
 	rx_desc = kzalloc(sizeof(*rx_desc), gfp_mask);
 	if (!rx_desc)
 		return -ENOMEM;
 
-	/* As of now, this MUST NEVER return a highmem page!
-	 * Which means no other user may ever have requested and then given
-	 * back a highmem page!
-	 */
-	page = drbd_alloc_pages(transport, nr_pages, gfp_mask);
+	/* Ignoring rdma_transport->rx_allocation_size for now! */
+	page = drbd_alloc_pages(transport, gfp_mask, PAGE_SIZE);
 	if (!page) {
 		kfree(rx_desc);
 		return -ENOMEM;
@@ -2068,14 +2036,14 @@ static int dtr_create_rx_desc(struct dtr_flow *flow, gfp_t gfp_mask, bool connec
 	rx_desc->page = page;
 	rx_desc->size = 0;
 	rx_desc->sge.lkey = dtr_cm_to_lkey(cm);
-	rx_desc->sge.addr = ib_dma_map_single(cm->id->device, page_address(page), alloc_size,
+	rx_desc->sge.addr = ib_dma_map_single(cm->id->device, page_address(page), PAGE_SIZE,
 					      DMA_FROM_DEVICE);
 	err = ib_dma_mapping_error(cm->id->device, rx_desc->sge.addr);
 	if (err) {
 		tr_err(transport, "ib_dma_map_single() failed %d\n", err);
 		goto out_put;
 	}
-	rx_desc->sge.length = alloc_size;
+	rx_desc->sge.length = PAGE_SIZE;
 
 	atomic_inc(&flow->rx_descs_allocated);
 	atomic_inc(&flow->rx_descs_posted);
@@ -2092,7 +2060,7 @@ out_put:
 	kref_put(&cm->kref, dtr_destroy_cm);
 out:
 	kfree(rx_desc);
-	drbd_free_pages(transport, page);
+	drbd_free_page(transport, page);
 	return err;
 }
 
@@ -3182,11 +3150,12 @@ static void dtr_update_congested(struct drbd_transport *transport)
 }
 
 static int dtr_send_page(struct drbd_transport *transport, enum drbd_stream stream,
-			 struct page *page, int offset, size_t size, unsigned msg_flags)
+			 struct page *caller_page, int offset, size_t size, unsigned int msg_flags)
 {
 	struct dtr_transport *rdma_transport =
 		container_of(transport, struct dtr_transport, transport);
 	struct dtr_tx_desc *tx_desc;
+	struct page *page;
 	int err;
 
 	// pr_info("%s: in send_page, size: %zu\n", rdma_stream->name, size);
@@ -3198,7 +3167,30 @@ static int dtr_send_page(struct drbd_transport *transport, enum drbd_stream stre
 	if (!tx_desc)
 		return -ENOMEM;
 
-	get_page(page); /* The put_page() is in dtr_tx_cqe_done() */
+	if (msg_flags & MSG_SPLICE_PAGES) {
+		page = caller_page;
+		get_page(page); /* The put_page() is in dtr_free_tx_desc() */
+	} else {
+		void *from;
+
+		/*
+		 * Allocate a page outside of DRBD's managed page pool, as
+		 * the TCP transport does implicitly by handing the caller's
+		 * page to the socket layer. Backpressure against unbounded
+		 * allocations comes from dtr_post_tx_desc(), which respects
+		 * tx_descs_max (derived from sndbuf_size).
+		 */
+		page = alloc_page(GFP_NOIO);
+		if (!page) {
+			kfree(tx_desc);
+			return -ENOMEM;
+		}
+		from = kmap_local_page(caller_page);
+		memcpy(page_address(page), from + offset, size);
+		kunmap_local(from);
+		offset = 0;
+	}
+
 	tx_desc->type = SEND_PAGE;
 	tx_desc->page = page;
 	tx_desc->nr_sges = 1;
@@ -3311,7 +3303,7 @@ static int dtr_send_bio_part(struct dtr_transport *rdma_transport,
 }
 #endif
 
-static int dtr_send_zc_bio(struct drbd_transport *transport, struct bio *bio)
+static int dtr_send_bio(struct drbd_transport *transport, struct bio *bio, unsigned int msg_flags)
 {
 #if SENDER_COMPACTS_BVECS
 	struct dtr_transport *rdma_transport =
@@ -3329,6 +3321,7 @@ static int dtr_send_zc_bio(struct drbd_transport *transport, struct bio *bio)
 		return -ECONNRESET;
 
 #if SENDER_COMPACTS_BVECS
+	/* TODO obey !MSG_SPLICE_PAGES in msg_flags */
 	bio_for_each_segment(bvec, bio, iter) {
 		size_tx_desc += bvec.bv_len;
 		//tr_info(transport, " bvec len = %d\n", bvec.bv_len);
@@ -3358,8 +3351,7 @@ out:
 #else
 	bio_for_each_segment(bvec, bio, iter) {
 		err = dtr_send_page(transport, DATA_STREAM,
-			bvec.bv_page, bvec.bv_offset, bvec.bv_len,
-			0 /* flags currently unused by dtr_send_page */);
+			bvec.bv_page, bvec.bv_offset, bvec.bv_len, msg_flags);
 		if (err)
 			break;
 	}

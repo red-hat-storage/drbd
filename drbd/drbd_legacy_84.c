@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2025, LINBIT HA-Solutions GmbH.
+ */
 
 #include "drbd_legacy_84.h"
+#include "drbd_meta_data.h"
 
 /*
  *   drbd-8.4                      drbd-9 md.flags                   drbd-9 peer-md.flags
@@ -36,7 +40,7 @@ struct meta_data_on_disk_84 {
 	u32 al_nr_extents;     /* important for restoring the AL (userspace) */
 	      /* `-- act_log->nr_elements <-- ldev->dc.al_extents */
 	u32 bm_offset;         /* offset to the bitmap, from here */
-	u32 bm_bytes_per_bit;  /* BM_BLOCK_SIZE */
+	u32 bm_bytes_per_bit;  /* 4k. Treat as magic number, must keep it compatible. */
 	u32 la_peer_max_bio_size;   /* last peer max_bio_size */
 
 	/* see al_tr_number_to_on_disk_sector() */
@@ -56,9 +60,10 @@ static const char * const drbd_conn_s_names[] = {
 	[C_NETWORK_FAILURE]  = "NetworkFailure",
 	[C_PROTOCOL_ERROR]   = "ProtocolError",
 	[C_CONNECTING]       = "WFConnection",
-	/* [C_WF_REPORT_PARAMS] = "WFReportParams", */
+	/* [C_WF_REPORT_PARAMS] = "WFReportParams", does no longer exist in drbd-9.x */
 	[C_TEAR_DOWN]        = "TearDown",
-	[C_CONNECTED]        = "Connected",
+	[C_CONNECTED]        = "WFReportParams", /* drbd-8.4 for "Negotiating" or "Off" */
+	[L_ESTABLISHED]      = "Connected",
 	[L_STARTING_SYNC_S]  = "StartingSyncS",
 	[L_STARTING_SYNC_T]  = "StartingSyncT",
 	[L_WF_BITMAP_S]      = "WFBitMapS",
@@ -141,6 +146,9 @@ void drbd_md_encode_84(struct drbd_device *device, struct meta_data_on_disk_84 *
 	u32 flags = (md->flags & MDF_84_MASK) | (peer_md->flags & MDF_84_PEER_MASK);
 	int i;
 
+	if (device->bitmap == NULL)
+		flags |= MDF_PEER_FULL_SYNC;
+
 	flags |= peer_md->flags & MDF_PEER_OUTDATED ? MDF_84_PEER_OUTDATED : 0;
 	flags |= peer_md->flags & MDF_PEER_CONNECTED ? MDF_84_CONNECTED_IND : 0;
 	buffer->la_size_sect = cpu_to_be64(md->effective_size);
@@ -156,7 +164,7 @@ void drbd_md_encode_84(struct drbd_device *device, struct meta_data_on_disk_84 *
 	buffer->al_offset = cpu_to_be32(md->al_offset);
 	buffer->al_nr_extents = cpu_to_be32(device->act_log->nr_elements);
 	buffer->bm_offset = cpu_to_be32(md->bm_offset);
-	buffer->bm_bytes_per_bit = cpu_to_be32(BM_BLOCK_SIZE);
+	buffer->bm_bytes_per_bit = cpu_to_be32(BM_BLOCK_SIZE_4k); /* treat as magic number */
 	buffer->la_peer_max_bio_size = cpu_to_be32(device->device_conf.max_bio_size);
 
 	buffer->al_stripes = cpu_to_be32(md->al_stripes);
@@ -296,11 +304,11 @@ static void seq_printf_with_thousands_grouping(struct seq_file *seq, long v)
 /* like bit_to_kb(), but accepts a signed bit count so we can express a
  * negative kB/sec rate when the out-of-sync set is growing.
  */
-static long signed_bit_to_kb(long bits)
+static long signed_bit_to_kb(long bits, unsigned int bm_block_shift)
 {
 	if (bits < 0)
-		return -(long)Bit2KB(-bits);
-	return Bit2KB(bits);
+		return -(long)bit_to_kb(-bits, bm_block_shift);
+	return bit_to_kb(bits, bm_block_shift);
 }
 
 static void drbd_get_syncer_progress(struct drbd_peer_device *pd,
@@ -357,6 +365,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 	unsigned int res;
 	int i, x, y;
 	int stalled = 0;
+	unsigned int bm_block_shift = pd->device->last_bm_block_shift;
 
 	drbd_get_syncer_progress(pd, repl_state, &rs_total, &rs_left, &res);
 
@@ -377,14 +386,14 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 	seq_printf(seq, "%3u.%u%% ", res / 10, res % 10);
 
 	/* if more than a few GB, display in MB */
-	if (rs_total > (4UL << (30 - BM_BLOCK_SHIFT)))
-		seq_printf(seq, "(%lu/%lu)M",
-			    (unsigned long) Bit2KB(rs_left >> 10),
-			    (unsigned long) Bit2KB(rs_total >> 10));
+	if (rs_total > (4UL << (30 - bm_block_shift)))
+		seq_printf(seq, "(%llu/%llu)M",
+			    bit_to_kb(rs_left >> 10, bm_block_shift),
+			    bit_to_kb(rs_total >> 10, bm_block_shift));
 	else
-		seq_printf(seq, "(%lu/%lu)K",
-			    (unsigned long) Bit2KB(rs_left),
-			    (unsigned long) Bit2KB(rs_total));
+		seq_printf(seq, "(%llu/%llu)K",
+			    bit_to_kb(rs_left, bm_block_shift),
+			    bit_to_kb(rs_total, bm_block_shift));
 
 	seq_puts(seq, "\n\t");
 
@@ -421,7 +430,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 			rt / 3600, (rt % 3600) / 60, rt % 60);
 	}
 
-	dbdt = signed_bit_to_kb(db / (long)dt);
+	dbdt = signed_bit_to_kb(db / (long)dt, bm_block_shift);
 	seq_puts(seq, " speed: ");
 	seq_printf_with_thousands_grouping(seq, dbdt);
 	seq_puts(seq, " (");
@@ -433,7 +442,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 		if (!dt)
 			dt++;
 		db = (long)pd->rs_mark_left[i] - (long)rs_left;
-		dbdt = signed_bit_to_kb(db / (long)dt);
+		dbdt = signed_bit_to_kb(db / (long)dt, bm_block_shift);
 		seq_printf_with_thousands_grouping(seq, dbdt);
 		seq_puts(seq, " -- ");
 	}
@@ -444,7 +453,7 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 	if (dt == 0)
 		dt = 1;
 	db = (long)rs_total - (long)rs_left;
-	dbdt = signed_bit_to_kb(db / (long)dt);
+	dbdt = signed_bit_to_kb(db / (long)dt, bm_block_shift);
 	seq_printf_with_thousands_grouping(seq, dbdt);
 	seq_putc(seq, ')');
 
@@ -472,8 +481,8 @@ static void drbd_syncer_progress(struct drbd_peer_device *pd, struct seq_file *s
 		seq_printf(seq,
 			"\t%3d%% sector pos: %llu/%llu",
 			(int)(bit_pos / (bm_bits/100+1)),
-			(unsigned long long)bit_pos * BM_SECT_PER_BIT,
-			(unsigned long long)bm_bits * BM_SECT_PER_BIT);
+			(unsigned long long)bit_pos * sect_per_bit(bm_block_shift),
+			(unsigned long long)bm_bits * sect_per_bit(bm_block_shift));
 		if (stop_sector != 0 && stop_sector != ULLONG_MAX)
 			seq_printf(seq, " stop sector: %llu", stop_sector);
 		seq_putc(seq, '\n');
@@ -566,7 +575,7 @@ static int seq_print_device_proc_drbd(struct seq_file *m, struct drbd_device *de
 			   write_ordering_chars[device->resource->write_ordering]
 			);
 		seq_printf(m, " oos:%llu\n", (peer_device && have_ldev) ?
-				Bit2KB((unsigned long long)drbd_bm_total_weight(peer_device)) : 0);
+				device_bit_to_kb(device, drbd_bm_total_weight(peer_device)) : 0);
 	}
 	if (have_ldev) {
 		if (state.conn == L_SYNC_SOURCE ||

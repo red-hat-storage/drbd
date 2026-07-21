@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
-   drbd_transport_tcp.c
-
-   This file is part of DRBD.
-
-   Copyright (C) 2014-2017, LINBIT HA-Solutions GmbH.
-
-
-*/
+ * Copyright (C) 2014, LINBIT HA-Solutions GmbH.
+ */
 
 #include <linux/module.h>
 #include <linux/errno.h>
@@ -104,8 +98,6 @@ struct dtt_path {
 	struct list_head sockets; /* sockets passed to me by other receiver threads */
 };
 
-/* From drbd_transport.c; here because drbd-headers is frozen for drbd-9.2 */
-struct drbd_listener *drbd_listener_try_get_ref(struct drbd_path *path);
 
 static int dtt_init(struct drbd_transport *transport);
 static void dtt_free(struct drbd_transport *transport, enum drbd_tr_free_op free_op);
@@ -117,14 +109,14 @@ static int dtt_prepare_connect(struct drbd_transport *transport);
 static int dtt_connect(struct drbd_transport *transport);
 static void dtt_finish_connect(struct drbd_transport *transport);
 static int dtt_recv(struct drbd_transport *transport, enum drbd_stream stream, void **buf, size_t size, int flags);
-static int dtt_recv_pages(struct drbd_transport *transport, struct drbd_page_chain_head *chain, size_t size);
+static int dtt_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size);
 static void dtt_stats(struct drbd_transport *transport, struct drbd_transport_stats *stats);
 static int dtt_net_conf_change(struct drbd_transport *transport, struct net_conf *new_net_conf);
 static void dtt_set_rcvtimeo(struct drbd_transport *transport, enum drbd_stream stream, long timeout);
 static long dtt_get_rcvtimeo(struct drbd_transport *transport, enum drbd_stream stream);
 static int dtt_send_page(struct drbd_transport *transport, enum drbd_stream, struct page *page,
-		int offset, size_t size, unsigned msg_flags);
-static int dtt_send_zc_bio(struct drbd_transport *, struct bio *bio);
+		int offset, size_t size, unsigned int msg_flags);
+static int dtt_send_bio(struct drbd_transport *, struct bio *bio, unsigned int msg_flags);
 static bool dtt_stream_ok(struct drbd_transport *transport, enum drbd_stream stream);
 static bool dtt_hint(struct drbd_transport *transport, enum drbd_stream stream, enum drbd_tr_hints hint);
 static void dtt_debugfs_show(struct drbd_transport *transport, struct seq_file *m);
@@ -148,13 +140,13 @@ static struct drbd_transport_class tcp_transport_class = {
 		.connect = dtt_connect,
 		.finish_connect = dtt_finish_connect,
 		.recv = dtt_recv,
-		.recv_pages = dtt_recv_pages,
+		.recv_bio = dtt_recv_bio,
 		.stats = dtt_stats,
 		.net_conf_change = dtt_net_conf_change,
 		.set_rcvtimeo = dtt_set_rcvtimeo,
 		.get_rcvtimeo = dtt_get_rcvtimeo,
 		.send_page = dtt_send_page,
-		.send_zc_bio = dtt_send_zc_bio,
+		.send_bio = dtt_send_bio,
 		.stream_ok = dtt_stream_ok,
 		.hint = dtt_hint,
 		.debugfs_show = dtt_debugfs_show,
@@ -360,41 +352,40 @@ static int dtt_recv(struct drbd_transport *transport, enum drbd_stream stream, v
 	return rv;
 }
 
-static int dtt_recv_pages(struct drbd_transport *transport, struct drbd_page_chain_head *chain, size_t size)
+
+static int dtt_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size)
 {
 	struct drbd_tcp_transport *tcp_transport =
 		container_of(transport, struct drbd_tcp_transport, transport);
 	struct socket *socket = tcp_transport->stream[DATA_STREAM];
+	size_t remaining = size;
 	struct page *page;
 	int err;
 
 	if (!socket)
 		return -ENOTCONN;
 
-	drbd_alloc_page_chain(transport, chain, DIV_ROUND_UP(size, PAGE_SIZE), GFP_TRY);
-	page = chain->head;
-	if (!page)
-		return -ENOMEM;
+	do {
+		size_t len;
 
-	page_chain_for_each(page) {
-		size_t len = min_t(int, size, PAGE_SIZE);
-		void *data = kmap(page);
-		err = dtt_recv_short(socket, data, len, 0);
-		kunmap(page);
-		set_page_chain_offset(page, 0);
-		set_page_chain_size(page, len);
+		page = drbd_alloc_pages(transport, GFP_KERNEL, remaining);
+		if (!page)
+			return -ENOMEM;
+		len = min(PAGE_SIZE << compound_order(page), remaining);
+
+		err = dtt_recv_short(socket, page_address(page), len, 0);
+		if (err <= 0)
+			goto fail;
+		remaining -= err;
+		err = drbd_bio_add_page(transport, bios, page, len, 0);
 		if (err < 0)
 			goto fail;
-		size -= err;
-	}
-	if (unlikely(size)) {
-		tr_warn(transport, "Not enough data received; missing %zu bytes\n", size);
-		err = -ENODATA;
-		goto fail;
-	}
-	return 0;
+	} while (remaining > 0);
+
+	return size;
+
 fail:
-	drbd_free_page_chain(transport, chain);
+	drbd_free_page(transport, page);
 	return err;
 }
 
@@ -1537,22 +1528,50 @@ static int dtt_send_page(struct drbd_transport *transport, enum drbd_stream stre
 	struct drbd_tcp_transport *tcp_transport =
 		container_of(transport, struct drbd_tcp_transport, transport);
 	struct socket *socket = tcp_transport->stream[stream];
-	struct msghdr msg = { .msg_flags = msg_flags | MSG_NOSIGNAL | MSG_SPLICE_PAGES };
+	struct net_conf *nc;
+	struct msghdr msg;
 	struct bio_vec bvec;
 	int len = size;
 	int err = -EIO;
+	bool tls;
 
 	if (!socket)
 		return -ENOTCONN;
+
+	rcu_read_lock();
+	nc = rcu_dereference(transport->net_conf);
+	tls = nc && nc->tls;
+	rcu_read_unlock();
+
+	/* With kTLS the payload is encrypted into freshly allocated TLS records,
+	 * so there is no zero-copy to preserve. Doing so would cause page ref bugs.
+	 */
+	if (tls)
+		msg_flags &= ~MSG_SPLICE_PAGES;
+
+	msg = (struct msghdr) { .msg_flags = msg_flags | MSG_NOSIGNAL };
 
 	dtt_update_congested(tcp_transport);
 	do {
 		int sent;
 
-		bvec_set_page(&bvec, page, len, offset);
-		iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, len);
+		if (tls) {
+			/* Map and send at most one page at a time. */
+			struct page *p = page + (offset >> PAGE_SHIFT);
+			unsigned int poff = offset & ~PAGE_MASK;
+			unsigned int chunk = min_t(int, len, PAGE_SIZE - poff);
+			void *addr = kmap_local_page(p);
+			struct kvec iov = { .iov_base = addr + poff, .iov_len = chunk };
 
-		sent = sock_sendmsg(socket, &msg);
+			iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, chunk);
+			sent = sock_sendmsg(socket, &msg);
+			kunmap_local(addr);
+		} else {
+			bvec_set_page(&bvec, page, len, offset);
+			iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, len);
+
+			sent = sock_sendmsg(socket, &msg);
+		}
 		if (sent <= 0) {
 			if (sent == -EAGAIN) {
 				if (drbd_stream_send_timed_out(transport, stream))
@@ -1582,7 +1601,7 @@ static int dtt_send_page(struct drbd_transport *transport, enum drbd_stream stre
 	return err;
 }
 
-static int dtt_send_zc_bio(struct drbd_transport *transport, struct bio *bio)
+static int dtt_send_bio(struct drbd_transport *transport, struct bio *bio, unsigned int msg_flags)
 {
 	struct bio_vec bvec;
 	struct bvec_iter iter;
@@ -1592,7 +1611,7 @@ static int dtt_send_zc_bio(struct drbd_transport *transport, struct bio *bio)
 
 		err = dtt_send_page(transport, DATA_STREAM, bvec.bv_page,
 				      bvec.bv_offset, bvec.bv_len,
-				      bio_iter_last(bvec, iter) ? 0 : MSG_MORE);
+				      msg_flags | (bio_iter_last(bvec, iter) ? 0 : MSG_MORE));
 		if (err)
 			return err;
 	}

@@ -1,13 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
-   drbd_req.h
-
-   This file is part of DRBD by Philipp Reisner and Lars Ellenberg.
-
-   Copyright (C) 2006-2008, LINBIT Information Technologies GmbH.
-   Copyright (C) 2006-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
-   Copyright (C) 2006-2008, Philipp Reisner <philipp.reisner@linbit.com>.
-
+ * Copyright (C) 2006-2008, Lars Ellenberg <lars.ellenberg@linbit.com>.
+ * Copyright (C) 2006-2008, Philipp Reisner <philipp.reisner@linbit.com>.
+ * Copyright (C) 2006-2008, LINBIT Information Technologies GmbH.
+ * Copyright (C) 2008, LINBIT HA-Solutions GmbH.
  */
 
 #ifndef _DRBD_REQ_H
@@ -69,7 +65,8 @@ enum drbd_req_event {
 	NEW_NET_READ,
 	NEW_NET_WRITE,
 	NEW_NET_OOS,
-	ADDED_TO_TRANSFER_LOG,
+	READY_FOR_NET,
+	SKIP_OOS,
 
 	/* For an empty flush, mark that a corresponding barrier has been sent
 	 * to this peer. This causes it to complete "successfully", even if the
@@ -113,32 +110,51 @@ enum drbd_req_event {
  */
 enum drbd_req_state_bits {
 	/*
-	 * Here are the possible combinations of the core net flags pending,
-	 * queued, sent, done, ok.
+	 * Here are the possible combinations of the core net flags pending, pending-oos,
+	 * queued, ready, sent, done, ok.
 	 *
 	 * <none>:
 	 *   No network required, or not yet processed.
-	 * pending:
-	 *   Intended for this peer, but not yet queued, or connection lost. If
-	 *   IO is suspended, it will stay in this state until the connection
-	 *   is restored or IO is resumed.
 	 * pending,queued:
-	 *   To be sent, on transfer log to be processed by sender.
-	 * pending,sent:
+	 *   To be sent, must not be processed yet.
+	 * pending,queued,ready:
+	 *   To be sent, processing allowed.
+	 * pending,ready,sent:
 	 *   Sent, expecting P_RECV_ACK (B) or P_WRITE_ACK (C).
-	 * sent,ok:
+	 * queued,ready,ok:
+	 *   P_RECV_ACK (B) or P_WRITE_ACK (C) received before request marked
+	 *   as having been sent.
+	 * ready,sent,ok:
 	 *   Sent, implicit "ack" (A), P_RECV_ACK (B) or P_WRITE_ACK (C) received.
 	 *   Still waiting for the barrier ack.
 	 *   master_bio may already be completed and invalidated.
-	 * sent,done,ok:
+	 * pending:
+	 *   Intended for this peer, but connection lost before processing
+	 *   allowed.
+	 * pending,ready:
+	 *   Intended for this peer, but connection lost. If
+	 *   IO is suspended, it will stay in this state until the connection
+	 *   is restored or IO is resumed.
+	 * ready,sent,done,ok:
 	 *   Data received (for remote read, any protocol),
 	 *   or finally the barrier ack has arrived.
-	 * sent,done:
+	 * ready,sent,done:
 	 *   Received P_NEG_ACK for write (protocol C, or we are SyncSource),
 	 *   or P_NEG_DREPLY for read (any protocol).
-	 *   Or cleaned up after connection loss.
+	 *   Or cleaned up after connection loss after send.
+	 * pending-oos,queued,done:
+	 *   P_OUT_OF_SYNC to be sent, must not be processed yet.
+	 * pending-oos,queued,ready,done:
+	 *   P_OUT_OF_SYNC to be sent, processing allowed.
+	 * queued,ready,done:
+	 *   P_OUT_OF_SYNC was intended, but skipped.
 	 * done:
-	 *   Canceled, send failed, or P_OUT_OF_SYNC sent.
+	 *   P_OUT_OF_SYNC was intended, but connection lost before processing
+	 *   allowed.
+	 * ready,done:
+	 *   P_OUT_OF_SYNC sent.
+	 *   Or cleaned up after connection loss, either before send or when
+	 *   only P_OUT_OF_SYNC was intended.
 	 */
 
 	/* Pending some network interaction towards the peer apart from
@@ -147,13 +163,19 @@ enum drbd_req_state_bits {
 	 * While set, the master_bio may not be completed. */
 	__RQ_NET_PENDING,
 
-	/* Queued for sending but not yet sent. */
+	/* Pending send of P_OUT_OF_SYNC */
+	__RQ_NET_PENDING_OOS,
+
+	/* The sender might store pointers to it */
 	__RQ_NET_QUEUED,
+
+	/* Ready for processing by the sender */
+	__RQ_NET_READY,
 
 	/* Well, actually only "handed over to the network stack". */
 	__RQ_NET_SENT,
 
-	/* When set, the request may be freed, as far as interaction with this
+	/* When set, the data stage is done, as far as interaction with this
 	 * peer is concerned. Basically this means the corresponding
 	 * P_BARRIER_ACK was received. */
 	__RQ_NET_DONE,
@@ -228,7 +250,9 @@ enum drbd_req_state_bits {
 	__RQ_UNCONF_GEN,
 };
 #define RQ_NET_PENDING     (1UL << __RQ_NET_PENDING)
+#define RQ_NET_PENDING_OOS (1UL << __RQ_NET_PENDING_OOS)
 #define RQ_NET_QUEUED      (1UL << __RQ_NET_QUEUED)
+#define RQ_NET_READY       (1UL << __RQ_NET_READY)
 #define RQ_NET_SENT        (1UL << __RQ_NET_SENT)
 #define RQ_NET_DONE        (1UL << __RQ_NET_DONE)
 #define RQ_NET_OK          (1UL << __RQ_NET_OK)
@@ -293,6 +317,7 @@ void __req_mod(struct drbd_request *req, enum drbd_req_event what,
 void complete_master_bio(struct drbd_device *device, struct bio_and_error *m);
 void drbd_release_conflicts(struct drbd_device *device,
 			    struct drbd_interval *release_interval);
+void drbd_put_ref_tl_walk(struct drbd_request *req, int done_put, int oos_send_put);
 void drbd_set_pending_out_of_sync(struct drbd_peer_device *peer_device);
 void request_timer_fn(struct timer_list *t);
 void tl_walk(struct drbd_connection *connection,

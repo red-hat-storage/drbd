@@ -1,6 +1,6 @@
 Name: drbd-kernel
 Summary: Kernel driver for DRBD
-Version: 9.2.19
+Version: 9.3.3
 Release: 1
 
 # always require a suitable userland
@@ -232,62 +232,14 @@ dkms remove -m $DKMS_NAME -v $DKMS_VERSION -q --all --rpm_safe_upgrade || :
 %endif
 
 %changelog
-* Tue Jun 30 2026 Philipp Reisner <phil@linbit.com> - 9.2.19
--  New upstream release.
+* Tue Jun 30 2026 Philipp Reisner <phil@linbit.com> - 9.3.3
+-  New upstream release
 
-* Mon Apr 20 2026 Philipp Reisner <phil@linbit.com> - 9.2.18
--  New upstream release.
+* Mon Apr 20 2026 Philipp Reisner <phil@linbit.com> - 9.3.2
+-  New upstream release
 
-* Mon Mar 09 2026 Philipp Reisner <phil@linbit.com> - 9.2.17
--  New upstream release.
+* Mon Mar 09 2026 Philipp Reisner <phil@linbit.com> - 9.3.1
+-  New upstream release
 
-* Tue Nov 25 2025 Philipp Reisner <phil@linbit.com> - 9.2.16
--  New upstream release.
-
-* Wed Sep 22 2025 Philipp Reisner <phil@linbit.com> - 9.2.15
--  New upstream release.
-
-* Tue Jun  3 2025 Philipp Reisner <phil@linbit.com> - 9.2.14
--  New upstream release.
-
-* Mon Mar 24 2025 Philipp Reisner <phil@linbit.com> - 9.2.13
--  New upstream release.
-
-* Mon Nov 18 2024 Philipp Reisner <phil@linbit.com> - 9.2.12
--  New upstream release.
-
-* Mon Aug 12 2024 Philipp Reisner <phil@linbit.com> - 9.2.11
--  New upstream release.
-
-* Mon Jun  3 2024 Philipp Reisner <phil@linbit.com> - 9.2.10
--  New upstream release.
-
-* Tue Apr 30 2024 Philipp Reisner <phil@linbit.com> - 9.2.9
--  New upstream release.
-
-* Tue Mar 05 2024 Philipp Reisner <phil@linbit.com> - 9.2.8
--  New upstream release.
-
-* Fri Dec 22 2023 Philipp Reisner <phil@linbit.com> - 9.2.7
--  New upstream release.
-
-* Tue Oct 31 2023 Philipp Reisner <phil@linbit.com> - 9.2.6
--  New upstream release.
-
-* Wed Aug 09 2023 Philipp Reisner <phil@linbit.com> - 9.2.5
--  New upstream release.
-
-* Mon Jun 05 2023 Philipp Reisner <phil@linbit.com> - 9.2.4
--  New upstream release.
-
-* Tue Apr 04 2023 Philipp Reisner <phil@linbit.com> - 9.2.3
--  New upstream release.
-
-* Mon Jan 30 2023 Philipp Reisner <phil@linbit.com> - 9.2.2
--  New upstream release.
-
-* Mon Nov 14 2022 Philipp Reisner <phil@linbit.com> - 9.2.1
--  New upstream release.
-
-* Mon Oct 10 2022 Philipp Reisner <phil@linbit.com> - 9.2.0
--  New upstream release.
+* Mon Dec  1 2025 Philipp Reisner <phil@linbit.com> - 9.3.0
+-  Fresh release

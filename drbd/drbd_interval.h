@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * Copyright (C) 2011, LINBIT HA-Solutions GmbH.
+ */
+
 #ifndef __DRBD_INTERVAL_H
 #define __DRBD_INTERVAL_H
 
@@ -61,6 +65,23 @@ enum drbd_interval_flags {
 
 	/* For resync requests: whether this was canceled while waiting for conflict resolution. */
 	INTERVAL_CANCELED,
+
+	/*
+	 * For local requests: whether this is done.
+	 *
+	 * Included here instead of in local_rq_state to allow access with
+	 * atomic bit operations instead of taking rq_lock.
+	 */
+	INTERVAL_DONE,
+
+	/*
+	 * For local requests: when we put the AL extent for this request, it
+	 * was the last in that extent.
+	 *
+	 * Included here instead of in local_rq_state to allow access with
+	 * atomic bit operations instead of taking rq_lock.
+	 */
+	INTERVAL_AL_EXTENT_LAST,
 };
 
 /* Intervals used to manage conflicts between application requests and various
@@ -88,7 +109,7 @@ enum drbd_interval_flags {
  * are simply cancelled. Futhermore, they do not lock out other requests;
  * instead they are simply marked as having conflicts and ignored.
  *
- * Application request intervals are retained even when they are
+ * Application write request intervals are retained even when they are
  * "INTERVAL_COMPLETED", so that they can be used to look up remote replies
  * that are still pending.
  */

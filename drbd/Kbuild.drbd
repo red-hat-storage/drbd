@@ -45,19 +45,12 @@ CONFIG_BLK_DEV_DRBD := m
 obj-$(CONFIG_BLK_DEV_DRBD)       += drbd.o
 obj-$(CONFIG_BLK_DEV_DRBD)       += drbd_transport_tcp.o
 obj-$(CONFIG_BLK_DEV_DRBD)       += drbd_transport_lb-tcp.o
-# The RDMA transport requires the ib_alloc_cq API (upstream v4.5+, RHEL 7.4+).
-# Older kernels with CONFIG_INFINIBAND but without this API cannot build it.
-COMPAT_IB_ALLOC_CQ := $(shell grep -qe '^.define COMPAT_HAVE_IB_ALLOC_CQ$$' $(src)/compat.h 2>/dev/null && echo yes)
-obj-$(if $(and $(CONFIG_INFINIBAND),$(COMPAT_IB_ALLOC_CQ)),m) += drbd_transport_rdma.o
+obj-$(if $(CONFIG_INFINIBAND),m) += drbd_transport_rdma.o
 obj-$(COMPAT_NET_HANDSHAKE)      += drbd-kernel-compat/handshake/
 # ================================================================
 
 ifdef CONFIG_DEV_DAX_PMEM
-ifneq ($(shell grep -e '\<arch_wb_cache_pmem\>' $(objtree)/Module.symvers | wc -l),1)
-override EXTRA_CFLAGS += -DDAX_PMEM_IS_INCOMPLETE
-else
 CONFIG_DRBD_DAX := y
-endif
 endif
 
 # enable fault injection by default
@@ -94,7 +87,6 @@ drbd-y += drbd_strings.o
 drbd-y += drbd_nl.o
 drbd-y += drbd_interval.o
 drbd-y += drbd_state.o
-drbd-y += drbd_nla.o
 drbd-y += drbd_transport.o
 drbd-y += $(compat_objs)
 
