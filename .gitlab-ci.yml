@@ -2,7 +2,7 @@ variables:
   RELEASE_BRANCH: master
   DRBD_VERSION_BASE: 9.3.0
   DRBD9_TESTS_REF: master
-  BUILD_HELPERS_VERSION: 04d2651f29fb4166b22e58c1f336899cc7603ce4
+  BUILD_HELPERS_VERSION: f25470fd968061a3353c114c8b7a0ea7eb567b7e
   # we have to change the way GitLab CI clones the repository.
   # by default, it is shallow, which gives us a wrong commit count when
   # we do `git rev-list --count origin/master` below.
@@ -40,6 +40,16 @@ stages:
           grep -v ^sles12 | grep -v ^rhel7 | grep -v ^sles15-sp0 | grep -v ^docker
       }
 
+      # upload the tarball in the current directory to the lbbuild-upstream
+      # repository on pulp.
+      upload_tarball() {
+        local tarball
+        tarball=$(ls drbd-*.tar.gz)
+        pulp file content upload --repository lbbuild-upstream \
+          --file "$tarball" \
+          --relative-path "$tarball"
+      }
+
       # parameters: [version] [release] [rel-version] [kernels]
       # kernels should be a string with lines with the format: "[distribution] [kernel version]"
       drbd_build () {
@@ -52,16 +62,11 @@ stages:
 
         ./.gitlab/drbd-prepare-release.sh "$version" "$release" "$rel_version"
         make FORCE=1 PRESERVE_DEBIAN=1 REL_VERSION="$rel_version" tarball
-        curl -isSf -u $LINBIT_REGISTRY_USER:$LINBIT_REGISTRY_PASSWORD \
-          --upload-file drbd-*.tar.gz \
-          $LINBIT_REGISTRY_URL/repository/lbbuild-upstream/
+        upload_tarball
 
-        local compat_rc=0  
+        local compat_rc=0
         echo "$kernels" | parallel --colsep ' ' -k -j24 --joblog compat.log \
           lbbuildctl build drbd --arch amd64 --ci -v "$rel_version" --compat-only \
-            -e LINBIT_REGISTRY_USER=$LINBIT_REGISTRY_USER \
-            -e LINBIT_REGISTRY_PASSWORD=$LINBIT_REGISTRY_PASSWORD \
-            -e LINBIT_REGISTRY_URL=$LINBIT_REGISTRY_URL \
             -d {1} -k {2} \
             || compat_rc=$?
 
@@ -75,7 +80,7 @@ stages:
         local compat_hs
         while read line; do
           kver=${line#* } # everything after " " -> the kernel version
-          curl -fsSLO "$LINBIT_REGISTRY_URL/repository/drbd-compat/$rel_version/compat.h.$kver"
+          curl -fsSLO "$LINBIT_PULP_BASE_URL/pulp/content/file/drbd-compat/$rel_version/compat.h.$kver"
           compat_hs+=("compat.h.$kver")
         done <<< "$kernels"
         ./build_cocci_cache.sh ${compat_hs[@]}
@@ -83,16 +88,11 @@ stages:
 
         make -j $(nproc) -C drbd compat
         make FORCE=1 PRESERVE_DEBIAN=1 REL_VERSION="$rel_version" tarball
-        curl -isSf -u $LINBIT_REGISTRY_USER:$LINBIT_REGISTRY_PASSWORD \
-          --upload-file drbd-*.tar.gz \
-          $LINBIT_REGISTRY_URL/repository/lbbuild-upstream/
+        upload_tarball
 
         local build_rc=0
         echo "$kernels" | parallel --colsep ' ' -k -j24 --joblog parallel.log \
           lbbuildctl build drbd --arch amd64 --ci -v "$rel_version" \
-            -e LINBIT_REGISTRY_USER=$LINBIT_REGISTRY_USER \
-            -e LINBIT_REGISTRY_PASSWORD=$LINBIT_REGISTRY_PASSWORD \
-            -e LINBIT_REGISTRY_URL=$LINBIT_REGISTRY_URL \
             -d {1} -k {2} \
             || build_rc=$?
 
@@ -179,14 +179,41 @@ build:for-tests:
     -   DRBD_VERSION=$DRBD_VERSION_BASE.$CI_COMMIT_SHA
     -   DRBD_RELEASE=1
     - fi
-    - echo DRBD_VERSION=$DRBD_VERSION >> build.env
     - |
       # If the build is conditional and some packages already exist, skip the build.
       # Then the purpose of this job is just to generate build.env.
+      build_packages=true
       if [ "$DRBD_BUILD_CONDITIONAL" = true ]; then
-        curl -fsSL "$LINBIT_REGISTRY_URL/service/rest/v1/search?repository=ci-yum&version=$DRBD_VERSION*" | \
-            jq --exit-status '.items | length > 0' && exit 0
+        published=$(pulp rpm content list --name-in kmod-drbd --name-in drbd-kmp-default \
+              --field version,release --limit 10000 | \
+            jq -r --arg v "$DRBD_VERSION" \
+                  '[.[] | select(.version | startswith($v + "_")) | .version + "-" + .release] | unique
+                   | sort_by([splits("[^0-9]+") | select(. != "") | tonumber])
+                   | last // empty' || true)
+        if [ -n "$published" ]; then
+          build_packages=false
+          # On the release branch $DRBD_VERSION is a rolling label, so the
+          # release of the package that will be installed identifies the
+          # commit under test -- $CI_COMMIT_SHA may already be newer.
+          published_release=${published##*-}
+          case "$published_release" in
+            "$published"|''|*[!0-9]*) ;;
+            *) DRBD_RELEASE=$published_release ;;
+          esac
+        fi
       fi
+    - |
+      {
+        echo DRBD_VERSION=$DRBD_VERSION
+        echo DRBD_RELEASE=$DRBD_RELEASE
+        echo DRBD_BUILD_SHA=$CI_COMMIT_SHA
+        if [ "$build_packages" = false ]; then
+          echo DRBD_PACKAGE_VERSION=$published
+          echo DRBD_BUILD_SKIPPED=true
+        fi
+      } >> build.env
+    - cat build.env
+    - if [ "$build_packages" = false ]; then exit 0; fi
     - drbd_build $DRBD_VERSION $DRBD_RELEASE $DRBD_VERSION "$(kernels_from_vms)"
   artifacts:
     reports:

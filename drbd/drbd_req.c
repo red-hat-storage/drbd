@@ -296,9 +296,8 @@ static void drbd_req_done(struct drbd_request *req)
 					clear_bit(bitmap_index, &mask);
 			}
 		}
-		if (device->bitmap)
-			modified_mask =
-				drbd_set_sync(device, req->i.sector, req->i.size, bits, mask);
+		modified_mask = drbd_set_sync(device, req->i.sector, req->i.size,
+					      bits, mask);
 		put_ldev(device);
 	}
 
@@ -363,7 +362,6 @@ static void drbd_req_oos_sent(struct drbd_request *req)
 	lockdep_assert_irqs_disabled();
 
 	if (s & RQ_WRITE && req->i.size) {
-		struct drbd_resource *resource = device->resource;
 		struct drbd_request *peer_ack_req;
 
 		spin_lock(&resource->peer_ack_lock); /* local irq already disabled */
@@ -735,8 +733,6 @@ static void drbd_req_put_completion_ref(struct drbd_request *req, struct bio_and
 {
 	D_ASSERT(req->device, m || (req->local_rq_state & RQ_POSTPONED));
 
-	lockdep_assert_held(&req->device->resource->state_rwlock);
-
 	if (!put)
 		return;
 
@@ -989,6 +985,10 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 			!(req->net_rq_state[idx] & RQ_NET_DONE))
 		set_cache_ptr_if_null(connection, &connection->req_not_net_done, req);
 
+	if ((old_net & (RQ_NET_QUEUED | RQ_NET_READY)) != (RQ_NET_QUEUED | RQ_NET_READY) &&
+	    (new_net & (RQ_NET_QUEUED | RQ_NET_READY)) == (RQ_NET_QUEUED | RQ_NET_READY))
+		set_cache_ptr_if_null(connection, &connection->req_next_ready, req);
+
 	if (!(old_net & RQ_EXP_BARR_ACK) && (set & RQ_EXP_BARR_ACK))
 		refcount_inc(&req->done_ref); /* wait for the DONE */
 
@@ -1038,6 +1038,8 @@ static void mod_rq_state(struct drbd_request *req, struct bio_and_error *m,
 	if ((old_net & RQ_NET_QUEUED) && (clear & RQ_NET_QUEUED)) {
 		++o_put;
 		advance_conn_req_next(connection, req);
+		advance_cache_ptr(connection, &connection->req_next_ready,
+				  req, RQ_NET_QUEUED | RQ_NET_READY, 0);
 	}
 
 	if (drbd_sender_needs_master_bio(old_net) && !drbd_sender_needs_master_bio(new_net))
@@ -1566,7 +1568,7 @@ static bool drbd_may_do_local_read(struct drbd_device *device, sector_t sector, 
 		struct drbd_peer_md *peer_md = &md->peers[node_id];
 
 		/* Skip bitmap indexes which are not assigned to a peer. */
-		if (!(peer_md->flags & MDF_HAVE_BITMAP))
+		if (!test_bit(__MDF_HAVE_BITMAP, &peer_md->flags))
 			continue;
 
 		if (drbd_bm_count_bits(device, peer_md->bitmap_index, sbnr, ebnr))
@@ -2380,6 +2382,18 @@ static bool inc_ap_bio_cond(struct drbd_device *device, int rw)
 		if (ap_bio_cnt >= nr_requests)
 			return false;
 	} while (atomic_cmpxchg(&device->ap_bio_cnt[rw], ap_bio_cnt, ap_bio_cnt + 1) != ap_bio_cnt);
+
+	/* Re-check suspend_cnt after publishing our ap_bio_cnt increment.
+	 * atomic_cmpxchg() is a full barrier, so this load is ordered after
+	 * the increment; it pairs with the smp_mb__after_atomic() in
+	 * drbd_suspend_io(). If a suspend raced in, at least one side sees
+	 * the other: either drbd_suspend_io() observes our increment and
+	 * waits, or we observe suspend_cnt here and roll back.
+	 */
+	if (atomic_read(&device->suspend_cnt)) {
+		dec_ap_bio(device, rw);
+		return false;
+	}
 
 	return true;
 }

@@ -611,12 +611,41 @@ static int drbd_finish_peer_reqs(struct drbd_connection *connection)
 	return err;
 }
 
+/* conn_connect() arms a data stream receive timeout to bound the connect;
+ * receive_state() disarms it per peer device, so a connection that has none
+ * keeps it over a data stream that is now legitimately idle. Disarm here
+ * instead, from the timeout it caused: a receive already waiting took its
+ * timeout when it started, so disarming elsewhere comes too late for it.
+ */
+static bool disarm_stale_connect_timeout(struct drbd_connection *connection)
+{
+	struct drbd_transport *transport = &connection->transport;
+	struct drbd_transport_ops *tr_ops = &transport->class->ops;
+
+	if (connection->cstate[NOW] != C_CONNECTED)
+		return false;
+
+	if (tr_ops->get_rcvtimeo(transport, DATA_STREAM) == MAX_SCHEDULE_TIMEOUT)
+		return false;
+
+	drbd_info(connection, "Idle data stream on an established connection; "
+		  "disarming the connect receive timeout\n");
+	tr_ops->set_rcvtimeo(transport, DATA_STREAM, MAX_SCHEDULE_TIMEOUT);
+
+	return true;
+}
+
 static int drbd_recv(struct drbd_connection *connection, void **buf, size_t size, int flags)
 {
 	struct drbd_transport_ops *tr_ops = &connection->transport.class->ops;
 	int rv;
 
+retry:
 	rv = tr_ops->recv(&connection->transport, DATA_STREAM, buf, size, flags);
+
+	/* At most one retry: the disarm makes the second attempt untimed. */
+	if (rv == -EAGAIN && disarm_stale_connect_timeout(connection))
+		goto retry;
 
 	if (rv < 0) {
 		if (rv == -ECONNRESET)
@@ -756,7 +785,8 @@ void conn_connect2(struct drbd_connection *connection)
 			drbd_get_connection_by_node_id(connection->resource, lost_node_id);
 
 		if (lost_peer) {
-			drbd_send_peer_dagtag(connection, lost_peer);
+			if (!drbd_send_peer_dagtag(connection, lost_peer))
+				connection->reconcile_handshake.sent_lost_node = true;
 			kref_put(&lost_peer->kref, drbd_destroy_connection);
 		}
 	}
@@ -2116,6 +2146,52 @@ static void p_req_detail_from_pi(struct drbd_connection *connection,
 	d->digest_size = digest_size;
 }
 
+/* A cluster-wide size change is agreed by a two-phase commit and then applied
+ * node by node, and applying it takes a different amount of time everywhere: a
+ * diskless node only sets the new capacity, a diskful one first grows its resync
+ * bitmap. So a peer that is further along legitimately sends us requests for the
+ * newly added tail of the device while we still consider that tail out of range.
+ * Wait for our own half of the size change and look again, instead of failing the
+ * request: an error return from a packet handler destroys the connection.
+ *
+ * remote_state_change plus TWOPC_RESIZE covers the whole window on every node:
+ * it is set when this node joins the resize two-phase commit and cleared after
+ * drbd_commit_size_change() has applied the new size locally.
+ *
+ * The wait is bounded, and it is skipped while an application read is
+ * outstanding here: a diskful node's size change waits for its application IO to
+ * drain (drbd_suspend_io), and a remote read completes through this very receiver
+ * thread, so waiting for both at once would deadlock. Falling through in either
+ * case leaves the old behaviour, which is what a peer sending a genuinely
+ * out-of-range request deserves.
+ */
+#define DRBD_SIZE_CHANGE_TIMEOUT (HZ)
+
+static bool resize_in_progress(struct drbd_resource *resource)
+{
+	bool rv;
+
+	read_lock_irq(&resource->state_rwlock);
+	rv = resource->remote_state_change && resource->twopc.type == TWOPC_RESIZE;
+	read_unlock_irq(&resource->state_rwlock);
+
+	return rv;
+}
+
+static bool in_range_after_size_change(struct drbd_device *device, sector_t sector,
+				       unsigned int size)
+{
+	struct drbd_resource *resource = device->resource;
+
+	if (atomic_read(&device->ap_bio_cnt[READ]))
+		return false;
+
+	wait_event_timeout(resource->twopc_wait, !resize_in_progress(resource),
+			   DRBD_SIZE_CHANGE_TIMEOUT);
+
+	return sector + (size >> 9) <= get_capacity(device->vdisk);
+}
+
 /* used from receive_RSDataReply (recv_resync_read)
  * and from receive_Data.
  * data_size: actual payload ("data in")
@@ -2162,7 +2238,8 @@ read_in_block(struct drbd_peer_request *peer_req, struct drbd_peer_request_detai
 
 	/* even though we trust our peer,
 	 * we sometimes have to double check. */
-	if (d->sector + (d->bi_size>>9) > capacity) {
+	if (d->sector + (d->bi_size>>9) > capacity &&
+	    !in_range_after_size_change(device, d->sector, d->bi_size)) {
 		drbd_err(device, "request from peer beyond end of local disk: "
 			"capacity: %llus < sector: %llus + size: %u\n",
 			capacity, d->sector, d->bi_size);
@@ -2224,6 +2301,11 @@ read_in_block(struct drbd_peer_request *peer_req, struct drbd_peer_request_detai
 static int ignore_remaining_packet(struct drbd_connection *connection, int size)
 {
 	void *data_to_ignore;
+
+	if (size < 0) {
+		drbd_err(connection, "Invalid packet size\n");
+		return -EIO;
+	}
 
 	while (size) {
 		int s = min_t(int, size, DRBD_SOCKET_BUFFER_SIZE);
@@ -3847,6 +3929,11 @@ static int receive_digest(struct drbd_peer_request *peer_req, int digest_size)
 {
 	struct digest_info *di = NULL;
 
+	if (digest_size < 0) {
+		drbd_err(peer_req->peer_device, "Invalid digest size\n");
+		return -EIO;
+	}
+
 	di = kmalloc(sizeof(*di) + digest_size, GFP_NOIO);
 	if (!di)
 		return -ENOMEM;
@@ -3884,7 +3971,8 @@ static int receive_common_data_request(struct drbd_connection *connection, struc
 				(unsigned long long)sector, size);
 		return -EINVAL;
 	}
-	if (sector + (size>>9) > capacity) {
+	if (sector + (size>>9) > capacity &&
+	    !in_range_after_size_change(device, sector, size)) {
 		drbd_err(peer_device, "%s:%d: sector: %llus, size: %u\n", __FILE__, __LINE__,
 				(unsigned long long)sector, size);
 		return -EINVAL;
@@ -3952,6 +4040,36 @@ static int receive_common_data_request(struct drbd_connection *connection, struc
 			"Unaligned %s request (%u vs %u) at %llu; may lead to hung or repeating resync.\n",
 			drbd_packet_name(pi->cmd), size, bm_block_size(device->bitmap), sector);
 		/* For now, try to continue anyways */
+	}
+
+	/* A sync source whose slot toward this peer still has
+	 * MDF_PEER_DIVERGENCE_BITMAP set:  Defer (retry) the resync request
+	 * until the flag has been cleared.
+	 *
+	 * Only toward a drbd-9 peer.  A drbd-8.4 sync target treats P_RS_CANCEL
+	 * as "this block is done" instead of rewinding to it, so the block would
+	 * never be resynced.
+	 */
+	if (repl_is_sync_source(peer_device->repl_state[NOW]) &&
+	    connection->agreed_pro_version >= 110 &&
+	    test_bit(__MDF_PEER_DIVERGENCE_BITMAP,
+		     &device->ldev->md.peers[peer_device->node_id].flags)) {
+		switch (pi->cmd) {
+		case P_RS_DATA_REQUEST:
+		case P_RS_DAGTAG_REQ:
+		case P_CSUM_RS_REQUEST:
+		case P_RS_CSUM_DAGTAG_REQ:
+		case P_RS_THIN_REQ:
+		case P_RS_THIN_DAGTAG_REQ:
+			drbd_notice_ratelimit(peer_device,
+				"Deferring resync request %llus +%u, divergence bitmap not cleared yet\n",
+				(unsigned long long)sector, size);
+			drbd_send_ack_be(peer_device, P_RS_CANCEL, sector, size, p->block_id);
+			put_ldev(device);
+			return ignore_remaining_packet(connection, pi->size);
+		default:
+			break;
+		}
 	}
 
 	inc_unacked(peer_device);
@@ -4595,26 +4713,35 @@ static int drbd_find_peer_bitmap_by_uuid(struct drbd_peer_device *peer_device, u
 	return -1;
 }
 
-/* find our bitmap slot for the given UUID, if we have one */
+/* Find our bitmap slot for the given UUID, if we have one. Prefer a slot whose
+ * bitmap is safe to copy from -- a divergence bitmap -- over a convergence
+ * bitmap being cleared by an ongoing resync. Fall back to a convergence slot so
+ * that callers can still tell "UUID unknown" (-1) from "UUID known but only as
+ * a convergence bitmap"; callers that must copy re-check is_divergence_bitmap()
+ * on the result.
+ */
 static int drbd_find_bitmap_by_uuid(struct drbd_peer_device *peer_device, u64 uuid)
 {
 	struct drbd_connection *connection = peer_device->connection;
 	struct drbd_device *device = peer_device->device;
-	u64 self;
-	int i;
+	struct drbd_peer_md *peer_md = device->ldev->md.peers;
+	int i, any = -1;
 
 	for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
 		if (i == device->ldev->md.node_id)
 			continue;
 		if (connection->agreed_pro_version < 116 &&
-		    device->ldev->md.peers[i].bitmap_index == -1)
+		    peer_md[i].bitmap_index == -1)
 			continue;
-		self = device->ldev->md.peers[i].bitmap_uuid & ~UUID_PRIMARY;
-		if (self == uuid)
+		if ((peer_md[i].bitmap_uuid & ~UUID_PRIMARY) != uuid)
+			continue;
+		if (is_divergence_bitmap(&peer_md[i]))
 			return i;
+		if (any == -1)
+			any = i;
 	}
 
-	return -1;
+	return any;
 }
 
 static enum sync_strategy
@@ -4636,7 +4763,7 @@ uuid_fixup_resync_end(struct drbd_peer_device *peer_device, enum sync_rule *rule
 			u64 previous_bitmap_uuid = peer_md->bitmap_uuid;
 
 			drbd_info(device, "was SyncSource, missed the resync finished event, corrected myself:\n");
-			peer_md->bitmap_uuid = 0;
+			drbd_set_peer_bitmap_uuid(peer_md, 0, 0);
 			_drbd_uuid_push_history(device, previous_bitmap_uuid);
 
 			drbd_uuid_dump_self(peer_device,
@@ -4995,8 +5122,15 @@ static enum sync_strategy drbd_uuid_compare(struct drbd_peer_device *peer_device
 	*rule = RULE_BITMAP_SELF_OTHER;
 	i = drbd_find_bitmap_by_uuid(peer_device, peer);
 	if (i != -1) {
-		*peer_node_id = i;
-		return SYNC_SOURCE_COPY_BITMAP;
+		if (is_divergence_bitmap(&device->ldev->md.peers[i])) {
+			*peer_node_id = i;
+			return SYNC_SOURCE_COPY_BITMAP;
+		}
+		/* A slot records the divergence from the peer's data, but its
+		 * bitmap is being cleared by an ongoing resync and cannot be
+		 * copied.  The data is related, so resync the whole slot.
+		 */
+		return SYNC_SOURCE_SET_BITMAP;
 	}
 
 	self = resolved_uuid;
@@ -5231,11 +5365,11 @@ static enum sync_strategy drbd_disk_states_source_strategy(
 	if (bitmap_uuid)
 		i = drbd_find_bitmap_by_uuid(peer_device, bitmap_uuid);
 
-	if (i == -1)
-		return SYNC_SOURCE_SET_BITMAP;
-
 	if (i == peer_device->node_id)
 		return SYNC_SOURCE_USE_BITMAP;
+
+	if (i == -1 || !is_divergence_bitmap(&peer_device->device->ldev->md.peers[i]))
+		return SYNC_SOURCE_SET_BITMAP;
 
 	*peer_node_id = i;
 	return SYNC_SOURCE_COPY_BITMAP;
@@ -5262,11 +5396,11 @@ static enum sync_strategy drbd_disk_states_target_strategy(
 	 * drbd_disk_states_source_strategy). */
 	i = drbd_find_peer_bitmap_by_uuid(peer_device, bitmap_uuid);
 
-	if (i == -1)
-		return SYNC_TARGET_SET_BITMAP;
-
 	if (i == node_id)
 		return SYNC_TARGET_USE_BITMAP;
+
+	if (i == -1)
+		return SYNC_TARGET_SET_BITMAP;
 
 	*peer_node_id = i;
 	return SYNC_TARGET_CLEAR_BITMAP;
@@ -5306,6 +5440,7 @@ static void maybe_reconcile_equal_uuid_bitmap(struct drbd_peer_device *peer_devi
 	struct drbd_device *device = peer_device->device;
 	const int node_id = device->resource->res_opts.node_id;
 	u64 local_uuid_flags;
+	bool one_sided;
 
 	if (*strategy != NO_SYNC)
 		return;
@@ -5315,17 +5450,37 @@ static void maybe_reconcile_equal_uuid_bitmap(struct drbd_peer_device *peer_devi
 		return;
 	if (!(connection->agreed_features & DRBD_FF_RECONCILE_RECONNECT))
 		return;
+	if (connection->cstate[NOW] != C_CONNECTING)
+		return;
 
 	/*
-	 * Reconcile only between secondaries of a *common lost primary*: the peer
-	 * named one via P_PEER_DAGTAG during this connect handshake
-	 * (find_common_lost_primary_node_id stashed it in reconcile_handshake).
-	 * Without that, an equal-UUID state with leftover bits is an ordinary
-	 * reconnect whose direction the rules above already settled (or NO_SYNC is
-	 * correct) -- do not second-guess it and force a resync.
+	 * Equal current UUIDs with leftover bits reconcile only between
+	 * secondaries of a *common lost primary*. Without one, the bits are
+	 * resync artifacts -- set toward an absent peer while this node was
+	 * itself a sync target (or after invalidate), marking blocks the peer
+	 * already holds -- and NO_SYNC (drop the bits) is correct; forcing a
+	 * resync would pull a healthy UpToDate peer through Inconsistent for
+	 * nothing.
+	 *
+	 * "Named a common lost primary" must be evaluated identically on both
+	 * nodes, but each node only ever *hears* the other's naming
+	 * (find_common_lost_primary_node_id excludes the peer itself, so a
+	 * plain secondary of the bit-holder can never name one; P_PEER_DAGTAG
+	 * stashed the peer's naming in reconcile_handshake). Gating on the
+	 * stash alone therefore deadlocked one-sided reconciles: the side the
+	 * naming reached went WFBitMapS while the namer stayed
+	 * NO_SYNC/Established. Accept either direction of the exchange --
+	 * the peer named one, or we named one to the peer -- which is the
+	 * same predicate on both nodes, so the one-sided case (ordered by the
+	 * bit counts) derives mirrored decisions.
+	 *
+	 * The both-sided case cannot be ordered by bit counts; it additionally
+	 * needs the peer's dagtag position toward the named lost primary, so
+	 * it still requires the peer's naming.
 	 */
-	if (connection->cstate[NOW] != C_CONNECTING ||
-	    connection->reconcile_handshake.lost_node_id == -1)
+	one_sided = !peer_device->comm_bm_set != !peer_device->dirty_bits;
+	if (connection->reconcile_handshake.lost_node_id == -1 &&
+	    !(one_sided && connection->reconcile_handshake.sent_lost_node))
 		return;
 
 	local_uuid_flags = drbd_collect_local_uuid_flags(peer_device, NULL);
@@ -5782,11 +5937,12 @@ static enum sync_strategy drbd_sync_handshake(struct drbd_peer_device *peer_devi
 			}
 		} else if (strategy == SYNC_TARGET_USE_BITMAP) {
 			if (peer_disk_state != D_UP_TO_DATE) {
-				int peer_node_id = peer_device->node_id;
-				u64 previous = device->ldev->md.peers[peer_node_id].bitmap_uuid;
+				struct drbd_peer_md *peer_md =
+					&device->ldev->md.peers[peer_device->node_id];
+				u64 previous = peer_md->bitmap_uuid;
 
 				if (previous) {
-					device->ldev->md.peers[peer_node_id].bitmap_uuid = 0;
+					drbd_set_peer_bitmap_uuid(peer_md, 0, 0);
 					_drbd_uuid_push_history(device, previous);
 					drbd_md_mark_dirty(device);
 				}
@@ -6082,17 +6238,20 @@ static int receive_SyncParam(struct drbd_connection *connection, struct packet_i
 			p->csums_alg[SHARED_SECRET_MAX-1] = 0;
 		}
 
+		strscpy(connection->peer_verify_alg, p->verify_alg,
+			sizeof(connection->peer_verify_alg));
+
 		if (strcmp(old_net_conf->verify_alg, p->verify_alg)) {
 			if (peer_device->repl_state[NOW] == L_OFF) {
-				drbd_err(device, "Different verify-alg settings. me=\"%s\" peer=\"%s\"\n",
+				drbd_warn(device, "Different verify-alg settings. me=\"%s\" peer=\"%s\", online verify will be refused\n",
 				    old_net_conf->verify_alg, p->verify_alg);
-				goto disconnect;
-			}
-			verify_tfm = drbd_crypto_alloc_digest_safe(device,
-					p->verify_alg, "verify-alg");
-			if (IS_ERR(verify_tfm)) {
-				verify_tfm = NULL;
-				goto disconnect;
+			} else {
+				verify_tfm = drbd_crypto_alloc_digest_safe(device,
+						p->verify_alg, "verify-alg");
+				if (IS_ERR(verify_tfm)) {
+					verify_tfm = NULL;
+					goto disconnect;
+				}
 			}
 		}
 
@@ -6217,6 +6376,33 @@ static unsigned int conn_max_bio_size(struct drbd_connection *connection)
 		return DRBD_MAX_SIZE_H80_PACKET;
 }
 
+static bool is_valid_block_size(unsigned int size)
+{
+	return size >= SECTOR_SIZE && size <= DRBD_MAX_BIO_SIZE && is_power_of_2(size);
+}
+
+static bool peer_block_sizes_are_sane(struct drbd_peer_device *peer_device, struct p_sizes *p)
+{
+	unsigned int logical_block_size, physical_block_size;
+
+	/* Older peers do not send queue limits at all. */
+	if (!(peer_device->connection->agreed_features & DRBD_FF_WSAME))
+		return true;
+
+	logical_block_size = be32_to_cpu(p->qlim->logical_block_size);
+	physical_block_size = be32_to_cpu(p->qlim->physical_block_size);
+
+	if (!is_valid_block_size(logical_block_size) ||
+	    !is_valid_block_size(physical_block_size)) {
+		drbd_err(peer_device,
+			 "Peer sent bogus block sizes (logical:%u physical:%u), disconnecting\n",
+			 logical_block_size, physical_block_size);
+		return false;
+	}
+
+	return true;
+}
+
 static struct drbd_peer_device *get_neighbor_device(struct drbd_device *device,
 		enum drbd_neighbor neighbor)
 {
@@ -6299,6 +6485,9 @@ static int receive_sizes(struct drbd_connection *connection, struct packet_info 
 		goto out;
 	}
 	have_mutex = true;
+
+	if (!peer_block_sizes_are_sane(peer_device, p))
+		goto disconnect;
 
 	/* just store the peer's disk size for now.
 	 * we still need to figure out whether we accept that. */
@@ -6751,11 +6940,8 @@ static int __receive_uuids(struct drbd_peer_device *peer_device, u64 node_mask)
 			propagate_skip_initial_to_diskless(device);
 		}
 
-		if (peer_device->uuid_flags & UUID_FLAG_NEW_DATAGEN) {
-			drbd_warn(peer_device, "received new current UUID: %016llX "
-				  "weak_nodes=%016llX\n", peer_device->current_uuid, node_mask);
+		if (peer_device->uuid_flags & UUID_FLAG_NEW_DATAGEN)
 			drbd_uuid_received_new_current(peer_device, peer_device->current_uuid, node_mask);
-		}
 
 		drbd_uuid_detect_finished_resyncs(peer_device);
 
@@ -6905,9 +7091,9 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 		if (bitmap_uuids_mask & NODE_MASK(i)) {
 			bitmap_uuid = be64_to_cpu(p->other_uuids[pos++]);
 
-			if (peer_md && !(peer_md[i].flags & MDF_HAVE_BITMAP) &&
+			if (peer_md && !test_bit(__MDF_HAVE_BITMAP, &peer_md[i].flags) &&
 			    i != not_allocated)
-				peer_md[i].flags |= MDF_NODE_EXISTS;
+				set_bit(__MDF_NODE_EXISTS, &peer_md[i].flags);
 		} else {
 			bitmap_uuid = -1;
 		}
@@ -7497,7 +7683,7 @@ far_away_change(struct drbd_connection *connection,
 					continue;
 
 				peer_md = &device->ldev->md.peers[initiator_node_id];
-				peer_md->flags |= MDF_PEER_OUTDATED;
+				set_bit(__MDF_PEER_OUTDATED, &peer_md->flags);
 				put_ldev(device);
 				drbd_md_mark_dirty(device);
 			}
@@ -9602,7 +9788,7 @@ static int receive_current_uuid(struct drbd_connection *connection, struct packe
 
 	if (get_ldev(device)) {
 		struct drbd_peer_md *peer_md = &device->ldev->md.peers[peer_device->node_id];
-		peer_md->flags |= MDF_NODE_EXISTS;
+		set_bit(__MDF_NODE_EXISTS, &peer_md->flags);
 		put_ldev(device);
 	}
 	if (connection->peer_role[NOW] == R_PRIMARY)
@@ -9618,23 +9804,40 @@ static int receive_current_uuid(struct drbd_connection *connection, struct packe
 	if (current_uuid == drbd_current_uuid(device))
 		return 0;
 
+	/* None of this is serialized against concurrent state changes: moved_on
+	 * may be stale by now, and disk_state[NOW] can change between the branch
+	 * conditions.  Deciding it reliably would mean making it part of a state
+	 * change transaction.
+	 */
 	if (peer_device->repl_state[NOW] >= L_ESTABLISHED &&
-	    get_ldev_if_state(device, D_UP_TO_DATE)) {
-		if (connection->peer_role[NOW] == R_PRIMARY) {
-			drbd_warn(peer_device, "received new current UUID: %016llX "
-				  "weak_nodes=%016llX\n", current_uuid, weak_nodes);
-			drbd_uuid_received_new_current(peer_device, current_uuid, weak_nodes);
-			drbd_md_sync_if_dirty(device);
-		} else if (moved_on) {
-			if (resource->remote_state_change)
-				set_bit(OUTDATE_ON_2PC_COMMIT, &device->flags);
-			else
-				change_disk_state(device, D_OUTDATED, CS_VERBOSE,
-						"receive-current-uuid", NULL);
-		}
+	    connection->peer_role[NOW] == R_PRIMARY &&
+	    get_ldev(device)) {
+		/* drbd_uuid_received_new_current() dispatches on our disk state:
+		 * adopt if D_UP_TO_DATE, defer into the sync source's record if
+		 * resync target (so resync-end adoption brings us to the
+		 * primary's generation), drop otherwise.
+		 */
+		drbd_uuid_received_new_current(peer_device, current_uuid, weak_nodes);
+		drbd_md_sync_if_dirty(device);
+		put_ldev(device);
+	} else if (peer_device->repl_state[NOW] >= L_ESTABLISHED &&
+		   connection->peer_role[NOW] != R_PRIMARY && moved_on &&
+		   get_ldev_if_state(device, D_UP_TO_DATE)) {
+		/* The peer is not primary but moved on to a new generation. */
+		if (resource->remote_state_change)
+			set_bit(OUTDATE_ON_2PC_COMMIT, &device->flags);
+		else
+			change_disk_state(device, D_OUTDATED, CS_VERBOSE,
+					"receive-current-uuid", NULL);
 		put_ldev(device);
 	} else if (device->disk_state[NOW] == D_DISKLESS && resource->role[NOW] == R_PRIMARY) {
 		drbd_uuid_set_exposed(device, peer_device->current_uuid, true);
+	} else if (connection->peer_role[NOW] == R_PRIMARY) {
+		/* A primary's generation we can not use: no local disk to
+		 * label it on, or this volume is not established with it.
+		 */
+		drbd_info(peer_device, "ignoring new current UUID %016llX (disk %s)\n",
+			  current_uuid, drbd_disk_str(device->disk_state[NOW]));
 	}
 
 	return 0;
@@ -10568,6 +10771,7 @@ static void conn_disconnect(struct drbd_connection *connection)
 
 	mutex_lock(&resource->conf_update);
 	drbd_transport_shutdown(connection, CLOSE_CONNECTION);
+	connection->peer_verify_alg[0] = 0;
 	mutex_unlock(&resource->conf_update);
 
 	cleanup_remote_state_change(connection);
@@ -10576,6 +10780,7 @@ static void conn_disconnect(struct drbd_connection *connection)
 
 	connection->after_reconciliation.lost_node_id = -1;
 	connection->reconcile_handshake.lost_node_id = -1;
+	connection->reconcile_handshake.sent_lost_node = false;
 
 	rcu_read_lock();
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr)

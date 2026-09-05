@@ -26,9 +26,14 @@
 #include <linux/idr.h>
 #include <linux/lru_cache.h>
 #include <linux/prefetch.h>
-#include <linux/drbd_genl_api.h>
 #include <linux/drbd.h>
+#include <uapi/linux/drbd_genl.h>
+#include <linux/drbd_nl_gen.h>
 #include <linux/drbd_config.h>
+
+extern struct genl_family drbd_nl_family;
+extern const unsigned int drbd_genl_cmd_flags[];
+int drbd_genl_multicast_events(struct sk_buff *skb);
 
 #include "drbd_strings.h"
 #include "drbd_state.h"
@@ -766,10 +771,28 @@ struct drbd_work_queue {
 	wait_queue_head_t q_wait;
 };
 
+/*
+ * Per-peer metadata slot. bitmap_uuid names the generation this slot's bitmap
+ * records divergence from (0 when unused); bitmap_dagtag is the dagtag at which
+ * it was set. A slot is in one of three states:
+ *
+ *   - allocated bitmap (MDF_HAVE_BITMAP, bitmap_index >= 0): owns an on-disk
+ *     bitmap tracking per-block divergence toward the peer.
+ *   - diskless peer (MDF_NODE_EXISTS, bitmap_index == -1): the peer is known
+ *     but we hold no bitmap of our own for it.
+ *   - unallocated day0 slot (flags == 0, bitmap_index == -1): carries the day0
+ *     UUID -- the generation the volume was created in -- as a common-ancestor
+ *     reference for inception-based resync. Its bitmap is associated with it
+ *     indirectly (a spare bitmap index, or implicitly all-set), never owned
+ *     directly, so it always records full divergence.
+ *
+ * (The same notion of day0 as drbd_uuid_is_day0(), seen differently: there, the
+ * local current UUID is still day0; here, a bitmap tracks divergence since day0.)
+ */
 struct drbd_peer_md {
 	u64 bitmap_uuid;
 	u64 bitmap_dagtag;
-	u32 flags;
+	unsigned long flags; /* enum mdf_peer_flag_bit, atomic bit operations */
 	s32 bitmap_index;
 };
 
@@ -894,12 +917,6 @@ enum resource_flag {
 	TWOPC_STATE_CHANGE_PENDING, /* set between sending commit and changing local state */
 
 	TRY_BECOME_UP_TO_DATE_PENDING,
-
-	RESUME_HELD_FOR_OUTDATE, /* A Primary regained data access but a far-away
-				  * member must be outdated before we resume I/O;
-				  * holds susp_nod until the primary-resume 2PC
-				  * commits (or aborts).
-				  */
 
 	DEVICE_WORK_PENDING,	/* tell worker that some device has pending work */
 	PEER_DEVICE_WORK_PENDING,/* tell worker that some peer_device has pending work */
@@ -1049,6 +1066,7 @@ struct drbd_resource {
 
 	struct semaphore state_sem;
 	wait_queue_head_t state_wait;  /* upon each state change. */
+	unsigned int state_change_seq;  /* bumped on each committed state change */
 	enum chg_state_flags state_change_flags;
 	const char **state_change_err_str;
 	bool remote_state_change;  /* remote state change in progress */
@@ -1081,6 +1099,11 @@ struct drbd_resource {
 	bool susp_quorum[2];		/* IO suspended because no quorum */
 	bool susp_uuid[2];		/* IO suspended because waiting new current UUID */
 	bool fail_io[2];		/* Fail all IO requests because forced a demote */
+	bool resume_held_for_outdate[2];/* A Primary regained data access, but a
+					 * far-away member must be outdated before
+					 * I/O resumes; keeps susp_nod set until the
+					 * primary-resume 2PC has done that.
+					 */
 	bool cached_susp;		/* cached result of looking at all different suspend bits */
 	bool cached_all_devices_have_quorum;
 
@@ -1179,6 +1202,7 @@ struct drbd_connection {
 	struct crypto_shash *peer_integrity_tfm;  /* checksums we verify, only accessed from receiver thread  */
 	struct crypto_shash *csums_tfm;
 	struct crypto_shash *verify_tfm;
+	char peer_verify_alg[SHARED_SECRET_MAX]; /* peer's verify-alg; protected by conf_update */
 
 	void *int_dig_in;
 	void *int_dig_vv;
@@ -1307,6 +1331,11 @@ struct drbd_connection {
 	/* The oldest request that is or was queued for this peer, but is not
 	 * done towards it. */
 	struct drbd_request *req_not_net_done;
+	/* The oldest request that is queued for this peer and ready to be
+	 * processed by the sender. Lets the sender pass requests that are queued
+	 * but not yet ready, see tl_next_request_for_connection().
+	 */
+	struct drbd_request *req_next_ready;
 	/* Protects the caching pointers from being advanced concurrently. */
 	spinlock_t advance_cache_ptr_lock;
 
@@ -1349,10 +1378,13 @@ struct drbd_connection {
 	 * position in a common lost primary's change stream. drbd_uuid_compare()
 	 * compares it against our own last_dagtag_sector toward that node to roll
 	 * an equal-UUID both-dirty reconcile forward. lost_node_id == -1 if none.
+	 * sent_lost_node records the mirror direction: we named a common lost
+	 * primary to the peer in this handshake (conn_connect2).
 	 */
 	struct {
 		u64 dagtag_sector;
 		int lost_node_id;
+		bool sent_lost_node;
 	} reconcile_handshake;
 
 	unsigned int peer_node_id;
@@ -1937,7 +1969,9 @@ void drbd_uuid_new_current(struct drbd_device *device, bool forced);
 void drbd_uuid_new_current_by_user(struct drbd_device *device);
 void _drbd_uuid_push_history(struct drbd_device *device, u64 val);
 u64 _drbd_uuid_pull_history(struct drbd_peer_device *peer_device);
+void drbd_set_peer_bitmap_uuid(struct drbd_peer_md *peer_md, u64 bitmap_uuid, u64 dagtag);
 void drbd_uuid_resync_starting(struct drbd_peer_device *peer_device);
+void drbd_uuid_resync_starting_source(struct drbd_peer_device *peer_device);
 u64 drbd_uuid_resync_finished(struct drbd_peer_device *peer_device);
 void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device);
 bool drbd_uuid_set_exposed(struct drbd_device *device, u64 val, bool log);
@@ -1945,11 +1979,11 @@ u64 drbd_weak_nodes_device(struct drbd_device *device);
 bool drbd_uuid_is_day0(struct drbd_device *device);
 int drbd_md_test_flag(struct drbd_backing_dev *bdev, enum mdf_flag flag);
 void drbd_md_set_peer_flag(struct drbd_peer_device *peer_device,
-			   enum mdf_peer_flag flag);
+			   enum mdf_peer_flag_bit flag_bit);
 void drbd_md_clear_peer_flag(struct drbd_peer_device *peer_device,
-			     enum mdf_peer_flag flag);
+			     enum mdf_peer_flag_bit flag_bit);
 bool drbd_md_test_peer_flag(struct drbd_peer_device *peer_device,
-			    enum mdf_peer_flag flag);
+			    enum mdf_peer_flag_bit flag_bit);
 void drbd_md_mark_dirty(struct drbd_device *device);
 void drbd_queue_bitmap_io(struct drbd_device *device,
 			  int (*io_fn)(struct drbd_device *device,
@@ -2293,6 +2327,7 @@ enum suspend_scope {
 	WRITE_ONLY
 };
 void drbd_suspend_io(struct drbd_device *device, enum suspend_scope ss);
+int drbd_suspend_io_interruptible(struct drbd_device *device, enum suspend_scope ss);
 void drbd_resume_io(struct drbd_device *device);
 char *ppsize(char *buf, unsigned long long size);
 sector_t drbd_new_dev_size(struct drbd_device *device, sector_t current_size,
@@ -2328,9 +2363,6 @@ void youngest_and_oldest_opener_to_str(struct drbd_device *device, char *buf,
 				       size_t len);
 int param_set_drbd_strict_names(const char *val,
 				const struct kernel_param *kp);
-void drbd_enable_netns(void);
-void drbd_register_pre_post_doit(void);
-
 /* drbd_sender.c */
 int drbd_sender(struct drbd_thread *thi);
 int drbd_worker(struct drbd_thread *thi);
@@ -3029,6 +3061,17 @@ static inline u64 drbd_bitmap_uuid(struct drbd_peer_device *peer_device)
 
 	peer_md = &device->ldev->md.peers[peer_device->node_id];
 	return peer_md->bitmap_uuid;
+}
+
+/* A slot with no bitmap of its own (MDF_HAVE_BITMAP clear) is implicitly a
+ * divergence bitmap. A day0 slot is such a slot: its bitmap is associated with
+ * it indirectly rather than owned directly. Only a directly-owned bitmap is
+ * cleared by a resync, and thereby turned into a convergence bitmap.
+ */
+static inline bool is_divergence_bitmap(struct drbd_peer_md *peer_md)
+{
+	return !test_bit(__MDF_HAVE_BITMAP, &peer_md->flags) ||
+		test_bit(__MDF_PEER_DIVERGENCE_BITMAP, &peer_md->flags);
 }
 
 static inline u64 drbd_history_uuid(struct drbd_device *device, int i)

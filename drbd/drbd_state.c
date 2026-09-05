@@ -189,10 +189,11 @@ static bool may_be_up_to_date(struct drbd_device *device, enum which_state which
 		if (node_id == device->ldev->md.node_id)
 			continue;
 
-		if (!(peer_md->flags & MDF_HAVE_BITMAP) && !(peer_md->flags & MDF_NODE_EXISTS))
+		if (!test_bit(__MDF_HAVE_BITMAP, &peer_md->flags) &&
+		    !test_bit(__MDF_NODE_EXISTS, &peer_md->flags))
 			continue;
 
-		if (!(peer_md->flags & MDF_PEER_FENCING))
+		if (!test_bit(__MDF_PEER_FENCING, &peer_md->flags))
 			continue;
 		peer_device = peer_device_by_node_id(device, node_id);
 		if (peer_device) {
@@ -205,7 +206,7 @@ static bool may_be_up_to_date(struct drbd_device *device, enum which_state which
 
 		switch (peer_disk_state) {
 		case D_DISKLESS:
-			if (!(peer_md->flags & MDF_PEER_DEVICE_SEEN))
+			if (!test_bit(__MDF_PEER_DEVICE_SEEN, &peer_md->flags))
 				continue;
 			fallthrough;
 		case D_ATTACHING:
@@ -215,7 +216,7 @@ static bool may_be_up_to_date(struct drbd_device *device, enum which_state which
 		case D_UNKNOWN:
 			if (!want_bitmap)
 				continue;
-			if ((peer_md->flags & MDF_PEER_OUTDATED))
+			if (test_bit(__MDF_PEER_OUTDATED, &peer_md->flags))
 				continue;
 			break;
 		case D_INCONSISTENT:
@@ -394,6 +395,9 @@ struct drbd_state_change *remember_state_change(struct drbd_resource *resource, 
 	       resource->susp_uuid, sizeof(resource->susp_uuid));
 	memcpy(state_change->resource->fail_io,
 	       resource->fail_io, sizeof(resource->fail_io));
+	memcpy(state_change->resource->resume_held_for_outdate,
+	       resource->resume_held_for_outdate,
+	       sizeof(resource->resume_held_for_outdate));
 
 	device_state_change = state_change->devices;
 	peer_device_state_change = state_change->peer_devices;
@@ -496,6 +500,7 @@ void copy_old_to_new_state_change(struct drbd_state_change *state_change)
 	OLD_TO_NEW(resource_state_change->susp_nod);
 	OLD_TO_NEW(resource_state_change->susp_uuid);
 	OLD_TO_NEW(resource_state_change->fail_io);
+	OLD_TO_NEW(resource_state_change->resume_held_for_outdate);
 
 	for (n_connection = 0; n_connection < state_change->n_connections; n_connection++) {
 		struct drbd_connection_state_change *connection_state_change =
@@ -640,6 +645,7 @@ static void ___begin_state_change(struct drbd_resource *resource)
 	resource->susp_quorum[NEW] = resource->susp_quorum[NOW];
 	resource->susp_uuid[NEW] = resource->susp_uuid[NOW];
 	resource->fail_io[NEW] = resource->fail_io[NOW];
+	resource->resume_held_for_outdate[NEW] = resource->resume_held_for_outdate[NOW];
 
 	for_each_connection_rcu(connection, resource) {
 		connection->cstate[NEW] = connection->cstate[NOW];
@@ -909,6 +915,7 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 	resource->susp_quorum[NOW] = resource->susp_quorum[NEW];
 	resource->susp_uuid[NOW] = resource->susp_uuid[NEW];
 	resource->fail_io[NOW] = resource->fail_io[NEW];
+	resource->resume_held_for_outdate[NOW] = resource->resume_held_for_outdate[NEW];
 	resource->cached_susp = resource_is_suspended(resource, NEW);
 
 	pro_ver = PRO_VERSION_MAX;
@@ -987,6 +994,11 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 		}
 	}
 
+	/* Progress for the bounded wait in stable_state_change(). The other
+	 * wake-ups of state_wait are not state changes, and must not count.
+	 */
+	if (rv != SS_NOTHING_TO_DO)
+		resource->state_change_seq++;
 	wake_up_all(&resource->state_wait);
 
 	/* Informed confirmation of a rotated data generation.  This state change
@@ -1490,7 +1502,9 @@ static void __calc_quorum_with_disk(struct drbd_device *device, struct quorum_de
 		   Note: a fresh (before connected once), intentional diskless peer
 		   gets ignored as well by this.
 		   A fresh diskful peer counts! (since it has MDF_HAVE_BITMAP) */
-		if (!(peer_md->flags & (MDF_HAVE_BITMAP | MDF_NODE_EXISTS | MDF_PEER_DEVICE_SEEN)))
+		if (!test_bit(__MDF_HAVE_BITMAP, &peer_md->flags) &&
+		    !test_bit(__MDF_NODE_EXISTS, &peer_md->flags) &&
+		    !test_bit(__MDF_PEER_DEVICE_SEEN, &peer_md->flags))
 			continue;
 
 		peer_device = peer_device_by_node_id(device, node_id);
@@ -1505,7 +1519,8 @@ static void __calc_quorum_with_disk(struct drbd_device *device, struct quorum_de
 				continue;
 			}
 		} else {
-			is_intentional_diskless = !(peer_md->flags & MDF_PEER_DEVICE_SEEN);
+			is_intentional_diskless =
+				!test_bit(__MDF_PEER_DEVICE_SEEN, &peer_md->flags);
 			is_tiebreaker = true;
 		}
 
@@ -1519,7 +1534,8 @@ static void __calc_quorum_with_disk(struct drbd_device *device, struct quorum_de
 			if (is_intentional_diskless)
 				/* device should be diskless but is absent */
 				qd->missing_diskless++;
-			else if (disk_state <= D_OUTDATED || peer_md->flags & MDF_PEER_OUTDATED)
+			else if (disk_state <= D_OUTDATED ||
+				 test_bit(__MDF_PEER_OUTDATED, &peer_md->flags))
 				qd->outdated++;
 			else if (NODE_MASK(node_id) & quorumless_nodes)
 				qd->quorumless++;
@@ -1747,7 +1763,7 @@ static enum drbd_state_rv __is_valid_soft_transition(struct drbd_resource *resou
 	}
 handshake_found:
 
-	if (in_handshake && role[OLD] != role[NEW])
+	if (in_handshake && role[OLD] != R_PRIMARY && role[NEW] == R_PRIMARY)
 		return SS_IN_TRANSIENT_STATE;
 
 	if (role[OLD] == R_SECONDARY && role[NEW] == R_PRIMARY && fail_io[NEW])
@@ -2559,8 +2575,8 @@ static void sanitize_state(struct drbd_resource *resource)
 			if (role[OLD] != R_PRIMARY || drbd_data_accessible(device, OLD))
 				volume_lost_data_access = true;
 		}
-		if (role[NEW] == R_PRIMARY && drbd_data_accessible(device, NEW) &&
-		    !(role[OLD] == R_PRIMARY && drbd_data_accessible(device, OLD)))
+		if (role[NEW] == R_PRIMARY && !drbd_data_accessible(device, OLD) &&
+		    drbd_data_accessible(device, NEW))
 			volume_gained_data_access = true;
 
 		if (lost_connection && disk_state[NEW] == D_NEGOTIATING)
@@ -2579,19 +2595,36 @@ static void sanitize_state(struct drbd_resource *resource)
 		 * resuming I/O: otherwise a diskless Primary's queued writes reach
 		 * only the close peer and silently diverge the far-away one.  Hold
 		 * the resume (keep susp_nod) until the primary-resume 2PC has
-		 * outdated the far-away member(s) and cleared the hold.
+		 * outdated the far-away member(s) and released the hold.
 		 */
 		if (volume_gained_data_access &&
 		    resource->res_opts.on_no_data == OND_SUSPEND_IO &&
 		    (resource->members & ~(directly_connected_nodes(resource, NEW) |
 					   NODE_MASK(resource->res_opts.node_id))))
-			set_bit(RESUME_HELD_FOR_OUTDATE, &resource->flags);
+			resource->resume_held_for_outdate[NEW] = true;
 
-		resource->susp_nod[NEW] =
-			test_bit(RESUME_HELD_FOR_OUTDATE, &resource->flags);
+		resource->susp_nod[NEW] = resource->resume_held_for_outdate[NEW];
 	}
 	if (volume_lost_data_access && resource->res_opts.on_no_data == OND_SUSPEND_IO)
 		resource->susp_nod[NEW] = true;
+
+	/* Clearing the susp-uuid bridge must not resume into inaccessibility:
+	 * the bridged bump attempt may have been REFUSED (the
+	 * unconfirmed-generation deferral), leaving no follow-up state
+	 * change.  The edge conditions above cannot catch that (access was
+	 * lost in an earlier state change, and after a demote no volume is
+	 * Primary here), so on the falling edge of susp_uuid re-evaluate
+	 * data accessibility at the level.
+	 */
+	if (resource->susp_uuid[OLD] && !resource->susp_uuid[NEW] &&
+	    resource->res_opts.on_no_data == OND_SUSPEND_IO) {
+		idr_for_each_entry(&resource->devices, device, vnr) {
+			if (!drbd_data_accessible(device, NEW)) {
+				resource->susp_nod[NEW] = true;
+				break;
+			}
+		}
+	}
 
 	resource->susp_quorum[NEW] =
 		resource->res_opts.on_no_quorum == ONQ_SUSPEND_IO ? !resource_has_quorum : false;
@@ -2970,6 +3003,40 @@ static bool should_try_become_up_to_date(struct drbd_device *device, enum drbd_d
 			may_return_to_up_to_date(device, which);
 }
 
+/* Set or clear a bit atomically; return true if it changed. */
+static bool test_and_assign_bit(int nr, unsigned long *addr, bool value)
+{
+	return value ? !test_and_set_bit(nr, addr) : test_and_clear_bit(nr, addr);
+}
+
+/* Bring the peer's meta-data flags in line with the new state. */
+static void update_peer_md_flags(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+	unsigned long *mdf = &device->ldev->md.peers[peer_device->node_id].flags;
+	enum drbd_disk_state pdsk = peer_device->disk_state[NEW];
+	bool changed;
+
+	changed = test_and_assign_bit(__MDF_PEER_CONNECTED, mdf,
+			peer_device->repl_state[NEW] > L_OFF);
+	changed |= test_and_assign_bit(__MDF_PEER_OUTDATED, mdf,
+			pdsk >= D_INCONSISTENT && pdsk <= D_OUTDATED);
+	changed |= test_and_assign_bit(__MDF_PEER_FENCING, mdf,
+			peer_device->connection->fencing_policy != FP_DONT_CARE);
+
+	/* Do NOT clear MDF_PEER_DEVICE_SEEN whenever the peer disk is gone. We
+	 * want to be able to refuse a resize beyond "last agreed" size, even if
+	 * the peer is currently detached.
+	 */
+	if (pdsk >= D_INCONSISTENT && pdsk != D_UNKNOWN)
+		changed |= !test_and_set_bit(__MDF_PEER_DEVICE_SEEN, mdf);
+	else if (pdsk == D_DISKLESS && !want_bitmap(peer_device))
+		changed |= test_and_clear_bit(__MDF_PEER_DEVICE_SEEN, mdf);
+
+	if (changed)
+		drbd_md_mark_dirty(device);
+}
+
 /**
  * finish_state_change  -  carry out actions triggered by a state change
  * @resource: DBRD resource.
@@ -3221,31 +3288,8 @@ static void finish_state_change(struct drbd_resource *resource, const char *tag)
 			}
 
 			if (disk_state[NEW] != D_NEGOTIATING && get_ldev(device)) {
-				if (peer_device->bitmap_index != -1) {
-					enum drbd_disk_state pdsk = peer_device->disk_state[NEW];
-					u32 mdf = device->ldev->md.peers[peer_device->node_id].flags;
-					/* Do NOT clear MDF_PEER_DEVICE_SEEN here.
-					 * We want to be able to refuse a resize beyond "last agreed" size,
-					 * even if the peer is currently detached.
-					 */
-					mdf &= ~(MDF_PEER_CONNECTED | MDF_PEER_OUTDATED | MDF_PEER_FENCING);
-					if (repl_state[NEW] > L_OFF)
-						mdf |= MDF_PEER_CONNECTED;
-					if (pdsk >= D_INCONSISTENT) {
-						if (pdsk <= D_OUTDATED)
-							mdf |= MDF_PEER_OUTDATED;
-						if (pdsk != D_UNKNOWN)
-							mdf |= MDF_PEER_DEVICE_SEEN;
-					}
-					if (pdsk == D_DISKLESS && !want_bitmap(peer_device))
-						mdf &= ~MDF_PEER_DEVICE_SEEN;
-					if (peer_device->connection->fencing_policy != FP_DONT_CARE)
-						mdf |= MDF_PEER_FENCING;
-					if (mdf != device->ldev->md.peers[peer_device->node_id].flags) {
-						device->ldev->md.peers[peer_device->node_id].flags = mdf;
-						drbd_md_mark_dirty(device);
-					}
-				}
+				if (peer_device->bitmap_index != -1)
+					update_peer_md_flags(peer_device);
 
 				/* Peer was forced D_UP_TO_DATE & R_PRIMARY, consider to resync */
 				if (disk_state[OLD] == D_INCONSISTENT &&
@@ -3532,10 +3576,17 @@ static void abw_start_sync(struct drbd_device *device,
 			   struct drbd_peer_device *peer_device, int rv)
 {
 	struct drbd_peer_device *pd;
+	enum drbd_state_rv srv;
 
 	if (rv) {
 		drbd_err(device, "Writing the bitmap failed not starting resync.\n");
-		stable_change_repl_state(peer_device, L_ESTABLISHED, CS_VERBOSE, "start-sync");
+		srv = stable_change_repl_state(peer_device, L_ESTABLISHED, CS_VERBOSE,
+					       "start-sync");
+		if (srv < SS_SUCCESS)
+			drbd_err(peer_device,
+				 "Leaving %s failed (%s); disconnect to recover.\n",
+				 drbd_repl_str(peer_device->repl_state[NOW]),
+				 drbd_set_st_err_str(srv));
 		return;
 	}
 
@@ -3548,11 +3599,15 @@ static void abw_start_sync(struct drbd_device *device,
 			initialize_resync(pd);
 		rcu_read_unlock();
 
-		if (peer_device->connection->agreed_pro_version < 110)
-			stable_change_repl_state(peer_device, L_WF_SYNC_UUID, CS_VERBOSE,
-					"start-sync");
-		else
+		if (peer_device->connection->agreed_pro_version < 110) {
+			srv = stable_change_repl_state(peer_device, L_WF_SYNC_UUID,
+						       CS_VERBOSE, "start-sync");
+			if (srv < SS_SUCCESS)
+				drbd_err(peer_device, "Not starting resync (%s)\n",
+					 drbd_set_st_err_str(srv));
+		} else {
 			drbd_start_resync(peer_device, L_SYNC_TARGET, "start-sync");
+		}
 		break;
 	case L_STARTING_SYNC_S:
 		drbd_start_resync(peer_device, L_SYNC_SOURCE, "start-sync");
@@ -4122,8 +4177,10 @@ static void drbd_run_resync(struct drbd_peer_device *peer_device, enum drbd_repl
 	 * we may have been paused in between, or become paused until
 	 * the timer triggers.
 	 * No matter, that is handled in resync_timer_fn() */
-	if (repl_state == L_SYNC_TARGET || repl_state == L_PAUSED_SYNC_T)
+	if (side == L_SYNC_TARGET)
 		drbd_uuid_resync_starting(peer_device);
+	else
+		drbd_uuid_resync_starting_source(peer_device);
 
 	drbd_md_sync_if_dirty(device);
 }
@@ -4141,6 +4198,7 @@ static int w_after_state_change(struct drbd_work *w, int unused)
 	struct drbd_resource *resource = resource_state_change->resource;
 	enum drbd_role *role = resource_state_change->role;
 	bool *susp_uuid = resource_state_change->susp_uuid;
+	bool *resume_held_for_outdate = resource_state_change->resume_held_for_outdate;
 	struct drbd_peer_device *send_state_others = NULL;
 	int n_device, n_connection;
 	bool still_connected = false;
@@ -4745,7 +4803,7 @@ static int w_after_state_change(struct drbd_work *w, int unused)
 	 * because a far-away member must be outdated first.  Drive that from
 	 * here.
 	 */
-	if (healed_primary && test_bit(RESUME_HELD_FOR_OUTDATE, &resource->flags))
+	if (!resume_held_for_outdate[OLD] && resume_held_for_outdate[NEW])
 		drbd_schedule_resume_twopc(resource);
 
 	if (!still_connected)
@@ -6067,7 +6125,7 @@ static void restore_outdated_in_pdsk(struct drbd_device *device)
 		int node_id = peer_device->connection->peer_node_id;
 		struct drbd_peer_md *peer_md = &device->ldev->md.peers[node_id];
 
-		if ((peer_md->flags & MDF_PEER_OUTDATED) &&
+		if (test_bit(__MDF_PEER_OUTDATED, &peer_md->flags) &&
 		    peer_device->disk_state[NEW] == D_UNKNOWN)
 			__change_peer_disk_state(peer_device, D_OUTDATED);
 	}
@@ -6167,8 +6225,9 @@ void drbd_resume_twopc_work_fn(struct work_struct *work)
 	/* First outdate the far-away member(s) behind this Primary. */
 	twopc_primary_resume(resource, CS_VERBOSE);
 
-	clear_bit(RESUME_HELD_FOR_OUTDATE, &resource->flags);
+	/* Then release the hold, which resumes the held I/O. */
 	begin_state_change(resource, &irq_flags, CS_VERBOSE | CS_FORCE_RECALC);
+	resource->resume_held_for_outdate[NEW] = false;
 	end_state_change(resource, &irq_flags, "primary-resumed");
 
 	kref_debug_put(&resource->kref_debug, 11);
@@ -6738,7 +6797,8 @@ static void check_wrongly_set_mdf_exists(struct drbd_device *device)
 		struct drbd_peer_device *peer_device = peer_device_by_node_id(device, node_id);
 		struct drbd_peer_md *peer_md = &device->ldev->md.peers[node_id];
 
-		if (!(peer_md->flags & MDF_NODE_EXISTS || peer_device || node_id == my_node_id)) {
+		if (!test_bit(__MDF_NODE_EXISTS, &peer_md->flags) &&
+		    !peer_device && node_id != my_node_id) {
 			wrong = false;
 			break;
 		}
@@ -6750,7 +6810,7 @@ static void check_wrongly_set_mdf_exists(struct drbd_device *device)
 			struct drbd_peer_md *peer_md = &device->ldev->md.peers[node_id];
 
 			if (!peer_device)
-				peer_md->flags &= ~MDF_NODE_EXISTS;
+				clear_bit(__MDF_NODE_EXISTS, &peer_md->flags);
 		}
 		if (!test_bit(WRONG_MDF_EXISTS, &resource->flags)) {
 			set_bit(WRONG_MDF_EXISTS, &resource->flags);
