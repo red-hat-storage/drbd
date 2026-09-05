@@ -13,7 +13,9 @@
 #include <linux/tcp.h>
 #include <linux/highmem.h>
 #include <linux/bio.h>
-#include <linux/drbd_genl_api.h>
+#include <linux/drbd.h>
+#include <uapi/linux/drbd_genl.h>
+#include <linux/drbd_nl_gen.h>
 #include <linux/drbd_config.h>
 #include <linux/tls.h>
 #include <net/tcp.h>
@@ -924,8 +926,20 @@ static void dtt_control_data_ready_work(struct work_struct *item)
 	while (true) {
 		n = dtt_recv_short(csocket, tcp_transport->rbuf[CONTROL_STREAM].base, PAGE_SIZE,
 				   MSG_DONTWAIT | MSG_NOSIGNAL);
-		if (n <= 0)
+		if (n == 0) {
+			/* Orderly shutdown: the peer closed the meta socket, and
+			 * the close surfaced here as EOF rather than (or before) a
+			 * state-change callback. Do not silently drop it -- treat
+			 * it as a peer-initiated disconnect, mirroring
+			 * dtt_control_state_change(). Otherwise the connection
+			 * lingers until the ping timeout, or forever on a transport
+			 * that reports a close only through the receive path.
+			 */
+			drbd_control_event(&tcp_transport->transport, CLOSED_BY_PEER);
 			break;
+		}
+		if (n < 0)
+			break;	/* -EAGAIN: nothing more available right now */
 
 		drbd_buffer.buffer = tcp_transport->rbuf[CONTROL_STREAM].base;
 		drbd_buffer.avail = n;

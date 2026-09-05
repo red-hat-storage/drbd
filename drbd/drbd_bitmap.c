@@ -439,8 +439,8 @@ sector_t drbd_bm_capacity(struct drbd_device *device)
 
 void drbd_bm_free(struct drbd_device *device)
 {
-	/* ldev_safe: explicit NULL check below */
-	struct drbd_bitmap *bitmap = device->bitmap;
+	/* ldev_safe: atomically claiming the pointer, NULL check below */
+	struct drbd_bitmap *bitmap = xchg(&device->bitmap, NULL);
 
 	if (bitmap == NULL)
 		return;
@@ -449,9 +449,6 @@ void drbd_bm_free(struct drbd_device *device)
 	drbd_bm_resize(device, bitmap, 0, 0);
 
 	kfree(bitmap);
-
-	/* ldev_safe: clearing pointer */
-	device->bitmap = NULL;
 }
 
 static inline unsigned long interleaved_word32(struct drbd_bitmap *bitmap,
@@ -1421,7 +1418,7 @@ static int bm_rw_range(struct drbd_device *device, unsigned int start_page, unsi
 		return -ENODEV;
 	}
 	/* Here, D_ATTACHING is sufficient because drbd_bm_read() is only
-	 * called from drbd_adm_attach(), after device->ldev has been assigned.
+	 * called from drbd_nl_attach_doit(), after device->ldev has been assigned.
 	 *
 	 * The corresponding put_ldev() happens in bm_aio_ctx_destroy().
 	 */
@@ -1655,12 +1652,51 @@ int drbd_bm_write_hinted(struct drbd_device *device)
 	return bm_rw(device, BM_AIO_WRITE_HINTED | BM_AIO_COPY_PAGES);
 }
 
+static __always_inline unsigned long
+__bm_many_bits_op(struct drbd_device *device, unsigned int bitmap_index,
+		  unsigned long start, unsigned long end, enum bitmap_operations op)
+{
+	struct drbd_bitmap *bitmap = device->bitmap;
+	unsigned long result = DRBD_END_OF_BITMAP;
+	unsigned long bit = start;
+
+	spin_lock_irq(&bitmap->bm_lock);
+
+	if (end >= bitmap->bm_bits)
+		end = bitmap->bm_bits - 1;
+
+	while (bit <= end && bit < bitmap->bm_bits) {
+		unsigned long last_bit = last_bit_on_page(bitmap, bitmap_index, bit);
+
+		if (end < last_bit)
+			last_bit = end;
+
+		result = __bm_op(device, bitmap, bitmap_index, bit, last_bit, op, NULL);
+		if ((op == BM_OP_FIND_BIT || op == BM_OP_FIND_ZERO_BIT) &&
+		    result != DRBD_END_OF_BITMAP)
+			break;
+		bit = last_bit + 1;
+		spin_unlock_irq(&bitmap->bm_lock);
+		if (need_resched())
+			cond_resched();
+		spin_lock_irq(&bitmap->bm_lock);
+	}
+	spin_unlock_irq(&bitmap->bm_lock);
+
+	return result;
+}
+
+/*
+ * A single bm_op() find would scan up to the whole bitmap while holding
+ * bm_lock with interrupts disabled.  With a large device the bitmap is
+ * large, too (a 64 TiB device has a 1 GiB bitmap), and scanning a mostly
+ * clear range keeps interrupts off for hundreds of milliseconds, stalling
+ * RCU and triggering soft lockups.  Scan page by page instead.
+ */
 unsigned long drbd_bm_find_next(struct drbd_peer_device *peer_device, unsigned long start)
 {
-	struct drbd_device *device = peer_device->device;
-
-	return bm_op(device, device->bitmap, peer_device->bitmap_index, start, -1UL,
-		     BM_OP_FIND_BIT, NULL);
+	return __bm_many_bits_op(peer_device->device, peer_device->bitmap_index, start, -1UL,
+				 BM_OP_FIND_BIT);
 }
 
 /* does not spin_lock_irqsave.
@@ -1683,34 +1719,6 @@ unsigned int drbd_bm_set_bits(struct drbd_device *device, unsigned int bitmap_in
 			      unsigned long start, unsigned long end)
 {
 	return bm_op(device, device->bitmap, bitmap_index, start, end, BM_OP_SET, NULL);
-}
-
-static __always_inline void
-__bm_many_bits_op(struct drbd_device *device, unsigned int bitmap_index, unsigned long start, unsigned long end,
-		  enum bitmap_operations op)
-{
-	struct drbd_bitmap *bitmap = device->bitmap;
-	unsigned long bit = start;
-
-	spin_lock_irq(&bitmap->bm_lock);
-
-	if (end >= bitmap->bm_bits)
-		end = bitmap->bm_bits - 1;
-
-	while (bit <= end) {
-		unsigned long last_bit = last_bit_on_page(bitmap, bitmap_index, bit);
-
-		if (end < last_bit)
-			last_bit = end;
-
-		__bm_op(device, bitmap, bitmap_index, bit, last_bit, op, NULL);
-		bit = last_bit + 1;
-		spin_unlock_irq(&bitmap->bm_lock);
-		if (need_resched())
-			cond_resched();
-		spin_lock_irq(&bitmap->bm_lock);
-	}
-	spin_unlock_irq(&bitmap->bm_lock);
 }
 
 void drbd_bm_set_many_bits(struct drbd_peer_device *peer_device, unsigned long start, unsigned long end)
