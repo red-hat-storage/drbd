@@ -1,6 +1,6 @@
 Name: drbd-kernel
 Summary: Kernel driver for DRBD
-Version: 9.3.3
+Version: 9.3.4~rc.1
 Release: 1
 
 # always require a suitable userland
@@ -206,7 +206,11 @@ install -D misc/SECURE-BOOT-KEY-linbit.com.der $RPM_BUILD_ROOT/etc/pki/linbit/SE
 # For DKMS, install the original source
 %{__install} -d %{buildroot}%{_usrsrc}/drbd-%{drbd_version}-%{release}/src
 %{__install} misc/dkms.conf %{buildroot}%{_usrsrc}/drbd-%{drbd_version}-%{release}/dkms.conf
-tar -xvf %{S:0} -C %{buildroot}%{_usrsrc}/drbd-%{drbd_version}-%{release}/src --strip-components=1 drbd-%{tarball_version}/drbd
+# The ynl code generator is Python 3 only, and it is not needed to build the
+# module. Shipping it breaks the build on distributions where /usr/bin/python
+# is Python 2, because rpm byte-compiles everything in the buildroot.
+tar -xvf %{S:0} -C %{buildroot}%{_usrsrc}/drbd-%{drbd_version}-%{release}/src --strip-components=1 \
+	--exclude='*/drbd-headers/linux/ynl' drbd-%{tarball_version}/drbd
 %endif
 
 %clean
@@ -232,6 +236,9 @@ dkms remove -m $DKMS_NAME -v $DKMS_VERSION -q --all --rpm_safe_upgrade || :
 %endif
 
 %changelog
+* Tue Sep 08 2026 Philipp Reisner <phil@linbit.com> - 9.3.4~rc.1
+-  Release candidate
+
 * Tue Jun 30 2026 Philipp Reisner <phil@linbit.com> - 9.3.3
 -  New upstream release
 
