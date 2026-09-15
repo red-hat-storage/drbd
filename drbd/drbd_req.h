@@ -86,6 +86,7 @@ enum drbd_req_event {
 	WRITE_ACKED_BY_PEER,
 	WRITE_ACKED_BY_PEER_AND_SIS, /* and set_in_sync */
 	NEG_ACKED,
+	POSTPONED_BY_PEER,
 	BARRIER_ACKED, /* in protocol A and B */
 	DATA_RECEIVED, /* (remote read) */
 
@@ -227,6 +228,12 @@ enum drbd_req_state_bits {
 	/* Should call drbd_al_complete_io() for this request... */
 	__RQ_IN_ACT_LOG,
 
+	/* Accounted in device->wait_for_actlog_ecnt, respectively in
+	 * device->ap_actlog_cnt. AL_SUSPENDED may flip at any time.
+	 */
+	__RQ_WAIT_FOR_AL_ECNT,
+	__RQ_AP_ACTLOG_CNT,
+
 	/* This was the most recent request during some blk_finish_plug()
 	 * or its implicit from-schedule equivalent.
 	 * We may use it as hint to send a P_UNPLUG_REMOTE */
@@ -248,6 +255,11 @@ enum drbd_req_state_bits {
 	 * barrier ack proves the generation durable.
 	 */
 	__RQ_UNCONF_GEN,
+
+	/* Completed to the application with success.  Read at a connection
+	 * loss, to tell an acknowledged write from one that failed.
+	 */
+	__RQ_COMPLETED_OK,
 };
 #define RQ_NET_PENDING     (1UL << __RQ_NET_PENDING)
 #define RQ_NET_PENDING_OOS (1UL << __RQ_NET_PENDING_OOS)
@@ -277,10 +289,13 @@ enum drbd_req_state_bits {
 #define RQ_UNMAP           (1UL << __RQ_UNMAP)
 #define RQ_ZEROES          (1UL << __RQ_ZEROES)
 #define RQ_IN_ACT_LOG      (1UL << __RQ_IN_ACT_LOG)
+#define RQ_WAIT_FOR_AL_ECNT (1UL << __RQ_WAIT_FOR_AL_ECNT)
+#define RQ_AP_ACTLOG_CNT   (1UL << __RQ_AP_ACTLOG_CNT)
 #define RQ_UNPLUG          (1UL << __RQ_UNPLUG)
 #define RQ_POSTPONED	   (1UL << __RQ_POSTPONED)
 #define RQ_COMPLETION_SUSP (1UL << __RQ_COMPLETION_SUSP)
 #define RQ_UNCONF_GEN      (1UL << __RQ_UNCONF_GEN)
+#define RQ_COMPLETED_OK    (1UL << __RQ_COMPLETED_OK)
 
 
 /* these flags go into local_rq_state,
@@ -292,10 +307,13 @@ enum drbd_req_state_bits {
 	 RQ_UNMAP       |\
 	 RQ_ZEROES      |\
 	 RQ_IN_ACT_LOG  |\
+	 RQ_WAIT_FOR_AL_ECNT |\
+	 RQ_AP_ACTLOG_CNT |\
 	 RQ_UNPLUG      |\
 	 RQ_POSTPONED   |\
 	 RQ_COMPLETION_SUSP |\
-	 RQ_UNCONF_GEN)
+	 RQ_UNCONF_GEN  |\
+	 RQ_COMPLETED_OK)
 
 static inline bool drbd_req_is_write(struct drbd_request *req)
 {
