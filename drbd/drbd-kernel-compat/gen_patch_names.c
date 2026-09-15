@@ -194,11 +194,24 @@ int main(int argc, char **argv)
 	patch(1, "bioset_init", true, false,
 	      COMPAT_HAVE_BIOSET_INIT, "present");
 
+	/* v5.2 to v5.9: neither .policy nor .maxattr in genl_ops */
 	patch(1, "genl_policy", true, false,
 	      COMPAT_GENL_POLICY_IN_OPS, "in_ops");
 
+	/* before v5.2: .policy in genl_ops, but no .maxattr */
+	patch(2, "genl_policy", true, true,
+	      COMPAT_GENL_POLICY_IN_OPS, "in_ops",
+	      COMPAT_GENL_MAXATTR_IN_OPS, "maxattr_in_ops");
+
+	/* before v5.10: no .maxattr in genl_ops */
+	patch(1, "genl_maxattr", true, false,
+	      COMPAT_GENL_MAXATTR_IN_OPS, "in_ops");
+
 	patch(1, "genl_pre_doit_split_ops", true, false,
 	      COMPAT_HAVE_GENL_PRE_DOIT_SPLIT_OPS, "present");
+
+	patch(1, "genl_resv_start_op", true, false,
+	      COMPAT_HAVE_GENL_RESV_START_OP, "present");
 
 	/*
 	 * >= 6.10:  BLK_FEAT_STABLE_WRITES
@@ -333,6 +346,9 @@ int main(int argc, char **argv)
 
 	patch(1, "nla_strscpy", true, false,
 	      COMPAT_HAVE_NLA_STRSCPY, "present");
+
+	patch(1, "NLA_POLICY_MAX_LEN", true, false,
+	      COMPAT_HAVE_NLA_POLICY_MAX_LEN, "present");
 
 	patch(1, "part_stat_read", true, false,
 	      COMPAT_PART_STAT_READ_TAKES_BLOCK_DEVICE, "takes_block_device");
