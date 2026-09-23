@@ -26,8 +26,9 @@
 #include <linux/idr.h>
 #include <linux/lru_cache.h>
 #include <linux/prefetch.h>
-#include <linux/drbd_genl_api.h>
 #include <linux/drbd.h>
+#include <uapi/linux/drbd_genl.h>
+#include <linux/drbd_nl_gen.h>
 #include <linux/drbd_config.h>
 
 #include "drbd_strings.h"
@@ -250,7 +251,6 @@ enum drbd_disk_state disk_state_from_md(struct drbd_device *device);
 bool want_bitmap(struct drbd_peer_device *peer_device);
 long twopc_timeout(struct drbd_resource *resource);
 long twopc_retry_timeout(struct drbd_resource *resource, int retries);
-void twopc_connection_down(struct drbd_connection *connection);
 u64 directly_connected_nodes(struct drbd_resource *resource,
 			     enum which_state which);
 
@@ -461,6 +461,9 @@ struct drbd_peer_request {
 		struct { /* resync target requests */
 			unsigned int requested_size;
 		};
+		struct { /* peer writes withheld from acknowledgment */
+			unsigned int wait_source_node_id;
+		};
 	};
 
 	struct bio_list bios;
@@ -545,6 +548,28 @@ enum {
 
 	/* This peer_req->recv_order is on connection->send_oos protocted by send_oos_lock */
 	__EE_ON_SEND_OOS,
+
+	/* A write on a sync target, not acknowledged until the sync source
+	 * has it as well. See drbd_withhold_ack_until_source_has_write().
+	 */
+	__EE_WAIT_FOR_SOURCE,
+
+	/* The sync source's answer overtook the local completion; recorded
+	 * here under peer_reqs_lock, acted on by e_end_block().
+	 */
+	__EE_SOURCE_REACHED,
+	__EE_SOURCE_UNREACHABLE,
+
+	/* The sync source can not get this write: answer the writer
+	 * P_RETRY_WRITE instead of P_WRITE_ACK, so it retries the write.
+	 */
+	__EE_POSTPONE,
+
+	/* The answer to the writer is decided; set under peer_reqs_lock by
+	 * e_end_block() when it does not park the write. From here on the
+	 * write can not be withheld or refused any more.
+	 */
+	__EE_ACK_DECIDED,
 };
 #define EE_MAY_SET_IN_SYNC     (1<<__EE_MAY_SET_IN_SYNC)
 #define EE_SET_OUT_OF_SYNC     (1<<__EE_SET_OUT_OF_SYNC)
@@ -562,6 +587,11 @@ enum {
 #define EE_LAST_RESYNC_REQUEST	(1<<__EE_LAST_RESYNC_REQUEST)
 #define EE_ON_RECV_ORDER	(1<<__EE_ON_RECV_ORDER)
 #define EE_ON_SEND_OOS		(1<<__EE_ON_SEND_OOS)
+#define EE_WAIT_FOR_SOURCE	(1<<__EE_WAIT_FOR_SOURCE)
+#define EE_SOURCE_REACHED	(1<<__EE_SOURCE_REACHED)
+#define EE_SOURCE_UNREACHABLE	(1<<__EE_SOURCE_UNREACHABLE)
+#define EE_POSTPONE		(1<<__EE_POSTPONE)
+#define EE_ACK_DECIDED		(1<<__EE_ACK_DECIDED)
 
 #define REQ_NO_BIO (REQ_OP_DRV_OUT) /* exception for drbd_alloc_peer_request(), DRBD private */
 
@@ -575,9 +605,6 @@ enum device_flag {
 				   so don't even try */
 	FORCE_DETACH,		/* Force-detach from local disk, aborting any pending local IO */
 	ABORT_MDIO,		/* Interrupt ongoing meta-data I/O */
-	NEW_CUR_UUID,		/* Create new current UUID when thawing IO or issuing local IO */
-	__NEW_CUR_UUID,		/* Set NEW_CUR_UUID as soon as state change visible */
-	WRITING_NEW_CUR_UUID,	/* Set while the new current ID gets generated. */
 	AL_SUSPENDED,		/* Activity logging is currently suspended. */
 	UNREGISTERED,
 	FLUSH_PENDING,		/* if set, device->flush_jif is when we submitted that flush
@@ -590,6 +617,7 @@ enum device_flag {
 	GO_DISKLESS,            /* tell worker to schedule cleanup before detach */
 	MD_SYNC,		/* tell worker to call drbd_md_sync() */
 	MAKE_NEW_CUR_UUID,	/* tell worker to ping peers and eventually write new current uuid */
+	AUTO_GROW,		/* tell worker to ask the cluster to grow into a bigger backend */
 
 	STABLE_RESYNC,		/* One peer_device finished the resync stable! */
 	READ_BALANCE_RR,
@@ -602,16 +630,108 @@ enum device_flag {
 	RESTORING_QUORUM,	/* sanitize_state() -> finish_state_change() */
 	LEGACY_84_MD,
 	BDEV_FROZEN,		/* called bdev_freeze(), needs bdev_thaw() on resume-io */
-	EXPOSED_GEN_UNCONFIRMED, /* A diskless primary started a new data
-				  * generation that no peer has confirmed yet.
-				  * While set, a further peer loss does not start
-				  * yet another generation -- the open one already
-				  * covers it (the losses are logically
-				  * simultaneous) -- so there is at most one
-				  * unconfirmed generation and a single
-				  * predecessor at any time.
-				  */
 };
+
+/* The data-generation obligation of one volume.  A divergence-start event
+ * (a peer's data lost, own disk failed, promotion, ...) obliges this volume
+ * to start a new data generation before it may admit further writes.  The
+ * state, the auxiliary bits and the reason set are packed into one word,
+ * device->gen_obligation, so that a reader gets a consistent snapshot with a
+ * single READ_ONCE().
+ */
+enum drbd_gen_obl_state {
+	GEN_OBL_NONE,		/* no obligation, writes admitted */
+	GEN_OBL_ARMED,		/* obligation outstanding, writes not admitted */
+	GEN_OBL_MINTING,	/* the new generation is being made right now */
+	GEN_OBL_UNCONFIRMED,	/* diskless: the new generation is exposed and
+				 * queued in order on every established channel,
+				 * but no peer has confirmed durable receipt.
+				 * Writes are admitted, their completion held.
+				 */
+	GEN_OBL_DISCHARGED,	/* met: new generation persisted or confirmed */
+	GEN_OBL_PARKED,		/* retained while writers fail fast (io-error
+				 * policy): the data set does not change, so no
+				 * generation is owed for that span.  Write
+				 * admission never sees this state -- whenever
+				 * it is set, device->cached_err_io is set as
+				 * well, and drbd_submit_bio() errors the write
+				 * long before inc_ap_bio_cond().
+				 */
+};
+
+/* The reason set: one bit per class of divergence-start event.  Several may
+ * accumulate before the obligation is met.
+ */
+#define GEN_OBL_PEER_DATA_LOST		(1 << 0)
+#define GEN_OBL_PEER_RETURNED_DISKLESS	(1 << 1)
+#define GEN_OBL_PEER_DISK_FAILED	(1 << 2)
+#define GEN_OBL_OWN_DISK_FAILED		(1 << 3)
+#define GEN_OBL_PROMOTED		(1 << 4)
+#define GEN_OBL_AHEAD			(1 << 5)
+#define GEN_OBL_PRE_110			(1 << 6)
+#define GEN_OBL_COMPLETION_DECIDED	(1 << 7)
+#define GEN_OBL_REASON_COUNT		8
+
+/* Layout of device->gen_obligation. */
+#define GEN_OBL_STATE_MASK	0x0000000fu
+#define GEN_OBL_MATERIALIZED	0x00000010u /* a completion decision was taken
+					     * although acks of a lost replica
+					     * are missing
+					     */
+#define GEN_OBL_REARM_PENDING	0x00000020u /* armed again while the mint of an
+					     * earlier obligation was running
+					     */
+#define GEN_OBL_REASON_SHIFT	16
+#define GEN_OBL_REASON_MASK	0xffff0000u
+
+/* A set of states, for the "allowed from" argument of a transition. */
+#define GEN_OBL_IN(state)	(1u << (state))
+
+/* The states an obligation can materialize out of: it is recorded, and its
+ * mint has not started.  PARKED is one of them -- a completion decision is
+ * about writes that already happened, so the io-error policy does not hold it
+ * back.
+ */
+#define GEN_OBL_MATERIALIZE_FROM	(GEN_OBL_IN(GEN_OBL_ARMED) | GEN_OBL_IN(GEN_OBL_PARKED))
+
+/* Enough for any state name plus the whole reason set. */
+#define GEN_OBL_STR_MAX		160
+
+/* What a mint attempt did.  The site that holds the obligation decides from
+ * this whether the obligation is met.
+ */
+enum drbd_mint_outcome {
+	MINT_MINTED,		/* a new generation exists, persisted to stable
+				 * storage before anyone else can see it
+				 */
+	MINT_EXPOSED,		/* diskless: the new generation is exposed and
+				 * queued in order on every established channel,
+				 * but no peer has confirmed durable receipt.
+				 * The obligation is not owed any more; it is met
+				 * once the confirm arrives.
+				 */
+	MINT_UNNECESSARY,	/* nothing owed: every absent peer already sees a
+				 * current UUID of ours it does not have
+				 */
+	MINT_DEFERRED,		/* not now: the exposed generation of a diskless
+				 * primary is still unconfirmed
+				 */
+	MINT_FAILED,		/* the metadata write failed; the new current UUID
+				 * was rolled back
+				 */
+	MINT_NOT_EVALUATED,	/* the mint did not run: the quorum and data gate
+				 * of the ping round declined
+				 */
+};
+
+/* The new data generation did not happen, so whoever holds the obligation
+ * still owes it.
+ */
+static inline bool drbd_mint_still_owed(enum drbd_mint_outcome outcome)
+{
+	return outcome == MINT_DEFERRED || outcome == MINT_FAILED ||
+	       outcome == MINT_NOT_EVALUATED;
+}
 
 /* flag bits per peer device */
 enum peer_device_flag {
@@ -626,6 +746,13 @@ enum peer_device_flag {
 	B_RS_H_DONE,		/* Before resync handler done (already executed) */
 	DISCARD_MY_DATA,	/* discard_my_data flag per volume */
 	USE_DEGR_WFC_T,		/* degr-wfc-timeout instead of wfc-timeout. */
+	SEND_RECONCILE_UUID,	/* worker: the reconcile peer has settled UpToDate;
+				 * send it our current UUID (the relabel), ordered
+				 * by the sender after the replayed transfer log.
+				 * Worker-dispatched (see DRBD_PEER_DEVICE_WORK_MASK);
+				 * must stay below 32 so get_work_bits() finds it in
+				 * flags[0] on 32-bit kernels.
+				 */
 	INITIAL_STATE_SENT,
 	INITIAL_STATE_RECEIVED,
 	RECONCILIATION_RESYNC,
@@ -651,13 +778,6 @@ enum peer_device_flag {
 	RS_REQUEST_UNSUCCESSFUL, /* Some resync request was unsuccessful in current cycle */
 	REPLICATION_NEXT, /* If unset, do not replicate writes when next Inconsistent */
 	PEER_REPLICATION_NEXT, /* We have instructed peer not to replicate writes */
-	SEND_RECONCILE_UUID,	/* worker: the reconcile peer has settled UpToDate;
-				 * send it our current UUID (the relabel), ordered
-				 * by the sender after the replayed transfer log.
-				 * Worker-dispatched (see DRBD_PEER_DEVICE_WORK_MASK);
-				 * must stay below 32 so get_work_bits() finds it in
-				 * flags[0] on 32-bit kernels.
-				 */
 	CURRENT_UUID_UNCONFIRMED, /* Diskless primary optimistically advanced this
 				   * peer's current_uuid (sent the new UUID, assumed
 				   * it took). Until the peer confirms, the handshake
@@ -757,7 +877,10 @@ struct drbd_bitmap {
 	const char    *bm_why;
 	char          bm_task_comm[TASK_COMM_LEN];
 	pid_t         bm_task_pid;
-	struct drbd_peer_device *bm_locked_peer;
+	/* >= 0 if a slot-scoped lock is held (the locked slot's index);
+	 * -1 if no lock is held or the lock is device-wide.
+	 */
+	int           bm_locked_slot_index;
 };
 
 struct drbd_work_queue {
@@ -766,11 +889,41 @@ struct drbd_work_queue {
 	wait_queue_head_t q_wait;
 };
 
+/*
+ * Per-peer metadata slot. bitmap_uuid names the generation this slot's bitmap
+ * records divergence from (0 when unused); bitmap_dagtag is the dagtag at which
+ * it was set. A slot is in one of three states:
+ *
+ *   - allocated bitmap (MDF_HAVE_BITMAP, bitmap_index >= 0): owns an on-disk
+ *     bitmap tracking per-block divergence toward the peer.
+ *   - diskless peer (MDF_NODE_EXISTS, bitmap_index == -1): the peer is known
+ *     but we hold no bitmap of our own for it.
+ *   - unallocated day0 slot (flags == 0, bitmap_index == -1): carries the day0
+ *     UUID -- the generation the volume was created in -- as a common-ancestor
+ *     reference for inception-based resync. Its bitmap is associated with it
+ *     indirectly (a spare bitmap index, or implicitly all-set), never owned
+ *     directly, so it always records full divergence.
+ *
+ * (The same notion of day0 as drbd_uuid_is_day0(), seen differently: there, the
+ * local current UUID is still day0; here, a bitmap tracks divergence since day0.)
+ */
 struct drbd_peer_md {
 	u64 bitmap_uuid;
 	u64 bitmap_dagtag;
-	u32 flags;
+	unsigned long flags; /* enum mdf_peer_flag_bit, atomic bit operations */
 	s32 bitmap_index;
+	/* Nodes whose resync set placeholder bits in this slot; those bits are
+	 * retired by a P_PEERS_IN_SYNC from one of them. Not in the meta data:
+	 * after a restart the slot falls back to asking whether any other peer
+	 * is connected, see drbd_bitmap_slot_decides().
+	 */
+	u64 placeholder_src;
+	/* Whether placeholder_src names every bit standing in this slot. False
+	 * for bits that were already in the meta data when the disk was
+	 * attached, or that a slot inherited when it was allocated; their
+	 * origin is not recorded there.
+	 */
+	bool placeholder_src_complete;
 };
 
 struct drbd_md {
@@ -779,6 +932,7 @@ struct drbd_md {
 	u64 effective_size;	/* last agreed size (sectors) */
 	u64 prev_members;	/* read from the meta-data */
 	u64 members;		/* current member mask for writing meta-data */
+	u64 prev_features;	/* read from the meta-data; DRBD_MD_FEATURES is written */
 	spinlock_t uuid_lock;
 	u64 current_uuid;
 	u64 device_uuid;
@@ -879,6 +1033,13 @@ enum connection_flag {
 	CONN_HANDSHAKE_RETRY,
 	CONN_HANDSHAKE_READY,
 	RECEIVED_DAGTAG, /* Whether we received any write or dagtag since connecting. */
+	DAGTAG_STREAM_GONE, /* This peer's write stream is being torn down: the
+			     * requests waiting for a position in it have been,
+			     * or are about to be, resolved. Set before the
+			     * teardown walks the wait lists, so a waiter that
+			     * tests it under the list's own lock never queues
+			     * behind that walk.
+			     */
 	PING_TIMEOUT_ACTIVE,
 };
 
@@ -894,12 +1055,6 @@ enum resource_flag {
 	TWOPC_STATE_CHANGE_PENDING, /* set between sending commit and changing local state */
 
 	TRY_BECOME_UP_TO_DATE_PENDING,
-
-	RESUME_HELD_FOR_OUTDATE, /* A Primary regained data access but a far-away
-				  * member must be outdated before we resume I/O;
-				  * holds susp_nod until the primary-resume 2PC
-				  * commits (or aborts).
-				  */
 
 	DEVICE_WORK_PENDING,	/* tell worker that some device has pending work */
 	PEER_DEVICE_WORK_PENDING,/* tell worker that some peer_device has pending work */
@@ -934,6 +1089,10 @@ struct twopc_reply {
 		struct { /* type == TWOPC_RESIZE */
 			u64 diskful_primary_nodes;
 			u64 max_possible_size;
+			/* reachable_nodes is the union over what the
+			 * participants report, this the intersection.
+			 */
+			u64 common_reachable_nodes;
 		};
 	};
 	unsigned int is_disconnect:1;
@@ -1049,6 +1208,7 @@ struct drbd_resource {
 
 	struct semaphore state_sem;
 	wait_queue_head_t state_wait;  /* upon each state change. */
+	unsigned int state_change_seq;  /* bumped on each committed state change */
 	enum chg_state_flags state_change_flags;
 	const char **state_change_err_str;
 	bool remote_state_change;  /* remote state change in progress */
@@ -1081,6 +1241,11 @@ struct drbd_resource {
 	bool susp_quorum[2];		/* IO suspended because no quorum */
 	bool susp_uuid[2];		/* IO suspended because waiting new current UUID */
 	bool fail_io[2];		/* Fail all IO requests because forced a demote */
+	bool resume_held_for_outdate[2];/* A Primary regained data access, but a
+					 * far-away member must be outdated before
+					 * I/O resumes; keeps susp_nod set until the
+					 * primary-resume 2PC has done that.
+					 */
 	bool cached_susp;		/* cached result of looking at all different suspend bits */
 	bool cached_all_devices_have_quorum;
 
@@ -1173,17 +1338,24 @@ struct drbd_connection {
 
 	struct drbd_work connect_timer_work;
 	struct timer_list connect_timer;
+	/* Connect two-phase commits attempted in this transport session. */
+	unsigned int connect_tries;
 
 	struct crypto_shash *cram_hmac_tfm;
 	struct crypto_shash *integrity_tfm;  /* checksums we compute, updates protected by connection->mutex[DATA_STREAM] */
 	struct crypto_shash *peer_integrity_tfm;  /* checksums we verify, only accessed from receiver thread  */
 	struct crypto_shash *csums_tfm;
 	struct crypto_shash *verify_tfm;
+	char peer_verify_alg[SHARED_SECRET_MAX]; /* peer's verify-alg; protected by conf_update */
 
 	void *int_dig_in;
 	void *int_dig_vv;
 
 	/* receiver side */
+	/* Payload copies to satisfy the backing device's alignment;
+	 * receiver thread only.
+	 */
+	unsigned int rx_misaligned_copies;
 	struct drbd_epoch *current_epoch;
 	spinlock_t epoch_lock;
 	unsigned int epochs;
@@ -1244,6 +1416,14 @@ struct drbd_connection {
 	/* Lists using drbd_peer_request.w.list */
 	struct list_head done_ee;   /* Need to send P_WRITE_ACK/P_RS_WRITE_ACK */
 	struct list_head dagtag_wait_ee; /* Resync read waiting for dagtag to be reached */
+	/* Peer writes done, waiting for the sync source to have them as well */
+	struct list_head source_wait_ee;
+
+	/* Dagtag wait requests of sync targets, waiting for this connection's
+	 * write stream to reach the position they name. Protected by
+	 * peer_reqs_lock.
+	 */
+	struct list_head dagtag_wait_reqs;
 
 	struct work_struct send_acks_work;
 	struct work_struct send_ping_ack_work;
@@ -1307,6 +1487,11 @@ struct drbd_connection {
 	/* The oldest request that is or was queued for this peer, but is not
 	 * done towards it. */
 	struct drbd_request *req_not_net_done;
+	/* The oldest request that is queued for this peer and ready to be
+	 * processed by the sender. Lets the sender pass requests that are queued
+	 * but not yet ready, see tl_next_request_for_connection().
+	 */
+	struct drbd_request *req_next_ready;
 	/* Protects the caching pointers from being advanced concurrently. */
 	spinlock_t advance_cache_ptr_lock;
 
@@ -1349,10 +1534,13 @@ struct drbd_connection {
 	 * position in a common lost primary's change stream. drbd_uuid_compare()
 	 * compares it against our own last_dagtag_sector toward that node to roll
 	 * an equal-UUID both-dirty reconcile forward. lost_node_id == -1 if none.
+	 * sent_lost_node records the mirror direction: we named a common lost
+	 * primary to the peer in this handshake (conn_connect2).
 	 */
 	struct {
 		u64 dagtag_sector;
 		int lost_node_id;
+		bool sent_lost_node;
 	} reconcile_handshake;
 
 	unsigned int peer_node_id;
@@ -1620,6 +1808,9 @@ struct drbd_device {
 	/* Used to close backing devices and destroy related structures. */
 	struct work_struct ldev_destroy_work;
 
+	/* Runs drbd_try_to_get_resynced() outside of the worker thread. */
+	struct work_struct try_get_resynced_work;
+
 	struct request_queue *rq_queue;
 	struct gendisk	    *vdisk;
 
@@ -1710,6 +1901,19 @@ struct drbd_device {
 				 */
 	bool cached_state_unstable; /* updates with each state change */
 	bool cached_err_io; /* complete all IOs with error */
+	sector_t auto_grow_asked; /* the backing-device maximum a cluster-wide
+				   * size change already answered for; see
+				   * drbd_auto_grow().  No lock: a lost update
+				   * costs one transaction, or one more arming
+				   * edge to start it.
+				   */
+	u32 gen_obligation;	/* state, auxiliary bits and reason set of the
+				 * data-generation obligation; see enum
+				 * drbd_gen_obl_state.  Read with the accessors
+				 * below, changed only by a transition holding
+				 * gen_obligation_lock.
+				 */
+	spinlock_t gen_obligation_lock;
 
 #ifdef CONFIG_DRBD_TIMING_STATS
 	spinlock_t timing_lock;
@@ -1737,8 +1941,8 @@ extern void drbd_peer_maybe_confirm_rotated_gen(struct drbd_peer_device *peer_de
 						unsigned int acked_epoch);
 
 /* Device-level decision for the per-peer signals above; defined in
- * drbd_receiver.c.  Returns true (clearing EXPOSED_GEN_UNCONFIRMED) when the
- * rotated generation just became confirmed across a quorate set of survivors.
+ * drbd_receiver.c.  Returns true (discharging the obligation) when the rotated
+ * generation just became confirmed across a quorate set of survivors.
  */
 extern bool drbd_maybe_release_rotated_gen(struct drbd_device *device);
 extern void drbd_reconcile_settled_try_up_to_date(struct drbd_resource *resource);
@@ -1764,30 +1968,7 @@ struct drbd_bm_aio_ctx {
 	struct kref kref;
 };
 
-struct drbd_config_context {
-	/* assigned from drbd_genlmsghdr */
-	unsigned int minor;
-	/* assigned from request attributes, if present */
-	unsigned int volume;
-#define VOLUME_UNSPECIFIED		(-1U)
-	unsigned int peer_node_id;
-#define PEER_NODE_ID_UNSPECIFIED	(-1U)
-	/* pointer into the request skb,
-	 * limited lifetime! */
-	char *resource_name;
-
-	/* network namespace of the sending socket */
-	struct net *net;
-	/* reply buffer */
-	struct sk_buff *reply_skb;
-	/* pointer into reply buffer */
-	struct drbd_genlmsghdr *reply_dh;
-	/* resolved from attributes, if possible */
-	struct drbd_device *device;
-	struct drbd_resource *resource;
-	struct drbd_connection *connection;
-	struct drbd_peer_device *peer_device;
-};
+#include "drbd_nl.h"
 
 static inline struct drbd_device *minor_to_device(unsigned int minor)
 {
@@ -1931,13 +2112,16 @@ int drbd_md_sync_if_dirty(struct drbd_device *device);
 void drbd_uuid_received_new_current(struct drbd_peer_device *from_pd, u64 val,
 				    u64 weak_nodes);
 void drbd_uuid_set_bitmap(struct drbd_peer_device *peer_device, u64 uuid);
+void __drbd_uuid_set_bitmap(struct drbd_peer_device *peer_device, u64 val);
 void _drbd_uuid_set_bitmap(struct drbd_peer_device *peer_device, u64 val);
 void _drbd_uuid_set_current(struct drbd_device *device, u64 val);
-void drbd_uuid_new_current(struct drbd_device *device, bool forced);
+enum drbd_mint_outcome drbd_uuid_new_current(struct drbd_device *device, bool forced);
 void drbd_uuid_new_current_by_user(struct drbd_device *device);
 void _drbd_uuid_push_history(struct drbd_device *device, u64 val);
 u64 _drbd_uuid_pull_history(struct drbd_peer_device *peer_device);
+void drbd_set_peer_bitmap_uuid(struct drbd_peer_md *peer_md, u64 bitmap_uuid, u64 dagtag);
 void drbd_uuid_resync_starting(struct drbd_peer_device *peer_device);
+void drbd_uuid_resync_starting_source(struct drbd_peer_device *peer_device);
 u64 drbd_uuid_resync_finished(struct drbd_peer_device *peer_device);
 void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device);
 bool drbd_uuid_set_exposed(struct drbd_device *device, u64 val, bool log);
@@ -1945,11 +2129,13 @@ u64 drbd_weak_nodes_device(struct drbd_device *device);
 bool drbd_uuid_is_day0(struct drbd_device *device);
 int drbd_md_test_flag(struct drbd_backing_dev *bdev, enum mdf_flag flag);
 void drbd_md_set_peer_flag(struct drbd_peer_device *peer_device,
-			   enum mdf_peer_flag flag);
+			   enum mdf_peer_flag_bit flag_bit);
 void drbd_md_clear_peer_flag(struct drbd_peer_device *peer_device,
-			     enum mdf_peer_flag flag);
+			     enum mdf_peer_flag_bit flag_bit);
 bool drbd_md_test_peer_flag(struct drbd_peer_device *peer_device,
-			    enum mdf_peer_flag flag);
+			    enum mdf_peer_flag_bit flag_bit);
+void drbd_md_slot_emptied(struct drbd_device *device, int bitmap_index);
+void drbd_md_set_bitmaps_authoritative(struct drbd_device *device);
 void drbd_md_mark_dirty(struct drbd_device *device);
 void drbd_queue_bitmap_io(struct drbd_device *device,
 			  int (*io_fn)(struct drbd_device *device,
@@ -2207,6 +2393,11 @@ void drbd_bm_get_lel(struct drbd_peer_device *peer_device, size_t offset,
 void drbd_bm_lock(struct drbd_device *device, const char *why,
 		  enum bm_flag flags);
 void drbd_bm_unlock(struct drbd_device *device);
+/* For a bitmap that is not published in device->bitmap yet. */
+void _drbd_bm_lock(struct drbd_device *device, struct drbd_bitmap *b,
+		   struct drbd_peer_device *peer_device, const char *why,
+		   enum bm_flag flags);
+void _drbd_bm_unlock(struct drbd_device *device, struct drbd_bitmap *b);
 void drbd_bm_slot_lock(struct drbd_peer_device *peer_device, char *why,
 		       enum bm_flag flags);
 void drbd_bm_slot_unlock(struct drbd_peer_device *peer_device);
@@ -2237,9 +2428,21 @@ extern struct bio_set drbd_md_io_bio_set;
 /* And a bio_set for cloning */
 extern struct bio_set drbd_io_bio_set;
 
+/* Peer request bios are allocated from drbd_peer_bio_set with this front pad. The
+ * block layer consumes bi_iter during I/O; drbd_submit_peer_request() saves
+ * what drbd_peer_request_endio() needs to restore it here.
+ */
+struct drbd_peer_bio {
+	unsigned int size;           /* bi_iter.bi_size at submit */
+	unsigned int sector_offset;  /* bi_sector - peer_req->i.sector at submit */
+	struct bio bio;
+};
+#define to_drbd_peer_bio(b) container_of(b, struct drbd_peer_bio, bio)
+extern struct bio_set drbd_peer_bio_set;
+
 struct drbd_peer_device *create_peer_device(struct drbd_device *device,
 					    struct drbd_connection *connection);
-enum drbd_ret_code drbd_create_device(struct drbd_config_context *adm_ctx,
+enum drbd_ret_code drbd_create_device(struct drbd_adm_ctx *adm_ctx,
 				      unsigned int minor,
 				      struct device_conf *device_conf,
 				      struct drbd_device **p_device);
@@ -2293,9 +2496,10 @@ enum suspend_scope {
 	WRITE_ONLY
 };
 void drbd_suspend_io(struct drbd_device *device, enum suspend_scope ss);
+int drbd_suspend_io_interruptible(struct drbd_device *device, enum suspend_scope ss);
 void drbd_resume_io(struct drbd_device *device);
 char *ppsize(char *buf, unsigned long long size);
-sector_t drbd_new_dev_size(struct drbd_device *device, sector_t current_size,
+sector_t drbd_new_dev_size(struct drbd_device *device, sector_t agreed_max_size,
 			   sector_t user_capped_size, enum dds_flags flags);
 enum determine_dev_size {
 	DS_2PC_ERR = -5,
@@ -2318,7 +2522,7 @@ void drbd_reconsider_queue_parameters(struct drbd_device *device,
 bool barrier_pending(struct drbd_resource *resource);
 enum drbd_state_rv
 drbd_set_role(struct drbd_resource *resource, enum drbd_role role, bool force,
-	      const char *tag, struct sk_buff *reply_skb);
+	      const char *tag, struct drbd_adm_ctx *ctx);
 void conn_try_outdate_peer_async(struct drbd_connection *connection);
 int drbd_maybe_khelper(struct drbd_device *device,
 		       struct drbd_connection *connection, char *cmd);
@@ -2328,9 +2532,6 @@ void youngest_and_oldest_opener_to_str(struct drbd_device *device, char *buf,
 				       size_t len);
 int param_set_drbd_strict_names(const char *val,
 				const struct kernel_param *kp);
-void drbd_enable_netns(void);
-void drbd_register_pre_post_doit(void);
-
 /* drbd_sender.c */
 int drbd_sender(struct drbd_thread *thi);
 int drbd_worker(struct drbd_thread *thi);
@@ -2364,7 +2565,7 @@ void drbd_rs_controller_reset(struct drbd_peer_device *peer_device);
 void drbd_rs_all_in_flight_came_back(struct drbd_peer_device *peer_device,
 				     int rs_sect_in);
 void drbd_check_peers(struct drbd_resource *resource);
-void drbd_check_peers_new_current_uuid(struct drbd_device *device);
+enum drbd_mint_outcome drbd_check_peers_new_current_uuid(struct drbd_device *device);
 void drbd_conflict_send_resync_request(struct drbd_peer_request *peer_req);
 void drbd_ping_peer(struct drbd_connection *connection);
 struct drbd_peer_device *peer_device_by_node_id(struct drbd_device *device,
@@ -2500,6 +2701,11 @@ struct drbd_peer_request *drbd_alloc_peer_req(struct drbd_peer_device *peer_devi
 void drbd_free_peer_req(struct drbd_peer_request *peer_req);
 void drbd_peer_req_strip_bio(struct drbd_peer_request *peer_req);
 int drbd_connected(struct drbd_peer_device *peer_device);
+
+/* drbd_transport.c */
+void drbd_connection_update_rx_alignment(struct drbd_resource *resource,
+					 struct drbd_connection *connection);
+void drbd_resource_update_rx_alignment(struct drbd_resource *resource);
 void conn_connect2(struct drbd_connection *connection);
 void wait_initial_states_received(struct drbd_connection *connection);
 void abort_connect(struct drbd_connection *connection);
@@ -2511,6 +2717,8 @@ void drbd_print_cluster_wide_state_change(struct drbd_resource *resource,
 					  union drbd_state mask,
 					  union drbd_state val);
 void apply_unacked_peer_requests(struct drbd_connection *connection);
+void drbd_refuse_unsecured_writes(struct drbd_peer_device *source);
+void drbd_dagtag_wait_reqs_source_gone(struct drbd_peer_device *requester);
 struct drbd_connection *drbd_connection_by_node_id(struct drbd_resource *resource,
 						   int node_id);
 struct drbd_connection *drbd_get_connection_by_node_id(struct drbd_resource *resource,
@@ -2520,7 +2728,7 @@ enum drbd_state_rv drbd_support_2pc_resize(struct drbd_resource *resource);
 enum determine_dev_size
 drbd_commit_size_change(struct drbd_device *device, struct resize_parms *rs,
 			u64 nodes_to_reach);
-void drbd_try_to_get_resynced(struct drbd_device *device);
+void drbd_try_get_resynced_work_fn(struct work_struct *ws);
 bool diskless_primary_can_replay_to(struct drbd_peer_device *peer_device);
 u64 diskless_primary_present_current_uuid(struct drbd_peer_device *peer_device);
 void drbd_process_rs_discards(struct drbd_peer_device *peer_device,
@@ -2573,8 +2781,9 @@ bool drbd_al_complete_io(struct drbd_device *device, struct drbd_interval *i);
 void drbd_advance_rs_marks(struct drbd_peer_device *peer_device,
 			   unsigned long still_to_go);
 bool drbd_lazy_bitmap_update_due(struct drbd_peer_device *peer_device);
-unsigned long drbd_set_all_out_of_sync(struct drbd_device *device, sector_t sector,
-			     int size);
+bool drbd_bitmap_slot_decides(struct drbd_peer_device *peer_device);
+unsigned long drbd_set_all_out_of_sync(struct drbd_device *device, int src_node_id,
+			     sector_t sector, int size);
 unsigned long drbd_set_sync(struct drbd_device *device, sector_t sector, int size,
 		  unsigned long bits, unsigned long mask);
 enum update_sync_bits_mode { RECORD_RS_FAILED, SET_OUT_OF_SYNC, SET_IN_SYNC };
@@ -2620,6 +2829,7 @@ int notify_path(struct drbd_connection *connection, struct drbd_path *path,
 void drbd_broadcast_peer_device_state(struct drbd_peer_device *peer_device);
 
 sector_t drbd_local_max_size(struct drbd_device *device);
+void drbd_auto_grow(struct drbd_device *device);
 int drbd_open_ro_count(struct drbd_resource *resource);
 
 void device_to_info(struct device_info *info, struct drbd_device *device);
@@ -2761,6 +2971,25 @@ int conn_send_twopc_request(struct drbd_connection *connection,
 			    struct twopc_request *request);
 int drbd_send_peer_ack(struct drbd_connection *connection, u64 mask,
 		       u64 dagtag_sector);
+
+/* DRBD 9 inserted D_DETACHING into enum drbd_disk_state; every state from
+ * D_FAILED up is one higher than in DRBD 8.4, which used D_FAILED for both.
+ */
+static inline void drbd_disk_states_to_84(union drbd_state *s)
+{
+	if (s->disk > D_DETACHING)
+		s->disk--;
+	if (s->pdsk > D_DETACHING)
+		s->pdsk--;
+}
+
+static inline void drbd_disk_states_from_84(union drbd_state *s)
+{
+	if (s->disk >= D_DETACHING)
+		s->disk++;
+	if (s->pdsk >= D_DETACHING)
+		s->pdsk++;
+}
 
 static inline void drbd_thread_stop(struct drbd_thread *thi)
 {
@@ -3006,6 +3235,51 @@ static inline bool may_inc_ap_bio(struct drbd_device *device)
 	return true;
 }
 
+extern bool drbd_gen_obligation_transition(struct drbd_device *device,
+					   unsigned int from_states,
+					   enum drbd_gen_obl_state to,
+					   u16 reasons, u32 aux);
+extern void drbd_gen_obligation_str(u32 obligation, char *buf, size_t size);
+extern void drbd_gen_obligation_arm(struct drbd_device *device, u16 reasons);
+extern bool drbd_gen_obligation_materialize(struct drbd_device *device);
+extern bool drbd_gen_obligation_void(struct drbd_device *device);
+extern bool drbd_gen_obligation_discharge_by_adoption(struct drbd_device *device);
+extern bool drbd_gen_obligation_mint_start(struct drbd_device *device);
+extern void drbd_gen_obligation_mint_run(struct drbd_device *device);
+extern void drbd_gen_obligation_mint_done(struct drbd_device *device,
+					  enum drbd_mint_outcome outcome);
+extern void drbd_gen_obligation_mint_before_resume(struct drbd_device *device, u64 only_nodes);
+
+static inline enum drbd_gen_obl_state drbd_gen_obligation_state(struct drbd_device *device)
+{
+	return READ_ONCE(device->gen_obligation) & GEN_OBL_STATE_MASK;
+}
+
+/* True while this volume owes a new data generation and a write must wait for
+ * it.  A parked obligation is owed as well, but writes do not reach this test
+ * while it is parked; see GEN_OBL_PARKED.  Readers take no lock.
+ * A transition can become visible slightly ahead of the state change that
+ * causes it, so a writer may find the obligation outstanding a moment before
+ * the state change is published -- that only holds back a write the state
+ * change is about to hold back anyway.  The other direction, the new state
+ * visible while the obligation it created is not, cannot happen.
+ */
+static inline bool drbd_gen_obligation_outstanding(struct drbd_device *device)
+{
+	enum drbd_gen_obl_state state = drbd_gen_obligation_state(device);
+
+	return state == GEN_OBL_ARMED || state == GEN_OBL_MINTING;
+}
+
+/* True while this volume decided to complete writes that a replica it lost
+ * never saw.  Nothing undoes such a completion, so the obligation is not
+ * voidable and its mint is mandatory.
+ */
+static inline bool drbd_gen_obligation_materialized(struct drbd_device *device)
+{
+	return READ_ONCE(device->gen_obligation) & GEN_OBL_MATERIALIZED;
+}
+
 static inline u64 drbd_current_uuid(struct drbd_device *device)
 {
 	if (!device->ldev)
@@ -3029,6 +3303,17 @@ static inline u64 drbd_bitmap_uuid(struct drbd_peer_device *peer_device)
 
 	peer_md = &device->ldev->md.peers[peer_device->node_id];
 	return peer_md->bitmap_uuid;
+}
+
+/* A slot with no bitmap of its own (MDF_HAVE_BITMAP clear) is implicitly a
+ * divergence bitmap. A day0 slot is such a slot: its bitmap is associated with
+ * it indirectly rather than owned directly. Only a directly-owned bitmap is
+ * cleared by a resync, and thereby turned into a convergence bitmap.
+ */
+static inline bool is_divergence_bitmap(struct drbd_peer_md *peer_md)
+{
+	return !test_bit(__MDF_HAVE_BITMAP, &peer_md->flags) ||
+		test_bit(__MDF_PEER_DIVERGENCE_BITMAP, &peer_md->flags);
 }
 
 static inline u64 drbd_history_uuid(struct drbd_device *device, int i)
