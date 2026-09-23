@@ -9,7 +9,8 @@ __git_ls_sources := $(shell			\
   git ls-files --recurse			\
 	*.[ch]					\
 	drbd-kernel-compat/handshake/*.[ch]	\
-	drbd-headers/linux/*.h			\
+	drbd-headers/linux/*.[ch]		\
+	drbd-headers/uapi/linux/*.h		\
 )
 
 # no need to patch our headers (yet)
@@ -18,6 +19,7 @@ sources-ignored += drbd_debugfs.h
 sources-ignored += drbd_int.h
 sources-ignored += drbd_interval.h
 sources-ignored += drbd_kref_debug.h
+sources-ignored += drbd_nl.h
 sources-ignored += drbd_polymorph_printk.h
 sources-ignored += drbd_req.h
 sources-ignored += drbd_state.h
@@ -35,6 +37,8 @@ sources += drbd_interval.c
 sources += drbd_kref_debug.c
 sources += drbd_main.c
 sources += drbd_nl.c
+sources += drbd_nl_legacy.c
+sources += drbd_nl_drbd2.c
 sources += drbd_proc.c
 sources += drbd_receiver.c
 sources += drbd_req.c
@@ -56,12 +60,20 @@ sources += drbd-kernel-compat/handshake/netlink.c
 sources += drbd-kernel-compat/handshake/request.c
 sources += drbd-kernel-compat/handshake/tlshd.c
 
-sources += drbd-headers/linux/drbd.h
-sources += drbd-headers/linux/drbd_genl.h
-sources += drbd-headers/linux/drbd_genl_api.h
-sources += drbd-headers/linux/drbd_limits.h
-sources += drbd-headers/linux/genl_magic_func.h
-sources += drbd-headers/linux/genl_magic_struct.h
+sources += drbd-headers/uapi/linux/drbd.h
+sources += drbd-headers/uapi/linux/drbd_genl.h
+sources += drbd-headers/uapi/linux/drbd_limits.h
+sources += drbd-headers/linux/drbd_nl_gen.c
+sources-ignored += drbd-headers/linux/drbd_nl_gen.h
+sources-ignored += drbd-headers/linux/drbd_nl_types.h
+# only compiled where no compat rule applies; see CONFIG_DRBD_NL_DRBD2
+sources-ignored += drbd-headers/linux/drbd2_nl_gen.c
+sources-ignored += drbd-headers/linux/drbd2_nl_gen.h
+sources-ignored += drbd-headers/uapi/linux/drbd2.h
+
+# generated for drbd-utils' userspace netlink, never compiled into the module
+sources-ignored += drbd-headers/linux/drbd_genl_userspace.c
+sources-ignored += drbd-headers/linux/drbd_genl_userspace.h
 
 __duplicates := $(shell printf "%s\n" $(sources) $(sources-ignored) | sort | uniq -d)
 $(if $(__duplicates),$(error duplicated entries found: $(__duplicates)))

@@ -127,6 +127,9 @@ module: check-kdir check-submods
 	@ $(MAKE) -C drbd KVER=$(KVER) KDIR=$(KDIR) SPAAS=$(SPAAS) SPAAS_URL=$(SPAAS_URL)
 	@ echo -e "\n\tModule build was successful."
 
+compile_commands.json: module
+	@ misc/gen-compile-commands.sh $(KDIR) drbd/build-current $@
+
 install:
 	$(MAKE) -C drbd install
 
@@ -136,7 +139,7 @@ clean:
 
 distclean:
 	@ set -e; for i in $(SUBDIRS); do $(MAKE) -C $$i distclean; done
-	rm -f *~ .filelist .fdist_version
+	rm -f *~ .filelist .fdist_version compile_commands.json
 
 uninstall:
 	@ set -e; for i in $(SUBDIRS); do $(MAKE) -C $$i uninstall; done
@@ -330,18 +333,22 @@ MODE = report
 endif
 
 .PHONY: coccicheck
+# spatch exits successfully even when a check reports something, so stop at the
+# first run that produces output.
 coccicheck: checks/*.cocci
 	@for file in $^ ; do \
 		echo "  COCCICHECK $$(basename $${file} .cocci)"; \
-		spatch --very-quiet drbd/drbd_*.c -D $(MODE) --sp-file $${file}; \
+		out=$$(spatch --very-quiet drbd/drbd_*.c -D $(MODE) --sp-file $${file}) || exit 1; \
+		if test -n "$${out}" ; then printf '%s\n' "$${out}"; exit 1; fi; \
 	done
 
 .PHONY: pychecks
 pychecks: checks/*.py
-	@for file in $^ ; do \
+	@rv=0; for file in $^ ; do \
+		test -x $${file} || continue; \
 		echo "  CHECK $$(basename $${file} .py)"; \
-		python3 $${file} drbd/*.c; \
-	done
+		python3 $${file} drbd/*.c || rv=1; \
+	done; exit $$rv
 
 .PHONY: checks
 checks: coccicheck pychecks

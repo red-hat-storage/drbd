@@ -12,7 +12,9 @@
 #include <linux/tcp.h>
 #include <linux/highmem.h>
 #include <linux/bio.h>
-#include <linux/drbd_genl_api.h>
+#include <linux/drbd.h>
+#include <uapi/linux/drbd_genl.h>
+#include <linux/drbd_nl_gen.h>
 #include <linux/drbd_config.h>
 #include <net/tcp.h>
 #include "drbd_protocol.h"
@@ -85,8 +87,11 @@ struct dtl_transport {
 	atomic_t connected_paths;
 	wait_queue_head_t connected_paths_change;
 	int err;
-	struct mutex connecting_socket_mutex;
-	struct socket *connecting_socket;
+	/* The connect worker connects the paths one after another, so at most one
+	 * socket is waiting for its connect at a time.
+	 */
+	wait_queue_head_t connect_wait;
+	void (*connecting_sk_state_change)(struct sock *sk);
 };
 
 struct dtl_listener {
@@ -138,7 +143,8 @@ static int dtl_connect(struct drbd_transport *transport);
 static void dtl_finish_connect(struct drbd_transport *transport);
 static int dtl_recv(struct drbd_transport *transport, enum drbd_stream stream, void **buf,
 		    size_t size, int flags);
-static int dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size);
+static int dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size,
+			unsigned int *misalign_bits);
 static void dtl_stats(struct drbd_transport *transport, struct drbd_transport_stats *stats);
 static int dtl_net_conf_change(struct drbd_transport *transport, struct net_conf *new_net_conf);
 static void dtl_set_rcvtimeo(struct drbd_transport *transport, enum drbd_stream stream,
@@ -205,7 +211,6 @@ static int dtl_init(struct drbd_transport *transport)
 		container_of(transport, struct dtl_transport, transport);
 
 	spin_lock_init(&dtl_transport->control_recv_lock);
-	mutex_init(&dtl_transport->connecting_socket_mutex);
 
 	dtl_transport->transport.class = &dtl_transport_class;
 	timer_setup(&dtl_transport->control_timer, dtl_control_timer_fn, 0);
@@ -217,6 +222,7 @@ static int dtl_init(struct drbd_transport *transport)
 	atomic_set(&dtl_transport->connected_paths, 0);
 	dtl_transport->flags = 0;
 	init_waitqueue_head(&dtl_transport->connected_paths_change);
+	init_waitqueue_head(&dtl_transport->connect_wait);
 
 	dtl_transport->rbuf.base = (void *)__get_free_page(GFP_KERNEL);
 	dtl_transport->rbuf.pos = dtl_transport->rbuf.base;
@@ -554,7 +560,8 @@ out:
 }
 
 static int
-dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size)
+dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t size,
+	     unsigned int *misalign_bits)
 {
 	struct dtl_transport *dtl_transport =
 		container_of(transport, struct dtl_transport, transport);
@@ -562,6 +569,7 @@ dtl_recv_bio(struct drbd_transport *transport, struct bio_list *bios, size_t siz
 	struct page *page;
 	int err;
 
+	*misalign_bits = 0;
 	do {
 		size_t len;
 
@@ -642,6 +650,67 @@ static bool dtl_path_cmp_addr(struct dtl_path *path)
 	return memcmp(&drbd_path->my_addr, &drbd_path->peer_addr, addr_size) > 0;
 }
 
+/* Wakes dtl_wait_connected(): this socket has left TCP_SYN_SENT. The read lock
+ * pairs with dtl_hook_connecting_socket(), so the callback and the unhook that
+ * drops sk_user_data cannot overlap.
+ */
+static void dtl_connect_state_change(struct sock *sk)
+{
+	struct dtl_transport *dtl_transport;
+
+	read_lock_bh(&sk->sk_callback_lock);
+	dtl_transport = sk->sk_user_data;
+	if (dtl_transport) {
+		dtl_transport->connecting_sk_state_change(sk);
+		wake_up(&dtl_transport->connect_wait);
+	}
+	read_unlock_bh(&sk->sk_callback_lock);
+}
+
+static void dtl_hook_connecting_socket(struct dtl_transport *dtl_transport,
+				       struct socket *sock, bool hook)
+{
+	struct sock *sk = sock->sk;
+
+	write_lock_bh(&sk->sk_callback_lock);
+	if (hook) {
+		dtl_transport->connecting_sk_state_change = sk->sk_state_change;
+		sk->sk_user_data = dtl_transport;
+		sk->sk_state_change = dtl_connect_state_change;
+	} else {
+		sk->sk_state_change = dtl_transport->connecting_sk_state_change;
+		sk->sk_user_data = NULL;
+	}
+	write_unlock_bh(&sk->sk_callback_lock);
+}
+
+/* Wait out a connect() that was issued non-blocking: 0 once the socket is
+ * connected, the socket's error if it is not, -EINTR when the transport stopped
+ * connecting, -ETIMEDOUT after connect_int. The last two lines are what
+ * __inet_stream_connect() would have run for a blocking connect.
+ */
+static int dtl_wait_connected(struct dtl_transport *dtl_transport,
+			      struct socket *sock, long timeout)
+{
+	struct sock *sk = sock->sk;
+	long t;
+
+	t = wait_event_interruptible_timeout(dtl_transport->connect_wait,
+			!test_bit(DTL_CONNECTING, &dtl_transport->flags) ||
+			(sk->sk_state != TCP_SYN_SENT &&
+			 sk->sk_state != TCP_SYN_RECV),
+			timeout);
+	if (!test_bit(DTL_CONNECTING, &dtl_transport->flags))
+		return -EINTR;
+	if (t < 0)
+		return t;
+	if (!t)
+		return -ETIMEDOUT;
+	if (sk->sk_state == TCP_CLOSE)
+		return sock_error(sk) ? : -ECONNABORTED;
+	return 0;
+}
+
 static int
 dtl_try_connect(struct drbd_transport *transport, struct dtl_path *path, struct socket **ret_sock)
 {
@@ -698,16 +767,17 @@ dtl_try_connect(struct drbd_transport *transport, struct dtl_path *path, struct 
 	if (err < 0)
 		goto out;
 
-	/* connect may fail, peer not yet available. stay C_CONNECTING */
+	/* connect may fail, peer not yet available. stay C_CONNECTING.
+	 * Non-blocking, and waited out here: a blocking connect() can only be
+	 * ended by the socket itself, and a teardown has to be able to end it.
+	 */
 	what = "connect";
-	mutex_lock(&dtl_transport->connecting_socket_mutex);
-	dtl_transport->connecting_socket = sock;
-	mutex_unlock(&dtl_transport->connecting_socket_mutex);
+	dtl_hook_connecting_socket(dtl_transport, sock, true);
 	err = sock->ops->connect(sock, (struct sockaddr_unsized *) &peer_addr,
-				   path->path.peer_addr_len, 0);
-	mutex_lock(&dtl_transport->connecting_socket_mutex);
-	dtl_transport->connecting_socket = NULL;
-	mutex_unlock(&dtl_transport->connecting_socket_mutex);
+				   path->path.peer_addr_len, O_NONBLOCK);
+	if (err == -EINPROGRESS)
+		err = dtl_wait_connected(dtl_transport, sock, connect_int * HZ);
+	dtl_hook_connecting_socket(dtl_transport, sock, false);
 	if (err < 0) {
 		switch (err) {
 		case -ETIMEDOUT:
@@ -1515,18 +1585,8 @@ static int dtl_set_active(struct drbd_transport *transport, bool active)
 	if (active) {
 		set_bit(DTL_CONNECTING, &dtl_transport->flags);
 	} else {
-		struct socket *sock;
-
 		clear_bit(DTL_CONNECTING, &dtl_transport->flags);
-
-		/* Abort a waiting connect(). Holding the mutex across the
-		 * shutdown keeps the socket alive.
-		 */
-		mutex_lock(&dtl_transport->connecting_socket_mutex);
-		sock = dtl_transport->connecting_socket;
-		if (sock)
-			kernel_sock_shutdown(sock, SHUT_RDWR);
-		mutex_unlock(&dtl_transport->connecting_socket_mutex);
+		wake_up_all(&dtl_transport->connect_wait);	/* abort a connect */
 	}
 
 	for_each_path_ref(drbd_path, transport) {
@@ -1562,9 +1622,15 @@ static int dtl_prepare_connect(struct drbd_transport *transport)
 
 	atomic_set(&dtl_transport->connected_paths, 0);
 	dtl_transport->err = 0;
-	flush_signals(current);
 	timer_delete_sync(&dtl_transport->control_timer);
-	dtl_transport->err = dtl_set_active(transport, true);
+
+	/* Drops a leftover signal but honours a stop request: with the peer
+	 * gone that is the only exit from dtl_connect()'s wait.
+	 */
+	if (drbd_should_abort_listening(transport))
+		dtl_transport->err = -ERESTARTSYS;
+	else
+		dtl_transport->err = dtl_set_active(transport, true);
 
 	return dtl_transport->err;
 }
