@@ -15,6 +15,7 @@
 #include <linux/mm.h>
 #include <linux/netlink.h>
 #include <linux/file.h>
+#include <linux/err.h>
 
 #include <net/sock.h>
 #include <net/genetlink.h>
@@ -94,7 +95,6 @@ int handshake_nl_accept_doit(struct sk_buff *skb, struct genl_info *info)
 	struct net *net = sock_net(skb->sk);
 	struct handshake_net *hn = handshake_pernet(net);
 	struct handshake_req *req;
-	struct socket *sock;
 	int class, fd, err;
 
 	err = -EOPNOTSUPP;
@@ -113,9 +113,9 @@ int handshake_nl_accept_doit(struct sk_buff *skb, struct genl_info *info)
 	if (!req)
 		goto out_status;
 
-	sock = req->hr_sk->sk_socket;
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
+		fput(req->hr_file); /* drop ref from handshake_req_next() */
 		err = fd;
 		goto out_complete;
 	}
@@ -123,10 +123,11 @@ int handshake_nl_accept_doit(struct sk_buff *skb, struct genl_info *info)
 	err = req->hr_proto->hp_accept(req, info, fd);
 	if (err) {
 		put_unused_fd(fd);
+		fput(req->hr_file);
 		goto out_complete;
 	}
 
-	fd_install(fd, get_file(sock->file));
+	fd_install(fd, req->hr_file); /* consumes the handshake_req_next() ref */
 
 	return 0;
 
@@ -142,8 +143,8 @@ int handshake_nl_done_doit(struct sk_buff *skb, struct genl_info *info)
 	struct socket *sock;
 	int fd, status, err;
 
-	if (!info->attrs[HANDSHAKE_A_ACCEPT_HANDLER_CLASS]) {
-		NL_SET_ERR_MSG_ATTR(info->extack, info->attrs[HANDSHAKE_A_ACCEPT_HANDLER_CLASS], "missing");
+	if (!info->attrs[HANDSHAKE_A_DONE_SOCKFD]) {
+		NL_SET_ERR_MSG_ATTR(info->extack, info->attrs[HANDSHAKE_A_DONE_SOCKFD], "missing");
 		return -EINVAL;
 	}
 	fd = nla_get_s32(info->attrs[HANDSHAKE_A_DONE_SOCKFD]);
@@ -162,8 +163,16 @@ int handshake_nl_done_doit(struct sk_buff *skb, struct genl_info *info)
 
 
 	status = -EIO;
-	if (info->attrs[HANDSHAKE_A_DONE_STATUS])
-		status = nla_get_u32(info->attrs[HANDSHAKE_A_DONE_STATUS]);
+	if (info->attrs[HANDSHAKE_A_DONE_STATUS]) {
+		u32 err_status = nla_get_u32(info->attrs[HANDSHAKE_A_DONE_STATUS]);
+
+		/* Upstream bounds this with NLA_POLICY_MAX() */
+		if (err_status > MAX_ERRNO) {
+			fput(sock->file);
+			return -EINVAL;
+		}
+		status = -(int)err_status;
+	}
 
 	handshake_complete(req, status, info);
 	fput(sock->file);
@@ -205,21 +214,21 @@ static void __net_exit handshake_net_exit(struct net *net)
 	 * accepted and are in progress will be destroyed when
 	 * the socket is closed.
 	 */
-	spin_lock(&hn->hn_lock);
+	spin_lock_bh(&hn->hn_lock);
 	set_bit(HANDSHAKE_F_NET_DRAINING, &hn->hn_flags);
-	list_splice_init(&requests, &hn->hn_requests);
-	spin_unlock(&hn->hn_lock);
+	list_splice_init(&hn->hn_requests, &requests);
+	list_for_each_entry(req, &requests, hr_list)
+		get_file(req->hr_file);
+	spin_unlock_bh(&hn->hn_lock);
 
 	while (!list_empty(&requests)) {
+		struct file *file;
+
 		req = list_first_entry(&requests, struct handshake_req, hr_list);
-		list_del(&req->hr_list);
-
-		/*
-		 * Requests on this list have not yet been
-		 * accepted, so they do not have an fd to put.
-		 */
-
+		file = req->hr_file;
+		list_del_init(&req->hr_list);
 		handshake_complete(req, -ETIMEDOUT, NULL);
+		fput(file);
 	}
 }
 

@@ -29,6 +29,7 @@ int drbd_register_transport_class(struct drbd_transport_class *transport_class, 
 				  int drbd_transport_size)
 {
 	int rv = 0;
+
 	if (version != DRBD_TRANSPORT_API_VERSION) {
 		pr_err("DRBD_TRANSPORT_API_VERSION not compatible\n");
 		return -EINVAL;
@@ -331,6 +332,13 @@ bool drbd_stream_send_timed_out(struct drbd_transport *transport, enum drbd_stre
 
 	if (drop_it)
 		return true;
+
+	if (connection->transport.ko_count == 0) {
+		drbd_err(connection, "[%s/%d] sending time expired, pinging peer\n",
+			 current->comm, current->pid);
+		drbd_queue_ping(connection);
+		return false;
+	}
 
 	drop_it = !--connection->transport.ko_count;
 	if (!drop_it) {
