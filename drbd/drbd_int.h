@@ -12,7 +12,6 @@
 #include <crypto/hash.h>
 #include <linux/compiler.h>
 #include <linux/types.h>
-#include <linux/version.h>
 #include <linux/list.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
@@ -760,6 +759,7 @@ enum peer_device_flag {
 				 * bridges loss -> RECONCILIATION_RESYNC
 				 */
 	UNSTABLE_RESYNC,	/* Sync source went unstable during resync. */
+	PEER_UPGRADE_PREDICTED,	/* Recorded the peer UpToDate before its P_STATE */
 	SEND_STATE_AFTER_AHEAD,
 	GOT_NEG_ACK,		/* got a neg_ack while primary, wait until peer_disk is lower than
 				   D_UP_TO_DATE before becoming secondary! */
@@ -1130,6 +1130,7 @@ struct drbd_send_buffer {
 	char *pos; /* position within that page */
 	int allocated_size; /* currently allocated space */
 	int additional_size;  /* additional space to be added to next packet's size */
+	bool dead; /* a send failed: this stream carries a truncated packet */
 };
 
 struct drbd_mutable_buffer {
@@ -2684,6 +2685,7 @@ void drbd_queue_ping_ack(struct drbd_connection *connection);
 void drbd_send_acks_wf(struct work_struct *ws);
 void drbd_send_peer_ack_wf(struct work_struct *ws);
 bool drbd_rs_c_min_rate_throttle(struct drbd_peer_device *peer_device);
+void drbd_predict_peer_upgrade(struct drbd_peer_device *peer_device);
 void drbd_verify_skipped_block(struct drbd_peer_device *peer_device,
 			       const sector_t sector, const unsigned int size);
 void drbd_conflict_submit_resync_request(struct drbd_peer_request *peer_req);
