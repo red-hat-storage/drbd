@@ -21,6 +21,10 @@
 
 #include "drbd_int.h"
 #include "drbd_nl.h"
+#include "drbd_legacy_84.h"
+
+#include <uapi/linux/drbd_genl.h>
+#include <linux/drbd_nl_gen.h>
 
 static const struct drbd_nl_dialect drbd_nl_legacy_dialect;
 
@@ -499,7 +503,7 @@ static bool legacy_attr_present(struct drbd_adm_ctx *ctx, enum drbd_adm_field fi
 static int legacy_put_timeout_type(struct drbd_adm_ctx *ctx, enum drbd_timeout_flag type)
 {
 	struct legacy_req *req = legacy_req(ctx);
-	struct timeout_parms tp = { .timeout_type = type };
+	struct drbd_timeout_parms tp = { .timeout_type = type };
 	int err;
 
 	err = timeout_parms_to_skb(req->reply_skb, &tp);
@@ -896,8 +900,8 @@ nla_put_failure:
 
 static int legacy_emit_resource(struct sk_buff *skb, struct netlink_callback *cb,
 				struct drbd_resource *resource,
-				struct resource_info *resource_info,
-				struct resource_statistics *resource_statistics)
+				struct drbd_resource_info *resource_info,
+				struct drbd_resource_statistics *resource_statistics)
 {
 	struct drbd_genlmsghdr *dh;
 	int err;
@@ -926,9 +930,9 @@ static int legacy_emit_resource(struct sk_buff *skb, struct netlink_callback *cb
 }
 
 static int legacy_emit_device(struct sk_buff *skb, struct netlink_callback *cb, int retcode,
-			      struct drbd_device *device, struct disk_conf *disk_conf,
-			      struct device_info *device_info,
-			      struct device_statistics *device_statistics)
+			      struct drbd_device *device, struct drbd_disk_conf *disk_conf,
+			      struct drbd_device_info *device_info,
+			      struct drbd_device_statistics *device_statistics)
 {
 	struct drbd_genlmsghdr *dh;
 	int err;
@@ -967,9 +971,9 @@ static int legacy_emit_device(struct sk_buff *skb, struct netlink_callback *cb, 
 static int legacy_emit_connection(struct sk_buff *skb, struct netlink_callback *cb, int retcode,
 				  struct drbd_resource *resource,
 				  struct drbd_connection *connection,
-				  struct net_conf *net_conf,
-				  struct connection_info *connection_info,
-				  struct connection_statistics *connection_statistics)
+				  struct drbd_net_conf *net_conf,
+				  struct drbd_connection_info *connection_info,
+				  struct drbd_connection_statistics *connection_statistics)
 {
 	struct drbd_genlmsghdr *dh;
 	int err;
@@ -1004,9 +1008,9 @@ static int legacy_emit_connection(struct sk_buff *skb, struct netlink_callback *
 
 static int legacy_emit_peer_device(struct sk_buff *skb, struct netlink_callback *cb, int retcode,
 				   struct drbd_peer_device *peer_device, unsigned int minor,
-				   struct peer_device_info *peer_device_info,
-				   struct peer_device_statistics *peer_device_statistics,
-				   struct peer_device_conf *peer_device_conf)
+				   struct drbd_peer_device_info *peer_device_info,
+				   struct drbd_peer_device_statistics *peer_device_statistics,
+				   struct drbd_peer_device_conf *peer_device_conf)
 {
 	struct drbd_genlmsghdr *dh;
 	int err;
@@ -1044,7 +1048,7 @@ static int legacy_emit_peer_device(struct sk_buff *skb, struct netlink_callback 
 
 static int legacy_emit_path(struct sk_buff *skb, struct netlink_callback *cb, int retcode,
 			    struct drbd_resource *resource, struct drbd_connection *connection,
-			    struct drbd_path *path, struct drbd_path_info *path_info)
+			    struct drbd_path *path, struct drbd_nl_path_info *path_info)
 {
 	struct drbd_genlmsghdr *dh;
 	int err;
@@ -1209,7 +1213,7 @@ int drbd_nl_get_initial_state_dumpit(struct sk_buff *skb, struct netlink_callbac
 static int nla_put_notification_header(struct sk_buff *msg,
 				       enum drbd_notification_type type)
 {
-	struct drbd_notification_header nh = {
+	struct drbd_nl_notification_header nh = {
 		.nh_type = type,
 	};
 
@@ -1219,11 +1223,11 @@ static int nla_put_notification_header(struct sk_buff *msg,
 static int legacy_notify_resource_state(struct sk_buff *skb,
 					unsigned int seq,
 					struct drbd_resource *resource,
-					struct resource_info *resource_info,
-					struct rename_resource_info *rename_resource_info,
+					struct drbd_resource_info *resource_info,
+					struct drbd_rename_resource_info *rename_resource_info,
 					enum drbd_notification_type type)
 {
-	struct resource_statistics resource_statistics;
+	struct drbd_resource_statistics resource_statistics;
 	struct drbd_genlmsghdr *dh;
 	bool multicast = false;
 	int err;
@@ -1282,10 +1286,10 @@ failed:
 static int legacy_notify_device_state(struct sk_buff *skb,
 				      unsigned int seq,
 				      struct drbd_device *device,
-				      struct device_info *device_info,
+				      struct drbd_device_info *device_info,
 				      enum drbd_notification_type type)
 {
-	struct device_statistics device_statistics;
+	struct drbd_device_statistics device_statistics;
 	struct drbd_genlmsghdr *dh;
 	bool multicast = false;
 	int err;
@@ -1331,10 +1335,10 @@ failed:
 static int legacy_notify_connection_state(struct sk_buff *skb,
 					  unsigned int seq,
 					  struct drbd_connection *connection,
-					  struct connection_info *connection_info,
+					  struct drbd_connection_info *connection_info,
 					  enum drbd_notification_type type)
 {
-	struct connection_statistics connection_statistics;
+	struct drbd_connection_statistics connection_statistics;
 	struct drbd_genlmsghdr *dh;
 	bool multicast = false;
 	int err;
@@ -1381,10 +1385,10 @@ failed:
 static int legacy_notify_peer_device_state(struct sk_buff *skb,
 					   unsigned int seq,
 					   struct drbd_peer_device *peer_device,
-					   struct peer_device_info *peer_device_info,
+					   struct drbd_peer_device_info *peer_device_info,
 					   enum drbd_notification_type type)
 {
-	struct peer_device_statistics peer_device_statistics;
+	struct drbd_peer_device_statistics peer_device_statistics;
 	struct drbd_resource *resource = peer_device->device->resource;
 	struct drbd_genlmsghdr *dh;
 	bool multicast = false;
@@ -1436,7 +1440,7 @@ static int legacy_notify_path_state(struct sk_buff *skb,
 				     */
 				    struct drbd_connection *connection,
 				    struct drbd_path *path,
-				    struct drbd_path_info *path_info,
+				    struct drbd_nl_path_info *path_info,
 				    enum drbd_notification_type type)
 {
 	struct drbd_resource *resource = connection->resource;
@@ -1490,7 +1494,7 @@ static int legacy_notify_helper(struct sk_buff *skb,
 				enum drbd_notification_type type)
 {
 	struct drbd_resource *resource = device ? device->resource : connection->resource;
-	struct drbd_helper_info helper_info;
+	struct drbd_nl_helper_info helper_info;
 	struct drbd_genlmsghdr *dh;
 	int err;
 
@@ -1586,3 +1590,32 @@ void drbd_nl_legacy_exit(void)
 {
 	genl_unregister_family(&drbd_nl_family);
 }
+
+#ifdef CONFIG_DRBD_COMPAT_84
+/*
+ * The 8.4 metadata support without the version 1 dialect: nobody consumes
+ * the fused sync-progress event drbd_nl_84.c would emit.
+ */
+void compat84_notify_sync_progress(struct drbd_peer_device *peer_device)
+{
+}
+#endif
+
+#ifndef CONFIG_DRBD_NL_DRBD2
+/*
+ * The drbd2 family is only built where the kernel has the split generic
+ * netlink ops, the big-endian policy types and the formatted extack
+ * messages the generated code and the adapter need (see Kbuild.drbd);
+ * elsewhere the module serves this family alone. The version 1 dialect
+ * needs a newer kernel than drbd2 does, so this file is always the one
+ * built there.
+ */
+int drbd_nl_drbd2_init(void)
+{
+	return 0;
+}
+
+void drbd_nl_drbd2_exit(void)
+{
+}
+#endif

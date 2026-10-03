@@ -22,6 +22,7 @@
 #include "drbd_protocol.h"
 #include "drbd_req.h"
 #include "drbd_meta_data.h"
+#include "drbd_legacy_84.h"
 
 void drbd_panic_after_delayed_completion_of_aborted_request(struct drbd_device *device);
 
@@ -852,7 +853,7 @@ struct fifo_buffer *fifo_alloc(unsigned int fifo_size)
 static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in, u64 duration_ns)
 {
 	const u64 max_duration_ns = RS_MAKE_REQS_INTV_NS * 10;
-	struct peer_device_conf *pdc;
+	struct drbd_peer_device_conf *pdc;
 	unsigned int want;     /* The number of sectors we want in-flight */
 	int req_sect; /* Number of sectors to request in this turn */
 	int correction; /* Number of sectors more we need in-flight */
@@ -942,7 +943,7 @@ static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in,
  */
 static int drbd_rs_number_requests(struct drbd_peer_device *peer_device)
 {
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	ktime_t duration, now;
 	unsigned int sect_in;  /* Number of sectors that came in since the last turn */
 	int number, mxb;
@@ -1673,7 +1674,7 @@ static int w_resync_finished(struct drbd_work *w, int cancel)
 
 static long ping_timeout(struct drbd_connection *connection)
 {
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	long timeout;
 
 	rcu_read_lock();
@@ -3067,7 +3068,7 @@ bool drbd_stable_sync_source_present(struct drbd_peer_device *except_peer_device
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
 		enum drbd_repl_state repl_state;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		if (peer_device == except_peer_device)
 			continue;
@@ -3126,7 +3127,7 @@ static void handle_congestion(struct drbd_peer_device *peer_device)
 {
 	struct drbd_resource *resource = peer_device->device->resource;
 	unsigned long irq_flags;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	enum drbd_on_congestion on_congestion;
 
 	rcu_read_lock();
@@ -3294,6 +3295,13 @@ static void update_on_disk_bitmap(struct drbd_peer_device *peer_device, bool res
 			drbd_resync_finished(peer_device, D_MASK);
 		}
 	}
+
+	/* v1 dialect only: fused SIB_SYNC_PROGRESS DRBD_EVENT, at the same
+	 * point and under the same throttle mainline's own
+	 * update_on_disk_bitmap() broadcasts one from (drivers/block/drbd/
+	 * drbd_worker.c). No-op stub without CONFIG_DRBD_COMPAT_84.
+	 */
+	compat84_notify_sync_progress(peer_device);
 
 	/* update timestamp, in case it took a while to write out stuff */
 	peer_device->rs_last_writeout = jiffies;
@@ -3711,7 +3719,7 @@ static void wait_for_sender_todo(struct drbd_connection *connection)
 {
 	struct drbd_resource *resource = connection->resource;
 	DEFINE_WAIT(wait);
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int uncork, cork;
 	bool got_something = 0;
 
