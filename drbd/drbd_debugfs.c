@@ -11,6 +11,7 @@
 #include <linux/jiffies.h>
 #include <linux/list.h>
 #include <generated/utsrelease.h>
+#include <uapi/linux/drbd_genl.h>
 
 #include "drbd_int.h"
 #include "drbd_req.h"
@@ -1844,7 +1845,7 @@ static int peer_device_proc_drbd_show(struct seq_file *m, void *ignored)
 	struct drbd_device *device = peer_device->device;
 	union drbd_state state;
 	const char *sn;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	bool have_ldev;
 	char wp;
 

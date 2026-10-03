@@ -26,8 +26,7 @@
 #include <linux/lru_cache.h>
 #include <linux/prefetch.h>
 #include <linux/drbd.h>
-#include <uapi/linux/drbd_genl.h>
-#include <linux/drbd_nl_gen.h>
+#include <linux/drbd_nl_types.h>
 #include <linux/drbd_config.h>
 
 #include "drbd_strings.h"
@@ -37,6 +36,31 @@
 #include "drbd_kref_debug.h"
 #include "drbd_transport.h"
 #include "drbd_polymorph_printk.h"
+
+/*
+ * The version DRBD advertises in /proc/drbd and in the module's "version"
+ * modinfo field.
+ *
+ * Released drbd-utils 9.x do not probe the netlink family: they take the
+ * first token after "version:" in /proc/drbd (or, with the module not yet
+ * loaded, "modinfo -F version drbd"). For 8.4 they exec their bundled
+ * drbdadm-84/drbdsetup-84; for anything else they run the DRBD 9 tools,
+ * which exit with "API mismatch" unless "drbd" is at family version 2. A
+ * build serving the v1 family must therefore say 8.4. 8.4.11 is what the
+ * in-tree module has reported since 2018; the real release is still shown
+ * as "core:" in /proc/drbd, in the kernel log and in debugfs.
+ *
+ * Only where "drbd" is actually v1, which CONFIG_DRBD_COMPAT_84 means. The
+ * out-of-tree module can instead serve DRBD 9's own version 2 of the family
+ * next to the 8.4 metadata support; its Kbuild then defines
+ * DRBD_NL_FAMILY_V2. That is what LINBIT's packages ship, and an 8.4 token
+ * there would send drbd-utils 9.x to drbdsetup-84 against a v2 family.
+ */
+#if defined(CONFIG_DRBD_COMPAT_84) && !defined(DRBD_NL_FAMILY_V2)
+#define DRBD_PROC_VERSION "8.4.11"
+#else
+#define DRBD_PROC_VERSION REL_VERSION
+#endif
 
 /* module parameter, defined in drbd_main.c */
 extern unsigned int drbd_minor_count;
@@ -965,7 +989,7 @@ struct drbd_backing_dev {
 	struct block_device *md_bdev;
 	struct file *f_md_bdev;
 	struct drbd_md md;
-	struct disk_conf __rcu *disk_conf; /* RCU, for updates: resource->conf_update */
+	struct drbd_disk_conf __rcu *disk_conf; /* RCU, for updates: resource->conf_update */
 	sector_t known_size; /* last known size of that backing device */
 #if IS_ENABLED(CONFIG_DEV_DAX_PMEM)
 	struct dax_device *dax_dev;
@@ -1166,8 +1190,21 @@ struct drbd_resource {
 	struct list_head connections;
 
 	struct list_head resources;     /* list entry in global resources list */
-	struct res_opts res_opts;
+	struct drbd_res_opts res_opts;
 	int max_node_id;
+#ifdef CONFIG_DRBD_COMPAT_84
+	/*
+	 * The version 1 dialect's disk_conf carries "fencing", whose DRBD 9
+	 * home is net_conf.fencing_policy: a connection-scoped setting. 8.4's
+	 * normal order is attach, then connect, so a v1 attach or
+	 * disk-options call can send this before any connection exists to
+	 * apply it to. Stashed here in that case, protected by adm_mutex;
+	 * the v1 connect handler applies it once the connection is created
+	 * and clears the flag.
+	 */
+	bool pending_fencing_policy_84_set;
+	enum drbd_fencing_policy pending_fencing_policy_84;
+#endif
 	/*
 	 * For read-copy-update of net_conf and disk_conf and devices,
 	 * connection, peer_devices and paths lists.
@@ -1586,7 +1623,7 @@ struct drbd_peer_device {
 	struct list_head peer_devices;
 	struct drbd_device *device;
 	struct drbd_connection *connection;
-	struct peer_device_conf __rcu *conf; /* RCU, for updates: resource->conf_update */
+	struct drbd_peer_device_conf __rcu *conf; /* RCU, for updates: resource->conf_update */
 	enum drbd_disk_state disk_state[2];
 	enum drbd_repl_state repl_state[2];
 	bool resync_susp_user[2];
@@ -1803,6 +1840,50 @@ struct drbd_device {
 	/* things that are stored as / read from meta data on disk */
 	unsigned long flags;
 
+#ifdef CONFIG_DRBD_COMPAT_84
+	/*
+	 * The version 1 dialect's disk_conf carries six resync-tuning
+	 * fields whose DRBD 9 home is this device's single peer device's
+	 * struct drbd_peer_device_conf. 8.4's normal order is attach, then
+	 * connect, so a v1 attach or disk-options call can send these
+	 * before any peer device exists to apply them to. Stashed here in
+	 * that case, protected by resource->adm_mutex, one "was sent" flag
+	 * per field so an unsent field does not overwrite live
+	 * configuration with a stale or zero stash value; the v1 connect
+	 * handler applies them once the peer device is created and clears
+	 * the flags.
+	 */
+	struct {
+		bool has_resync_rate;
+		u32 resync_rate;
+		bool has_c_plan_ahead;
+		u32 c_plan_ahead;
+		bool has_c_delay_target;
+		u32 c_delay_target;
+		bool has_c_fill_target;
+		u32 c_fill_target;
+		bool has_c_max_rate;
+		u32 c_max_rate;
+		bool has_c_min_rate;
+		u32 c_min_rate;
+	} pending_peer_device_conf_84;
+
+	/*
+	 * The fused SIB_STATE_CHANGE DRBD_EVENT (drbd_nl_84.c) this device owes
+	 * for the state change being notified: 8.4-packed state words before
+	 * and after it, collected across that change's resource, connection,
+	 * device and peer-device notifications, plus the connection's cstate
+	 * before and after it (-1 if the connection did not change), for the
+	 * peer-device notification to fall back to when it is not
+	 * replicating. Serialized by notification_mutex.
+	 */
+	bool bcast_pending_84;
+	u32 bcast_prev_84;
+	u32 bcast_new_84;
+	int bcast_cstate_prev_84;
+	int bcast_cstate_new_84;
+#endif
+
 	/* configured by drbdsetup */
 	struct drbd_backing_dev *ldev; /* enclose accessing code in get_ldev() / put_ldev() */
 
@@ -1886,7 +1967,7 @@ struct drbd_device {
 		spinlock_t q_lock;	/* dec only once finished. */
 		struct list_head q;	/* n > 0 even if q already empty */
 	} pending_bitmap_work;
-	struct device_conf device_conf;
+	struct drbd_device_conf device_conf;
 
 	/* any requests that were blocked due to conflicts with other requests
 	 * or resync are submitted on this ordered work queue */
@@ -2445,7 +2526,7 @@ struct drbd_peer_device *create_peer_device(struct drbd_device *device,
 					    struct drbd_connection *connection);
 enum drbd_ret_code drbd_create_device(struct drbd_adm_ctx *adm_ctx,
 				      unsigned int minor,
-				      struct device_conf *device_conf,
+				      struct drbd_device_conf *device_conf,
 				      struct drbd_device **p_device);
 void drbd_unregister_device(struct drbd_device *device);
 void drbd_reclaim_device(struct rcu_head *rp);
@@ -2455,7 +2536,7 @@ void drbd_reclaim_path(struct rcu_head *rp);
 void del_connect_timer(struct drbd_connection *connection);
 
 struct drbd_resource *drbd_create_resource(const char *name,
-					   struct res_opts *res_opts);
+					   struct drbd_res_opts *res_opts);
 void drbd_reclaim_resource(struct rcu_head *rp);
 struct drbd_resource *drbd_find_resource(const char *name);
 void drbd_destroy_resource(struct kref *kref);
@@ -2463,7 +2544,7 @@ void drbd_destroy_resource(struct kref *kref);
 void drbd_destroy_device(struct kref *kref);
 
 int set_resource_options(struct drbd_resource *resource,
-			 struct res_opts *res_opts, const char *tag);
+			 struct drbd_res_opts *res_opts, const char *tag);
 struct drbd_connection *drbd_create_connection(struct drbd_resource *resource,
 					       struct drbd_transport_class *tc);
 void drbd_transport_shutdown(struct drbd_connection *connection,
@@ -2516,7 +2597,7 @@ enum determine_dev_size {
 enum determine_dev_size
 drbd_determine_dev_size(struct drbd_device *device,
 			sector_t peer_current_size, enum dds_flags flags,
-			struct resize_parms *rs);
+			struct drbd_resize_parms *rs);
 void resync_after_online_grow(struct drbd_peer_device *peer_device);
 void drbd_reconsider_queue_parameters(struct drbd_device *device,
 				      struct drbd_backing_dev *bdev);
@@ -2728,7 +2809,7 @@ struct drbd_connection *drbd_get_connection_by_node_id(struct drbd_resource *res
 bool drbd_have_local_disk(struct drbd_resource *resource);
 enum drbd_state_rv drbd_support_2pc_resize(struct drbd_resource *resource);
 enum determine_dev_size
-drbd_commit_size_change(struct drbd_device *device, struct resize_parms *rs,
+drbd_commit_size_change(struct drbd_device *device, struct drbd_resize_parms *rs,
 			u64 nodes_to_reach);
 void drbd_try_get_resynced_work_fn(struct work_struct *ws);
 bool diskless_primary_can_replay_to(struct drbd_peer_device *peer_device);
@@ -2807,20 +2888,20 @@ extern atomic_t drbd_genl_seq;
 
 int notify_resource_state(struct sk_buff *skb, unsigned int seq,
 			  struct drbd_resource *resource,
-			  struct resource_info *resource_info,
-			  struct rename_resource_info *rename_resource_info,
+			  struct drbd_resource_info *resource_info,
+			  struct drbd_rename_resource_info *rename_resource_info,
 			  enum drbd_notification_type type);
 int notify_device_state(struct sk_buff *skb, unsigned int seq,
 			struct drbd_device *device,
-			struct device_info *device_info,
+			struct drbd_device_info *device_info,
 			enum drbd_notification_type type);
 int notify_connection_state(struct sk_buff *skb, unsigned int seq,
 			    struct drbd_connection *connection,
-			    struct connection_info *connection_info,
+			    struct drbd_connection_info *connection_info,
 			    enum drbd_notification_type type);
 int notify_peer_device_state(struct sk_buff *skb, unsigned int seq,
 			     struct drbd_peer_device *peer_device,
-			     struct peer_device_info *peer_device_info,
+			     struct drbd_peer_device_info *peer_device_info,
 			     enum drbd_notification_type type);
 void notify_helper(enum drbd_notification_type type,
 		   struct drbd_device *device,
@@ -2834,10 +2915,10 @@ sector_t drbd_local_max_size(struct drbd_device *device);
 void drbd_auto_grow(struct drbd_device *device);
 int drbd_open_ro_count(struct drbd_resource *resource);
 
-void device_to_info(struct device_info *info, struct drbd_device *device);
-void device_state_change_to_info(struct device_info *info,
+void device_to_info(struct drbd_device_info *info, struct drbd_device *device);
+void device_state_change_to_info(struct drbd_device_info *info,
 				 struct drbd_device_state_change *state_change);
-void peer_device_state_change_to_info(struct peer_device_info *info,
+void peer_device_state_change_to_info(struct drbd_peer_device_info *info,
 				      struct drbd_peer_device_state_change *state_change);
 /*
  * inline helper functions
@@ -2976,13 +3057,19 @@ int drbd_send_peer_ack(struct drbd_connection *connection, u64 mask,
 
 /* DRBD 9 inserted D_DETACHING into enum drbd_disk_state; every state from
  * D_FAILED up is one higher than in DRBD 8.4, which used D_FAILED for both.
+ * The v1 netlink dialect puts every disk or pdsk value through this too.
  */
+static inline enum drbd_disk_state drbd_disk_state_84(enum drbd_disk_state state)
+{
+	if (state > D_DETACHING)
+		state--;
+	return state;
+}
+
 static inline void drbd_disk_states_to_84(union drbd_state *s)
 {
-	if (s->disk > D_DETACHING)
-		s->disk--;
-	if (s->pdsk > D_DETACHING)
-		s->pdsk--;
+	s->disk = drbd_disk_state_84(s->disk);
+	s->pdsk = drbd_disk_state_84(s->pdsk);
 }
 
 static inline void drbd_disk_states_from_84(union drbd_state *s)
