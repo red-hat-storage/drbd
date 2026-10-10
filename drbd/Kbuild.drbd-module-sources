@@ -6,6 +6,8 @@ __drbd-module-sources := $(sort $(shell     \
   git ls-files --recurse                    \
  	*.[ch]                              \
  	linux/                              \
+ 	drbd-84/*.[ch]                      \
+ 	drbd-84/uapi/                       \
  	drbd-headers/*.[ch]                 \
  	drbd-headers/linux/                 \
 	drbd-headers/uapi/                  \
@@ -32,6 +34,7 @@ drbd-headers/uapi/linux/drbd.h
 drbd-headers/linux/drbd_genl_ynl.yaml
 drbd-headers/linux/drbd_nl_gen.c
 drbd-headers/linux/drbd_nl_gen.h
+drbd-headers/linux/drbd_nl_defaults.c
 drbd-headers/linux/drbd_nl_types.h
 drbd-headers/linux/drbd2.yaml
 drbd-headers/linux/drbd2_nl_gen.c
@@ -63,6 +66,9 @@ drbd-kernel-compat/net/handshake.h
 drbd-kernel-compat/nsecs_to_jiffies.c
 drbd-kernel-compat/uapi/linux/handshake.h
 drbd-kernel-compat/uapi/linux/sched/types.h
+drbd-84/drbd_nl_gen.c
+drbd-84/drbd_nl_gen.h
+drbd-84/uapi/linux/drbd_genl.h
 drbd_actlog.c
 drbd_bitmap.c
 drbd_dax_pmem.c
@@ -77,6 +83,7 @@ drbd_kref_debug.h
 drbd_main.c
 drbd_nl.c
 drbd_nl_legacy.c
+drbd_nl_84.c
 drbd_nl_drbd2.c
 drbd_nl.h
 drbd_polymorph_printk.h
