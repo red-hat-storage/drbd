@@ -22,6 +22,7 @@
 #include "drbd_protocol.h"
 #include "drbd_req.h"
 #include "drbd_meta_data.h"
+#include "drbd_legacy_84.h"
 
 void drbd_panic_after_delayed_completion_of_aborted_request(struct drbd_device *device);
 
@@ -89,6 +90,17 @@ static void drbd_endio_read_sec_final(struct drbd_peer_request *peer_req)
 	bool io_error;
 
 	device->read_cnt += peer_req->i.size >> 9;
+	/* Resync and online-verify reads are DRBD's own IO at this device;
+	 * of the reads that come through here, only the peer's is not.
+	 */
+	if (!drbd_interval_is_application(&peer_req->i))
+		atomic_add(peer_req->i.size >> 9, &device->rs_sect_done);
+	/* The depth bound holds resync reads only, so only those were
+	 * counted into the queue at submit.
+	 */
+	if (drbd_interval_is_resync(&peer_req->i))
+		drbd_rs_depth_completed(device, peer_req->i.size >> 9,
+					peer_req->submit_jif);
 	io_error = test_bit(__EE_WAS_ERROR, &peer_req->flags);
 
 	drbd_queue_work(&connection->sender_work, &peer_req->w);
@@ -177,6 +189,13 @@ void drbd_endio_write_sec_final(struct drbd_peer_request *peer_req)
 	 * it may be freed/reused already!
 	 * (as soon as we release the peer_reqs_lock) */
 	type = peer_req->i.type;
+
+	if (type == INTERVAL_RESYNC_WRITE) {
+		atomic_add(peer_req->i.size >> 9, &device->rs_sect_done);
+		if (!(peer_req->flags & EE_TRIM))
+			drbd_rs_depth_completed(device, peer_req->i.size >> 9,
+						peer_req->submit_jif);
+	}
 
 	if (peer_req->flags & EE_WAS_ERROR) {
 		/* In protocol != C, we usually do not send write acks.
@@ -616,7 +635,6 @@ static int w_e_send_csum(struct drbd_work *w, int cancel)
 	return 0;
 
 out:
-	atomic_sub(peer_req->i.size >> SECTOR_SHIFT, &peer_device->device->rs_sect_ev);
 	drbd_free_peer_req(peer_req);
 
 	if (unlikely(err))
@@ -654,10 +672,11 @@ static int read_for_csum(struct drbd_peer_device *peer_device, sector_t sector, 
 	peer_req->w.cb = w_e_send_csum;
 
 	atomic_inc(&connection->backing_ee_cnt);
-	atomic_add(size >> 9, &device->rs_sect_ev);
+	drbd_rs_depth_queued(device, size >> 9);
 	/* ldev_ref_transfer: put_ldev in peer_req endio */
 	if (drbd_submit_peer_request(peer_req) == 0)
 		return 0;
+	atomic_sub(size >> 9, &device->rs_sect_queued);
 
 	/* If it failed because of ENOMEM, retry should help.  If it failed
 	 * because bio_add_page failed (probably broken lower level driver),
@@ -852,7 +871,7 @@ struct fifo_buffer *fifo_alloc(unsigned int fifo_size)
 static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in, u64 duration_ns)
 {
 	const u64 max_duration_ns = RS_MAKE_REQS_INTV_NS * 10;
-	struct peer_device_conf *pdc;
+	struct drbd_peer_device_conf *pdc;
 	unsigned int want;     /* The number of sectors we want in-flight */
 	int req_sect; /* Number of sectors to request in this turn */
 	int correction; /* Number of sectors more we need in-flight */
@@ -881,7 +900,7 @@ static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in,
 
 	steps = plan->size; /* (pdc->c_plan_ahead * 10 * RS_MAKE_REQS_INTV) / HZ; */
 
-	if (peer_device->rs_in_flight + sect_in == 0) { /* At start of resync */
+	if (drbd_rs_outstanding(peer_device) + sect_in == 0) { /* At start of resync */
 		want = ((pdc->resync_rate * 2 * RS_MAKE_REQS_INTV) / HZ) * steps;
 	} else { /* normal path */
 		if (pdc->c_fill_target) {
@@ -894,7 +913,7 @@ static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in,
 		}
 	}
 
-	correction = want - peer_device->rs_in_flight - plan->total;
+	correction = want - drbd_rs_outstanding(peer_device) - plan->total;
 
 	/* Plan ahead */
 	cps = correction / steps;
@@ -919,14 +938,69 @@ static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in,
 
 	duration_ms = duration_ns;
 	do_div(duration_ms, NSEC_PER_MSEC);
-	dynamic_drbd_dbg(peer_device, "dur=%lluns (%llums) sect_in=%llu in_flight=%d wa=%u co=%d st=%d cps=%d cc=%d rs=%d mx=%llu\n",
+	dynamic_drbd_dbg(peer_device, "dur=%lluns (%llums) sect_in=%llu in_flight=%d wa=%u co=%d st=%d cps=%d cc=%d rs=%d mx=%llu dr=%u\n",
 		 duration_ns, duration_ms, sect_in, peer_device->rs_in_flight, want, correction,
-		 steps, cps, curr_corr, req_sect, max_sect);
+		 steps, cps, curr_corr, req_sect, max_sect,
+		 READ_ONCE(peer_device->device->rs_drain_rate));
 
 	if (req_sect > max_sect)
 		req_sect = max_sect;
 
 	return req_sect;
+}
+
+/* How many 4k blocks a pacing of rate_kib_s allows over duration_ns.
+ *
+ * The remainder is carried in rs_pacing_credit to maintain a stable
+ * rate whatever the actual round cadence is.
+ * duration_ns is clamped the way drbd_rs_controller() clamps it, so a
+ * round after a long pause grants at most ten intervals worth.
+ */
+static int rs_paced_number(struct drbd_peer_device *peer_device,
+			   unsigned int rate_kib_s, u64 duration_ns)
+{
+	const u64 per_block = (BM_BLOCK_SIZE_4k / 1024) * (u64)NSEC_PER_SEC;
+	u64 credit, blocks;
+
+	if (duration_ns > RS_MAKE_REQS_INTV_NS * 10)
+		duration_ns = RS_MAKE_REQS_INTV_NS * 10;
+
+	credit = peer_device->rs_pacing_credit + rate_kib_s * duration_ns;
+	blocks = credit;
+	do_div(blocks, per_block);
+	if (blocks > INT_MAX)
+		blocks = INT_MAX;
+	peer_device->rs_pacing_credit = credit - blocks * per_block;
+
+	return blocks;
+}
+
+/* Say so, once per resync and net configuration, when the in-flight window is
+ * what bounds this resync and not the configured rate: the max-buffers clamp
+ * keeps trimming the request while the data actually arriving stays well below
+ * c-max-rate. max-buffers pages over the round trip is then the ceiling, and no
+ * rate setting will lift it.
+ */
+static void rs_hint_mxb_limited(struct drbd_peer_device *peer_device, int mxb,
+				unsigned int c_max_rate, unsigned int sect_in,
+				u64 duration_ns)
+{
+	u64 kib_s;
+
+	if (++peer_device->rs_mxb_limited < RS_MXB_LIMITED_ROUNDS)
+		return;
+	if (!c_max_rate || !duration_ns)
+		return;
+
+	kib_s = (u64)sect_in * NSEC_PER_SEC / 2;
+	kib_s = div64_u64(kib_s, duration_ns);
+	if (kib_s * 4 >= (u64)c_max_rate * 3)
+		return;
+
+	if (!test_and_set_bit(RS_MXB_LIMITED_LOGGED, peer_device->flags))
+		drbd_info(peer_device,
+			  "resync bounded by max-buffers (%d), not by c-max-rate (%u KiB/s): %llu KiB/s arriving\n",
+			  mxb, c_max_rate, kib_s);
 }
 
 /* Calculate how many 4k sized blocks we want to resync this time.
@@ -942,9 +1016,10 @@ static int drbd_rs_controller(struct drbd_peer_device *peer_device, u64 sect_in,
  */
 static int drbd_rs_number_requests(struct drbd_peer_device *peer_device)
 {
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	ktime_t duration, now;
 	unsigned int sect_in;  /* Number of sectors that came in since the last turn */
+	unsigned int c_max_rate;
 	int number, mxb;
 	int effective_resync_request_size;
 	struct drbd_bitmap *bm = peer_device->device->bitmap;
@@ -959,12 +1034,17 @@ static int drbd_rs_number_requests(struct drbd_peer_device *peer_device)
 	rcu_read_lock();
 	nc = rcu_dereference(peer_device->connection->transport.net_conf);
 	mxb = nc ? nc->max_buffers : 0;
+	c_max_rate = rcu_dereference(peer_device->conf)->c_max_rate;
 	if (rcu_dereference(peer_device->rs_plan_s)->size) {
 		number = drbd_rs_controller(peer_device, sect_in, ktime_to_ns(duration));
 		number = sect_to_bit(number, BM_BLOCK_SHIFT_4k);
 	} else {
-		number = RS_MAKE_REQS_INTV * rcu_dereference(peer_device->conf)->resync_rate
-			/ ((BM_BLOCK_SIZE_4k/1024) * HZ);
+		struct drbd_peer_device_conf *pdc = rcu_dereference(peer_device->conf);
+		unsigned int rate = pdc->resync_rate;
+
+		if (pdc->c_max_rate && pdc->c_max_rate < rate)
+			rate = pdc->c_max_rate;
+		number = rs_paced_number(peer_device, rate, ktime_to_ns(duration));
 	}
 	rcu_read_unlock();
 
@@ -982,9 +1062,13 @@ static int drbd_rs_number_requests(struct drbd_peer_device *peer_device)
 		int mxb_sect = mxb << (PAGE_SHIFT - 9);
 		int num_sect = bit_to_sect(number, BM_BLOCK_SHIFT_4k);
 
-		if (mxb_sect - peer_device->rs_in_flight < num_sect) {
-			num_sect = mxb_sect - peer_device->rs_in_flight;
+		if (mxb_sect - drbd_rs_outstanding(peer_device) < num_sect) {
+			num_sect = mxb_sect - drbd_rs_outstanding(peer_device);
 			number = sect_to_bit(num_sect, BM_BLOCK_SHIFT_4k);
+			rs_hint_mxb_limited(peer_device, mxb, c_max_rate, sect_in,
+					    ktime_to_ns(duration));
+		} else {
+			peer_device->rs_mxb_limited = 0;
 		}
 	}
 
@@ -1384,6 +1468,16 @@ static int make_resync_request(struct drbd_peer_device *peer_device, int cancel)
 			goto request_done;
 		}
 
+		/* read_for_csum() reads at this node's own backing device, so
+		 * a checksum round stops at the depth bound, before the cursor
+		 * moves past this request.
+		 */
+		if (peer_device->use_csums && drbd_rs_depth_exceeded(peer_device)) {
+			peer_device->resync_next_bit = bit;
+			drbd_rs_depth_defer(peer_device);
+			goto request_done;
+		}
+
 		if (adjacent(prev_sector, size, sector) && (number - i) < size >> bm_block_shift) {
 			/* When making requests in an out-of-sync area, ensure that the size
 			   of successive requests does not decrease. This allows the next
@@ -1673,7 +1767,7 @@ static int w_resync_finished(struct drbd_work *w, int cancel)
 
 static long ping_timeout(struct drbd_connection *connection)
 {
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	long timeout;
 
 	rcu_read_lock();
@@ -2597,7 +2691,6 @@ int w_e_end_ov_reply(struct drbd_work *w, int cancel)
 static int drbd_send_barrier(struct drbd_connection *connection)
 {
 	struct p_barrier *p;
-	int err;
 
 	p = conn_prepare_command(connection, sizeof(*p), DATA_STREAM);
 	if (!p)
@@ -2605,17 +2698,11 @@ static int drbd_send_barrier(struct drbd_connection *connection)
 
 	p->barrier = connection->send.current_epoch_nr;
 	p->pad = 0;
-	connection->send.last_sent_epoch_nr = connection->send.current_epoch_nr;
+	WRITE_ONCE(connection->send.last_sent_epoch_nr, connection->send.current_epoch_nr);
 	connection->send.current_epoch_writes = 0;
 	connection->send.last_sent_barrier_jif = jiffies;
 
-	set_bit(BARRIER_ACK_PENDING, &connection->flags);
-	err = send_command(connection, -1, P_BARRIER, DATA_STREAM);
-	if (err) {
-		clear_bit(BARRIER_ACK_PENDING, &connection->flags);
-		wake_up(&connection->resource->barrier_wait);
-	}
-	return err;
+	return send_command(connection, -1, P_BARRIER, DATA_STREAM);
 }
 
 static bool need_unplug(struct drbd_connection *connection)
@@ -3022,14 +3109,35 @@ void drbd_resync_after_changed(struct drbd_device *device)
 
 void drbd_rs_controller_reset(struct drbd_peer_device *peer_device)
 {
-	struct gendisk *disk = peer_device->device->ldev->backing_bdev->bd_disk;
+	struct drbd_device *device = peer_device->device;
+	/* ldev_safe: callers transition into a resync or verify state */
+	struct gendisk *disk = device->ldev->backing_bdev->bd_disk;
 	struct fifo_buffer *plan;
 
 	atomic_set(&peer_device->rs_sect_in, 0);
-	atomic_set(&peer_device->device->rs_sect_ev, 0);  /* FIXME: ??? */
+	/* the end of the previous resync canceled its parked writes */
+	atomic_set(&peer_device->rs_sect_parked, 0);
 	peer_device->rs_last_mk_req_kt = ktime_get();
 	peer_device->rs_in_flight = 0;
-	peer_device->rs_last_events = (int)part_stat_read_accum(disk->part0, sectors);
+	peer_device->rs_pacing_credit = 0;
+	peer_device->rs_mxb_limited = 0;
+	clear_bit(RS_MXB_LIMITED_LOGGED, peer_device->flags);
+	peer_device->rs_last_events = (int)part_stat_read_accum(disk->part0, sectors)
+		- atomic_read(&device->rs_sect_done);
+
+	/* Measure this device now rather than trust what it did last time: it
+	 * may not even be the same backing device any more.
+	 */
+	device->rs_drain_mark = atomic_read(&device->rs_drain_sect);
+	device->rs_drain_since = ktime_get();
+	device->rs_drain_busy_ns = 0;
+	WRITE_ONCE(device->rs_drain_rate, 0);
+	WRITE_ONCE(device->rs_lat_ns, 0);
+	WRITE_ONCE(device->rs_drain_sample_sect, RS_DEPTH_MIN_SECT);
+	WRITE_ONCE(device->rs_lat_probe, RS_LAT_DRAIN);
+	device->rs_lat_due = jiffies + RS_LAT_PROBE_INTV;
+	device->rs_lat_wend = jiffies + RS_LAT_WINDOW;
+	device->rs_lat_wmin = 0;
 
 	/* Updating the RCU protected object in place is necessary since
 	   this function gets called from atomic context.
@@ -3067,7 +3175,7 @@ bool drbd_stable_sync_source_present(struct drbd_peer_device *except_peer_device
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
 		enum drbd_repl_state repl_state;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		if (peer_device == except_peer_device)
 			continue;
@@ -3126,7 +3234,7 @@ static void handle_congestion(struct drbd_peer_device *peer_device)
 {
 	struct drbd_resource *resource = peer_device->device->resource;
 	unsigned long irq_flags;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	enum drbd_on_congestion on_congestion;
 
 	rcu_read_lock();
@@ -3240,6 +3348,13 @@ skip_helper:
 		return;
 	}
 
+	/* Past the retries, so once per resync start, and before the state
+	 * change: the first resync write may follow that at once, no matter
+	 * which thread runs this.
+	 */
+	if (side == L_SYNC_TARGET)
+		drbd_cbt_merge_resync_bits(peer_device);
+
 	lock_all_resources();
 	clear_bit(B_RS_H_DONE, peer_device->flags);
 	if (connection->cstate[NOW] < C_CONNECTED ||
@@ -3294,6 +3409,13 @@ static void update_on_disk_bitmap(struct drbd_peer_device *peer_device, bool res
 			drbd_resync_finished(peer_device, D_MASK);
 		}
 	}
+
+	/* v1 dialect only: fused SIB_SYNC_PROGRESS DRBD_EVENT, at the same
+	 * point and under the same throttle mainline's own
+	 * update_on_disk_bitmap() broadcasts one from (drivers/block/drbd/
+	 * drbd_worker.c). No-op stub without CONFIG_DRBD_COMPAT_84.
+	 */
+	compat84_notify_sync_progress(peer_device);
 
 	/* update timestamp, in case it took a while to write out stuff */
 	peer_device->rs_last_writeout = jiffies;
@@ -3711,7 +3833,7 @@ static void wait_for_sender_todo(struct drbd_connection *connection)
 {
 	struct drbd_resource *resource = connection->resource;
 	DEFINE_WAIT(wait);
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int uncork, cork;
 	bool got_something = 0;
 
@@ -3816,10 +3938,14 @@ static void wait_for_sender_todo(struct drbd_connection *connection)
 static void re_init_if_first_write(struct drbd_connection *connection, unsigned int epoch)
 {
 	if (!connection->send.seen_any_write_yet) {
-		connection->send.seen_any_write_yet = true;
 		connection->send.current_epoch_nr = epoch;
 		connection->send.current_epoch_writes = 0;
 		connection->send.last_sent_barrier_jif = jiffies;
+		/* no barrier is pending; the first one of this connection is @epoch */
+		WRITE_ONCE(connection->send.last_sent_epoch_nr, epoch - 1);
+		WRITE_ONCE(connection->last_acked_epoch_nr, epoch - 1);
+		/* pairs with smp_load_acquire() in barriers_acked() */
+		smp_store_release(&connection->send.seen_any_write_yet, true);
 	}
 }
 
@@ -3846,7 +3972,10 @@ static void maybe_send_barrier(struct drbd_connection *connection, unsigned int 
 
 	if (connection->send.current_epoch_writes)
 		drbd_send_barrier(connection);
-	connection->send.current_epoch_nr = epoch;
+	/* after last_sent_epoch_nr; pairs with smp_load_acquire() in barriers_acked() */
+	smp_store_release(&connection->send.current_epoch_nr, epoch);
+	if (wq_has_sleeper(&connection->resource->barrier_wait))
+		wake_up(&connection->resource->barrier_wait);
 }
 
 /* The reconcile peer we asserted UpToDate on its predecessor generation has

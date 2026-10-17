@@ -1318,6 +1318,14 @@ static void drbd_bm_endio(struct bio *bio)
 
 	bm_page_unlock_io(device, idx);
 
+	/* this should not count as user activity and cause the resync to
+	 * throttle -- see drbd_rs_c_min_rate_throttle(). Only where the
+	 * meta-data shares the backing device's disk: the detector reads the
+	 * part_stat counters of that whole disk.
+	 */
+	if (device->ldev->md_bdev->bd_disk == device->ldev->backing_bdev->bd_disk)
+		atomic_add(bio->bi_io_vec[0].bv_len >> 9, &device->rs_sect_done);
+
 	if (ctx->flags & BM_AIO_COPY_PAGES)
 		mempool_free(bio->bi_io_vec[0].bv_page, &drbd_md_io_page_pool);
 
@@ -1412,9 +1420,6 @@ static void bm_page_io_async(struct drbd_bm_aio_ctx *ctx, int page_nr)
 		submit_bio(bio);
 		if (op == REQ_OP_WRITE)
 			device->bm_writ_cnt++;
-		/* this should not count as user activity and cause the
-		 * resync to throttle -- see drbd_rs_should_slow_down(). */
-		atomic_add(len >> 9, &device->rs_sect_ev);
 	}
 }
 
@@ -1824,14 +1829,19 @@ void drbd_bm_set_all(struct drbd_device *device)
 		__bm_many_bits_op(device, bitmap_index, 0, -1, BM_OP_SET);
 }
 
-/* clear all bits in the bitmap */
+/* clear all bits in the bitmap, except for the changed block tracking slot:
+ * the data did not change, so its record of changes stays valid
+ */
 void drbd_bm_clear_all(struct drbd_device *device)
 {
 	struct drbd_bitmap *bitmap = device->bitmap;
+	/* ldev_safe: callers clear the bitmap of an attached disk */
+	int cbt_index = drbd_cbt_bitmap_index(device->ldev);
 	unsigned int bitmap_index;
 
 	for (bitmap_index = 0; bitmap_index < bitmap->bm_max_peers; bitmap_index++)
-		__bm_many_bits_op(device, bitmap_index, 0, -1, BM_OP_CLEAR);
+		if (bitmap_index != cbt_index)
+			__bm_many_bits_op(device, bitmap_index, 0, -1, BM_OP_CLEAR);
 }
 
 unsigned int drbd_bm_clear_bits(struct drbd_device *device, unsigned int bitmap_index,
@@ -1847,18 +1857,22 @@ int drbd_bm_count_bits(struct drbd_device *device, unsigned int bitmap_index, un
 	return bm_op(device, device->bitmap, bitmap_index, s, e, BM_OP_COUNT, NULL);
 }
 
-void drbd_bm_copy_slot(struct drbd_device *device, unsigned int from_index, unsigned int to_index)
+enum bm_slot_op { BM_SLOT_COPY, BM_SLOT_OR };
+
+static void __bm_slot_op(struct drbd_device *device, unsigned int from_index,
+			 unsigned int to_index, enum bm_slot_op op)
 {
 	struct drbd_bitmap *bitmap = device->bitmap;
 	unsigned long word_nr, from_word_nr, to_word_nr, words32_total;
 	unsigned int from_page_nr, to_page_nr, current_page_nr;
-	u32 data_word, *addr;
+	u32 data_word, *addr, *to_word;
 
 	words32_total = bitmap->bm_words * sizeof(unsigned long) / sizeof(u32);
 	spin_lock_irq(&bitmap->bm_all_slots_lock);
 	spin_lock(&bitmap->bm_lock);
 
-	bitmap->bm_set[to_index] = 0;
+	if (op == BM_SLOT_COPY)
+		bitmap->bm_set[to_index] = 0;
 	current_page_nr = 0;
 	addr = bm_map(bitmap, current_page_nr);
 	for (word_nr = 0; word_nr < words32_total; word_nr += bitmap->bm_max_peers) {
@@ -1885,16 +1899,35 @@ void drbd_bm_copy_slot(struct drbd_device *device, unsigned int from_index, unsi
 			current_page_nr = to_page_nr;
 			addr = bm_map(bitmap, current_page_nr);
 		}
+		to_word = &addr[word32_in_page(to_word_nr)];
 
-		if (addr[word32_in_page(to_word_nr)] != data_word)
-			bm_set_page_need_writeout(bitmap, current_page_nr);
-		addr[word32_in_page(to_word_nr)] = data_word;
+		if (op == BM_SLOT_OR) {
+			/* count only the bits that are new in the target */
+			data_word &= ~*to_word;
+			if (data_word)
+				bm_set_page_need_writeout(bitmap, current_page_nr);
+			*to_word |= data_word;
+		} else {
+			if (*to_word != data_word)
+				bm_set_page_need_writeout(bitmap, current_page_nr);
+			*to_word = data_word;
+		}
 		bitmap->bm_set[to_index] += hweight32(data_word);
 	}
 	bm_unmap(bitmap, addr);
-	if (bitmap->bm_set[to_index] == 0)
+	if (op == BM_SLOT_COPY && bitmap->bm_set[to_index] == 0)
 		drbd_md_slot_emptied(device, to_index);
 
 	spin_unlock(&bitmap->bm_lock);
 	spin_unlock_irq(&bitmap->bm_all_slots_lock);
+}
+
+void drbd_bm_copy_slot(struct drbd_device *device, unsigned int from_index, unsigned int to_index)
+{
+	__bm_slot_op(device, from_index, to_index, BM_SLOT_COPY);
+}
+
+void drbd_bm_or_slot(struct drbd_device *device, unsigned int from_index, unsigned int to_index)
+{
+	__bm_slot_op(device, from_index, to_index, BM_SLOT_OR);
 }

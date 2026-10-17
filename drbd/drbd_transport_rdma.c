@@ -14,8 +14,7 @@
 #include <rdma/ib_cm.h>
 #include <linux/interrupt.h>
 #include <linux/drbd.h>
-#include <linux/drbd_genl.h>
-#include <linux/drbd_nl_gen.h>
+#include <linux/drbd_nl_types.h>
 #include "drbd_protocol.h"
 #include "drbd_transport.h"
 #include "linux/drbd_config.h" /* for REL_VERSION */
@@ -848,6 +847,13 @@ static void dtr_path_established_work_fn(struct work_struct *work)
 	if (!dtr_path_ok(path)) {
 		if (path->cs.active)
 			dtr_cma_retry_connect(path, path->cm);
+		/* Release the PCS_FINISHING hold taken above, as the success path
+		 * does below, or __dtr_disconnect_path() waits a minute for it.
+		 */
+		p = atomic_xchg(&cs->passive_state, PCS_INACTIVE);
+		if (p > PCS_INACTIVE)
+			drbd_put_listener(&path->path);
+		wake_up(&cs->wq);
 		goto out_put;
 	}
 
@@ -1070,7 +1076,7 @@ static void dtr_cma_retry_connect(struct dtr_path *path, struct dtr_cm *failed_c
 	struct drbd_transport *transport = path->path.transport;
 	struct dtr_connect_state *cs = &path->cs;
 	long connect_int = 10 * HZ;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int a;
 
 	dtr_remove_cm_from_path(path, failed_cm);
@@ -2132,7 +2138,7 @@ static int __dtr_post_tx_desc(struct dtr_cm *cm, struct dtr_tx_desc *tx_desc)
 	const struct ib_send_wr *send_wr_failed;
 	struct ib_device *device = cm->id->device;
 	unsigned long timeout;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int i, err = -EIO;
 	bool was_active;
 
@@ -2401,7 +2407,7 @@ static int dtr_init_flow(struct dtr_path *path, enum drbd_stream stream)
 	unsigned int rcvbuf_size = RDMA_DEF_BUFFER_SIZE;
 	unsigned int sndbuf_size = RDMA_DEF_BUFFER_SIZE;
 	struct dtr_flow *flow = &path->flow[stream];
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int err = 0;
 
 	rcu_read_lock();
@@ -2926,7 +2932,7 @@ static int dtr_prepare_connect(struct drbd_transport *transport)
 
 	struct dtr_stream *data_stream = NULL, *control_stream = NULL;
 	struct dtr_path *path;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int timeout, err = -ENOMEM;
 
 	flush_signals(current);
@@ -2975,7 +2981,12 @@ static int dtr_connect(struct drbd_transport *transport)
 
 	err = wait_for_completion_interruptible(&rdma_transport->connected);
 	if (err) {
+		/* The core signals the receiver when this attempt failed underneath
+		 * it (NetworkFailure); retry, as dtt_connect() does. conn_connect()
+		 * tells a disconnect request apart by C_DISCONNECTING.
+		 */
 		flush_signals(current);
+		err = -EAGAIN;
 		goto abort;
 	}
 
@@ -3014,9 +3025,9 @@ static void dtr_finish_connect(struct drbd_transport *transport)
 	}
 }
 
-static int dtr_net_conf_change(struct drbd_transport *transport, struct net_conf *new_net_conf)
+static int dtr_net_conf_change(struct drbd_transport *transport, struct drbd_net_conf *new_net_conf)
 {
-	struct net_conf *old_net_conf;
+	struct drbd_net_conf *old_net_conf;
 	struct dtr_transport *dtr_transport = container_of(transport,
 		struct dtr_transport, transport);
 	int ret = 0;
