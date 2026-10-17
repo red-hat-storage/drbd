@@ -105,7 +105,10 @@ static void queue_peer_ack_send(struct drbd_resource *resource,
 
 		if (connection->agreed_pro_version < 110 ||
 				connection->cstate[NOW] != C_CONNECTED) {
-			connection->last_peer_ack_dagtag_seen = peer_ack->dagtag_sector;
+			/* Do not jump back, as in process_peer_ack_list(). */
+			connection->last_peer_ack_dagtag_seen =
+				max(connection->last_peer_ack_dagtag_seen,
+				    peer_ack->dagtag_sector);
 			continue;
 		}
 
@@ -272,12 +275,15 @@ static void drbd_req_done(struct drbd_request *req)
 		drbd_remove_request_interval(&device->requests, req);
 
 	/* There is a special case:
-	 * we may notice late that IO was suspended,
-	 * and postpone, or schedule for retry, a write,
-	 * before it even was submitted or sent.
-	 * In that case we do not want to touch the bitmap at all.
+	 * we may notice late that IO was suspended, or that we may not
+	 * write at all, and postpone, schedule for retry, or fail a
+	 * write, before it even was submitted or sent.  No peer lacks
+	 * anything for such a write, so we do not want to touch the
+	 * bitmap at all.  Such a write left drbd_send_and_submit()
+	 * before it got a dagtag, which is never 0 for a write with
+	 * data.
 	 */
-	if ((s & RQ_WRITE) && (s & (RQ_POSTPONED|RQ_LOCAL_MASK)) != RQ_POSTPONED &&
+	if ((s & RQ_WRITE) && req->dagtag_sector &&
 			req->i.size && get_ldev_if_state(device, D_DETACHING)) {
 		struct drbd_peer_md *peer_md = device->ldev->md.peers;
 		unsigned long bits = -1, mask = -1;
@@ -364,7 +370,12 @@ static void drbd_req_oos_sent(struct drbd_request *req)
 	lockdep_assert_held(&resource->state_rwlock);
 	lockdep_assert_irqs_disabled();
 
-	if (s & RQ_WRITE && req->i.size) {
+	/* A write without a dagtag never entered the change stream and has
+	 * no position to acknowledge.  Publishing its zero dagtag moves the
+	 * peer-ack watermarks backwards, and a peer waiting for a higher one --
+	 * a sync target waiting for P_FLUSH_REQUESTS_ACK -- then waits forever.
+	 */
+	if (s & RQ_WRITE && req->i.size && req->dagtag_sector) {
 		struct drbd_request *peer_ack_req;
 
 		spin_lock(&resource->peer_ack_lock); /* local irq already disabled */
@@ -1115,7 +1126,7 @@ static void drbd_report_io_error(struct drbd_device *device, struct drbd_request
 
 static int drbd_protocol_state_bits(struct drbd_connection *connection)
 {
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int p;
 
 	rcu_read_lock();
@@ -1223,7 +1234,7 @@ void __req_mod(struct drbd_request *req, enum drbd_req_event what,
 		struct bio_and_error *m)
 {
 	struct drbd_device *device = req->device;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	unsigned long flags;
 	int p;
 	int idx;
@@ -1643,7 +1654,7 @@ static bool remote_due_to_read_balancing(struct drbd_device *device,
 
 static void __maybe_pull_ahead(struct drbd_device *device, struct drbd_connection *connection)
 {
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	bool congested = false;
 	enum drbd_on_congestion on_congestion;
 	u32 cong_fill = 0, cong_extents = 0;
@@ -1758,7 +1769,7 @@ static u64 calc_nodes_to_read_from(struct drbd_device *device)
 
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		if (peer_device->disk_state[NOW] != D_UP_TO_DATE)
 			continue;
@@ -1953,6 +1964,9 @@ drbd_submit_req_private_bio(struct drbd_request *req)
 	 * stable storage, and this is a WRITE, we may not even submit
 	 * this bio. */
 	if (get_ldev(device)) {
+		if (bio_op(bio) != REQ_OP_READ)
+			drbd_cbt_mark(device, req->i.sector, req->i.size >> SECTOR_SHIFT);
+
 		if (drbd_insert_fault(device, type)) {
 			bio->bi_status = BLK_STS_IOERR;
 			bio_endio(bio);
@@ -2362,6 +2376,8 @@ static void drbd_conflict_submit_write(struct drbd_request *req)
 	conflict = drbd_find_conflict(device, &req->i, 0);
 	if (drbd_interval_empty(&req->i))
 		drbd_insert_interval(&device->requests, &req->i);
+	if (conflict)
+		drbd_rs_depth_exempt(device, &req->i);
 	if (!conflict) {
 		set_bit(INTERVAL_SUBMITTED, &req->i.flags);
 	} else if (drbd_interval_is_local(conflict)) {
@@ -3106,7 +3122,7 @@ void request_timer_fn(struct timer_list *t)
 	}
 	for_each_connection(connection, resource) {
 		struct drbd_peer_device *peer_device = conn_peer_device(connection, device->vnr);
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 		struct drbd_request *req;
 		unsigned long effective_net_timeout = 0;
 		unsigned long pre_send_jif = now;
