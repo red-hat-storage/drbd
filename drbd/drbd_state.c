@@ -534,7 +534,7 @@ static bool may_be_up_to_date(struct drbd_device *device, enum which_state which
 			continue;
 		peer_device = peer_device_by_node_id(device, node_id);
 		if (peer_device) {
-			struct peer_device_conf *pdc = rcu_dereference(peer_device->conf);
+			struct drbd_peer_device_conf *pdc = rcu_dereference(peer_device->conf);
 
 			want_bitmap = pdc->bitmap;
 			peer_disk_state = peer_device->disk_state[NEW];
@@ -1080,13 +1080,56 @@ static void drbd_clear_twopc_replies(struct drbd_resource *resource)
 	rcu_read_unlock();
 }
 
+/* A participant of a resize keeps its application I/O suspended until the
+ * transaction ends here, so that no write is in flight on any link when the
+ * COMMIT arrives and every node writes its bitmap in parallel. A participant
+ * takes it in the state_rwlock section that makes it one, the initiator once
+ * it knows that it commits; either way under the lock that orders it against
+ * the end of the transaction.
+ */
+void twopc_suspend_io(struct drbd_device *device)
+{
+	lockdep_assert_held(&device->resource->state_rwlock);
+
+	if (!test_and_set_bit(TWOPC_IO_SUSPENDED, &device->flags))
+		__drbd_suspend_io(device);
+}
+
+/* The peers' 2PC timers start when they receive the prepare. The initiator's
+ * drain before the COMMIT adds to a peer's drain before its reply, and
+ * forwarded prepares chain the drains, so their sum has to stay well below
+ * the 2PC timeout. A drain that does not finish in time falls back to
+ * serialized bitmap writes; a 2PC timeout on a peer would leave the cluster
+ * with diverging sizes.
+ */
+static long twopc_drain_timeout(struct drbd_resource *resource)
+{
+	return twopc_timeout(resource) / 8;
+}
+
+void twopc_drain_io(struct drbd_device *device, enum suspend_scope ss)
+{
+	long timeout = twopc_drain_timeout(device->resource);
+
+	if (!drbd_wait_io_drained(device, ss, timeout))
+		drbd_info(device, "Application I/O did not drain within %ums, continuing size change\n",
+			  jiffies_to_msecs(timeout));
+}
+
 void __clear_remote_state_change(struct drbd_resource *resource)
 {
 	bool is_connect = resource->twopc_reply.is_connect;
 	int initiator_node_id = resource->twopc_reply.initiator_node_id;
 	struct drbd_connection *connection;
+	struct drbd_device *device;
+	int vnr;
 
 	lockdep_assert_held(&resource->state_rwlock);
+
+	idr_for_each_entry(&resource->devices, device, vnr) {
+		if (test_and_clear_bit(TWOPC_IO_SUSPENDED, &device->flags))
+			drbd_resume_io(device);
+	}
 
 	resource->remote_state_change = false;
 	resource->twopc_reply.initiator_node_id = -1;
@@ -1096,6 +1139,7 @@ void __clear_remote_state_change(struct drbd_resource *resource)
 	 * when_done_lock() until the work runs.
 	 */
 	clear_bit(TWOPC_WORK_PENDING, &resource->flags);
+	clear_bit(TWOPC_PREPARING, &resource->flags);
 	drbd_clear_twopc_replies(resource);
 
 	if (is_connect && resource->twopc_prepare_reply_cmd == 0) {
@@ -1304,7 +1348,7 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 
 	idr_for_each_entry(&resource->devices, device, vnr) {
 		bool err_io_before = device->cached_err_io;
-		struct res_opts *o = &resource->res_opts;
+		struct drbd_res_opts *o = &resource->res_opts;
 		struct drbd_peer_device *peer_device;
 		bool err_io;
 
@@ -1879,7 +1923,7 @@ static void __calc_quorum_with_disk(struct drbd_device *device, struct quorum_de
 		enum drbd_disk_state disk_state;
 		enum drbd_repl_state repl_state;
 		bool is_intentional_diskless, is_tiebreaker;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		if (node_id == my_node_id) {
 			disk_state = device->disk_state[NEW];
@@ -1969,7 +2013,7 @@ static void __calc_quorum_no_disk(struct drbd_device *device, struct quorum_deta
 	for_each_peer_device_rcu(peer_device, device) {
 		enum drbd_disk_state disk_state;
 		enum drbd_repl_state repl_state;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 		bool is_tiebreaker;
 
 		repl_state = peer_device->repl_state[NEW];
@@ -2121,6 +2165,22 @@ static __printf(2, 3) void drbd_state_err(struct drbd_resource *resource, const 
 		kfree(err_str);
 }
 
+/* Without a disk of our own, we know the data generation we expose. A peer
+ * that holds an ancestor of it lacks writes that reached other peers only.
+ * It must not become Primary: the downgrade in
+ * diskless_with_peers_different_current_uuids() changes only our view of it.
+ */
+static bool peer_behind_exposed_data(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+	u64 exposed = device->exposed_data_uuid & ~UUID_PRIMARY;
+
+	return device->disk_state[NEW] == D_DISKLESS && exposed &&
+		peer_device->disk_state[NEW] > D_INCONSISTENT &&
+		(peer_device->current_uuid & ~UUID_PRIMARY) != exposed &&
+		peer_data_is_ancestor_of_mine(peer_device);
+}
+
 static enum drbd_state_rv __is_valid_soft_transition(struct drbd_resource *resource)
 {
 	enum drbd_role *role = resource->role;
@@ -2134,7 +2194,7 @@ static enum drbd_state_rv __is_valid_soft_transition(struct drbd_resource *resou
 
 	if (role[OLD] != R_PRIMARY && role[NEW] == R_PRIMARY) {
 		for_each_connection_rcu(connection, resource) {
-			struct net_conf *nc;
+			struct drbd_net_conf *nc;
 
 			nc = rcu_dereference(connection->transport.net_conf);
 			if (!nc || nc->two_primaries)
@@ -2166,7 +2226,8 @@ handshake_found:
 	for_each_connection_rcu(connection, resource) {
 		enum drbd_conn_state *cstate = connection->cstate;
 		enum drbd_role *peer_role = connection->peer_role;
-		struct net_conf *nc;
+		struct drbd_peer_device *peer_device;
+		struct drbd_net_conf *nc;
 		bool two_primaries;
 
 		if (cstate[NEW] == C_DISCONNECTING && cstate[OLD] == C_STANDALONE)
@@ -2195,6 +2256,19 @@ handshake_found:
 					 * causes confusion for the caller, if that then waits
 					 * for the read-only openers to go away.
 					 */
+				}
+			}
+		}
+
+		if (peer_role[OLD] == R_SECONDARY && peer_role[NEW] == R_PRIMARY) {
+			idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
+				if (peer_behind_exposed_data(peer_device)) {
+					u64 exposed = peer_device->device->exposed_data_uuid;
+
+					drbd_warn(peer_device,
+						  "Refusing promotion, peer's data is older than %016llX\n",
+						  (unsigned long long)exposed);
+					return SS_NO_UP_TO_DATE_DISK;
 				}
 			}
 		}
@@ -2302,8 +2376,9 @@ allow:
 
 			if (!(repl_state[OLD] == L_VERIFY_S || repl_state[OLD] == L_VERIFY_T) &&
 			     (repl_state[NEW] == L_VERIFY_S || repl_state[NEW] == L_VERIFY_T)) {
-				struct net_conf *nc = rcu_dereference(peer_device->connection->transport.net_conf);
+				struct drbd_net_conf *nc;
 
+				nc = rcu_dereference(peer_device->connection->transport.net_conf);
 				if (!nc || nc->verify_alg[0] == 0)
 					return SS_NO_VERIFY_ALG;
 			}
@@ -3378,7 +3453,7 @@ static bool primary_and_data_present(struct drbd_device *device)
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
 		struct drbd_connection *connection = peer_device->connection;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		/* Do not consider the peer if we are disconnecting. */
 		if (resource->remote_state_change &&
@@ -3775,8 +3850,10 @@ static void finish_state_change(struct drbd_resource *resource, const char *tag)
 			if (repl_state[OLD] > L_ESTABLISHED && repl_state[NEW] <= L_ESTABLISHED)
 				clear_bit(SYNC_SRC_CRASHED_PRI, peer_device->flags);
 
+			/* disk_state: CRASHED_PRIMARY changes with it */
 			if (peer_role[OLD] != peer_role[NEW] || role[OLD] != role[NEW] ||
-			    peer_disk_state[OLD] != peer_disk_state[NEW])
+			    peer_disk_state[OLD] != peer_disk_state[NEW] ||
+			    disk_state[OLD] != disk_state[NEW])
 				drbd_update_mdf_al_disabled(device, NEW);
 		}
 
@@ -4193,7 +4270,7 @@ int notify_resource_state_change(struct sk_buff *skb,
 	struct drbd_resource_state_change *resource_state_change =
 		((struct drbd_state_change *)state_change)->resource;
 	struct drbd_resource *resource = resource_state_change->resource;
-	struct resource_info resource_info = {
+	struct drbd_resource_info resource_info = {
 		.res_role = resource_state_change->role[NEW],
 		.res_susp = resource_state_change->susp[NEW],
 		.res_susp_nod = resource_state_change->susp_nod[NEW],
@@ -4201,6 +4278,21 @@ int notify_resource_state_change(struct sk_buff *skb,
 		.res_susp_quorum = state_change_is_susp_quorum(state_change, NEW) ||
 			resource_state_change->susp_uuid[NEW],
 		.res_fail_io = resource_state_change->fail_io[NEW],
+#ifdef CONFIG_DRBD_COMPAT_84
+		/*
+		 * old_res_susp mirrors drbd_get_resource_state()'s own .susp
+		 * formula (susp_user || susp_quorum || susp_uuid), evaluated
+		 * at OLD instead of NOW/NEW, so the v1 dialect's prev_state
+		 * combines the same three reasons into its one wire bit that
+		 * new_state's live drbd_pack_state_84() does.
+		 */
+		.old_res_role = resource_state_change->role[OLD],
+		.old_res_susp = resource_state_change->susp[OLD] ||
+			state_change_is_susp_quorum(state_change, OLD) ||
+			resource_state_change->susp_uuid[OLD],
+		.old_res_susp_nod = resource_state_change->susp_nod[OLD],
+		.old_res_susp_fen = state_change_is_susp_fen(state_change, OLD),
+#endif
 	};
 
 	return drbd_notify_resource_state(skb, seq, dialect, resource, &resource_info,
@@ -4215,9 +4307,13 @@ int notify_connection_state_change(struct sk_buff *skb,
 {
 	struct drbd_connection_state_change *connection_state_change = state_change;
 	struct drbd_connection *connection = connection_state_change->connection;
-	struct connection_info connection_info = {
+	struct drbd_connection_info connection_info = {
 		.conn_connection_state = connection_state_change->cstate[NEW],
 		.conn_role = connection_state_change->peer_role[NEW],
+#ifdef CONFIG_DRBD_COMPAT_84
+		.old_conn_connection_state = connection_state_change->cstate[OLD],
+		.old_conn_role = connection_state_change->peer_role[OLD],
+#endif
 	};
 
 	return drbd_notify_connection_state(skb, seq, dialect, connection,
@@ -4232,7 +4328,7 @@ int notify_device_state_change(struct sk_buff *skb,
 {
 	struct drbd_device_state_change *device_state_change = state_change;
 	struct drbd_device *device = device_state_change->device;
-	struct device_info device_info;
+	struct drbd_device_info device_info;
 
 	device_state_change_to_info(&device_info, device_state_change);
 
@@ -4247,7 +4343,7 @@ int notify_peer_device_state_change(struct sk_buff *skb,
 {
 	struct drbd_peer_device_state_change *peer_device_state_change = state_change;
 	struct drbd_peer_device *peer_device = peer_device_state_change->peer_device;
-	struct peer_device_info peer_device_info;
+	struct drbd_peer_device_info peer_device_info;
 
 	peer_device_state_change_to_info(&peer_device_info, state_change);
 
@@ -4645,7 +4741,7 @@ static void drbd_run_resync(struct drbd_peer_device *peer_device, enum drbd_repl
 		 * response (implicit in drbd_resync_finished) reduces
 		 * the race considerably, but does not solve it. */
 		if (side == L_SYNC_SOURCE) {
-			struct net_conf *nc;
+			struct drbd_net_conf *nc;
 			int timeo;
 
 			rcu_read_lock();
@@ -5691,7 +5787,7 @@ static bool multiple_primaries_allowed(struct drbd_resource *resource)
 {
 	struct drbd_connection *connection;
 	bool allowed = false;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 
 	rcu_read_lock();
 	for_each_connection_rcu(connection, resource) {
@@ -5735,7 +5831,7 @@ check_primaries_distances(struct drbd_resource *resource)
 
 		for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
 			struct drbd_connection *connection;
-			struct net_conf *nc;
+			struct drbd_net_conf *nc;
 			bool two_primaries;
 
 			if (!(common_server & NODE_MASK(node_id)))
@@ -5764,7 +5860,7 @@ check_ro_cnt_and_primary(struct drbd_resource *resource)
 	struct twopc_reply *reply = &resource->twopc_reply;
 	struct drbd_connection *connection;
 	enum drbd_state_rv rv = SS_SUCCESS;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 
 	if (drbd_open_ro_count(resource) == 0)
 		return rv;
@@ -6114,9 +6210,14 @@ retry:
 		    target_connection->agreed_pro_version >= 118)
 			conn_connect2(target_connection);
 
-		t = wait_event_interruptible_timeout(resource->state_wait,
-						     cluster_wide_reply_ready(resource),
-						     twopc_timeout(resource));
+		if (context->flags & CS_NO_SIGNALS)
+			t = wait_event_timeout(resource->state_wait,
+					       cluster_wide_reply_ready(resource),
+					       twopc_timeout(resource));
+		else
+			t = wait_event_interruptible_timeout(resource->state_wait,
+							     cluster_wide_reply_ready(resource),
+							     twopc_timeout(resource));
 		if (t > 0)
 			rv = get_cluster_wide_reply(resource, context);
 		else
@@ -6326,7 +6427,7 @@ change_cluster_wide_device_size(struct drbd_device *device,
 				uint64_t new_user_size,
 				enum dds_flags dds_flags,
 				bool automatic,
-				struct resize_parms *rs)
+				struct drbd_resize_parms *rs)
 {
 	struct drbd_resource *resource = device->resource;
 	struct twopc_reply *reply = &resource->twopc_reply;
@@ -6480,8 +6581,25 @@ retry:
 	}
 
 	request.cmd = commit_it ? P_TWOPC_COMMIT : P_TWOPC_ABORT;
-	if (have_peers)
+	if (have_peers) {
+		/* A write queued behind the COMMIT on the data socket reaches
+		 * the peer only after its bitmap write, and our own drain in
+		 * drbd_determine_dev_size() would wait for that. Reads too:
+		 * this is not a receiver, and a read in flight to a peer is
+		 * answered only after the peer's bitmap write as well.
+		 * Not earlier: a request sent during the prepare phase sits
+		 * behind the prepare on the peer's data socket and is answered
+		 * once that receiver has replied, so this drain covers it, and
+		 * a transaction that does not commit freezes nothing.
+		 */
+		if (commit_it) {
+			write_lock_irq(&resource->state_rwlock);
+			twopc_suspend_io(device);
+			write_unlock_irq(&resource->state_rwlock);
+			twopc_drain_io(device, READ_AND_WRITE);
+		}
 		twopc_phase2(resource, &request, reach_immediately);
+	}
 
 	if (commit_it) {
 		struct twopc_resize *tr = &resource->twopc.resize;
@@ -6580,7 +6698,13 @@ void drbd_maybe_cluster_wide_reply(struct drbd_resource *resource)
 {
 	lockdep_assert_held(&resource->state_rwlock);
 
-	if (!resource->remote_state_change || !cluster_wide_reply_ready(resource))
+	/* Until this node forwarded the prepare, none of its children is
+	 * prepared, and cluster_wide_reply_ready() would vacuously answer YES
+	 * for a transaction this node has not even evaluated yet.
+	 * nested_twopc_request() re-derives the reply once it is clear.
+	 */
+	if (!resource->remote_state_change || test_bit(TWOPC_PREPARING, &resource->flags) ||
+	    !cluster_wide_reply_ready(resource))
 		return;
 
 	if (resource->twopc_reply.initiator_node_id == resource->res_opts.node_id) {
@@ -6622,6 +6746,12 @@ nested_twopc_request(struct drbd_resource *resource, struct twopc_request *reque
 	rv = __cluster_wide_request(resource, request, reach_immediately);
 	have_peers = rv == SS_CW_SUCCESS;
 	if (cmd == P_TWOPC_PREPARE || cmd == P_TWOPC_PREP_RSZ) {
+		write_lock_irq(&resource->state_rwlock);
+		/* The flag may belong to a later transaction already */
+		if (resource->twopc_reply.tid == request->tid)
+			clear_bit(TWOPC_PREPARING, &resource->flags);
+		write_unlock_irq(&resource->state_rwlock);
+
 		if (rv < SS_SUCCESS) {
 			twopc_end_nested(resource, request->tid, P_TWOPC_NO, false);
 		} else if (!have_peers && cluster_wide_reply_ready(resource)) {
@@ -7402,7 +7532,7 @@ static bool calc_data_accessible(struct drbd_state_change *state_change, int n_d
 				n_device * state_change->n_connections + n_connection];
 		struct drbd_peer_device *peer_device = peer_device_state_change->peer_device;
 		enum drbd_disk_state *peer_disk_state = peer_device_state_change->disk_state;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		rcu_read_lock();
 		nc = rcu_dereference(peer_device->connection->transport.net_conf);
@@ -7438,7 +7568,7 @@ bool drbd_data_accessible(struct drbd_device *device, enum which_state which)
 
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		nc = rcu_dereference(peer_device->connection->transport.net_conf);
 		if (nc && !nc->allow_remote_read)
@@ -7466,7 +7596,7 @@ static u64 exposable_data_uuid(struct drbd_device *device)
 
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 
 		nc = rcu_dereference(peer_device->connection->transport.net_conf);
 		if (nc && !nc->allow_remote_read)

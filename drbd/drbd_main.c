@@ -33,6 +33,7 @@
 #include <linux/swab.h>
 #include <linux/overflow.h>
 
+#include <uapi/linux/drbd_genl.h>
 #include <linux/drbd_limits.h>
 #include "drbd_int.h"
 #include "drbd_protocol.h"
@@ -56,7 +57,7 @@ static void __net_exit __drbd_net_exit(struct net *net);
 MODULE_AUTHOR("Philipp Reisner <phil@linbit.com>, "
 	      "Lars Ellenberg <lars@linbit.com>");
 MODULE_DESCRIPTION("drbd - Distributed Replicated Block Device v" REL_VERSION);
-MODULE_VERSION(REL_VERSION);
+MODULE_VERSION(DRBD_PROC_VERSION);
 MODULE_LICENSE("GPL");
 MODULE_PARM_DESC(minor_count, "Approximate number of drbd devices ("
 		 __stringify(DRBD_MINOR_COUNT_MIN) "-" __stringify(DRBD_MINOR_COUNT_MAX) ")");
@@ -472,8 +473,8 @@ int tl_release(struct drbd_connection *connection,
 	/* urgently flush out peer acks for P_CONFIRM_STABLE */
 	if (req_y) {
 		drbd_flush_peer_acks(resource);
-	} else if (barrier_nr == connection->send.last_sent_epoch_nr) {
-		clear_bit(BARRIER_ACK_PENDING, &connection->flags);
+	} else {
+		WRITE_ONCE(connection->last_acked_epoch_nr, barrier_nr);
 		wake_up(&resource->barrier_wait);
 	}
 
@@ -694,6 +695,23 @@ int drbd_thread_start(struct drbd_thread *thi)
 	return true;
 }
 
+
+/* Like the restart path of drbd_thread_setup(), for a thread restarting in place. */
+void drbd_thread_consume_restart(struct drbd_thread *thi)
+{
+	unsigned long flags;
+	bool restarted = false;
+
+	spin_lock_irqsave(&thi->t_lock, flags);
+	if (thi->t_state == RESTARTING) {
+		thi->t_state = RUNNING;
+		restarted = true;
+	}
+	spin_unlock_irqrestore(&thi->t_lock, flags);
+
+	if (restarted)
+		flush_signals(current);
+}
 
 void _drbd_thread_stop(struct drbd_thread *thi, int restart, int wait)
 {
@@ -1261,8 +1279,8 @@ int drbd_send_sync_param(struct drbd_peer_device *peer_device)
 	int size, err;
 	const int apv = peer_device->connection->agreed_pro_version;
 	enum drbd_packet cmd;
-	struct net_conf *nc;
-	struct peer_device_conf *pdc;
+	struct drbd_net_conf *nc;
+	struct drbd_peer_device_conf *pdc;
 
 	rcu_read_lock();
 	nc = rcu_dereference(peer_device->connection->transport.net_conf);
@@ -1335,7 +1353,7 @@ int drbd_send_sync_param(struct drbd_peer_device *peer_device)
 int __drbd_send_protocol(struct drbd_connection *connection, enum drbd_packet cmd)
 {
 	struct p_protocol *p;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	size_t integrity_alg_len;
 	int size, cf;
 
@@ -1972,7 +1990,7 @@ int drbd_send_flush_requests_ack(struct drbd_connection *connection, u64 flush_s
 int drbd_send_enable_replication_next(struct drbd_peer_device *peer_device)
 {
 	struct p_enable_replication *p;
-	struct peer_device_conf *pdc;
+	struct drbd_peer_device_conf *pdc;
 	bool resync_without_replication;
 
 	set_bit(PEER_REPLICATION_NEXT, peer_device->flags);
@@ -2673,7 +2691,7 @@ int drbd_send_dagtag(struct drbd_connection *connection, u64 dagtag)
 static bool primary_peer_present(struct drbd_resource *resource)
 {
 	struct drbd_connection *connection;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	bool two_primaries, rv = false;
 
 	rcu_read_lock();
@@ -2770,7 +2788,7 @@ static int try_to_promote(struct drbd_device *device, long timeout, bool ndelay)
 		long t;
 
 		snprintf_current_comm_pid_tag(&tag, "auto-promote");
-		rv = drbd_set_role(resource, R_PRIMARY, false, tag.buf, NULL);
+		rv = drbd_set_role(resource, R_PRIMARY, 0, tag.buf, NULL);
 		timeout -= jiffies - start;
 
 		if (ndelay || rv >= SS_SUCCESS || timeout <= 0) {
@@ -3034,7 +3052,7 @@ out:
 		add_opener(device, rv >= SS_SUCCESS);
 		/* Only interested in first open and last close. */
 		if (device->open_cnt == 1) {
-			struct device_info info;
+			struct drbd_device_info info;
 
 			device_to_info(&info, device);
 			mutex_lock(&notification_mutex);
@@ -3092,6 +3110,73 @@ restart:
 	rcu_read_unlock();
 }
 
+/* Barrier numbers are epoch numbers, with gaps. Once the sender is past @epoch,
+ * the barriers of earlier epochs are acked if all are, or if one >= @epoch - 1 is.
+ */
+static bool barriers_acked(struct drbd_resource *resource, unsigned int epoch, u64 *done)
+{
+	struct drbd_connection *connection;
+	bool acked = true;
+
+	rcu_read_lock();
+	for_each_connection_rcu(connection, resource) {
+		u64 mask = NODE_MASK(connection->peer_node_id);
+		bool seen;
+		int epoch_nr, sent, ack;
+
+		if (*done & mask)
+			continue;
+		/* without the connection, the peer gets the writes by resync */
+		if (connection->cstate[NOW] != C_CONNECTED) {
+			*done |= mask;
+			continue;
+		}
+		/* pairs with smp_store_release() in re_init_if_first_write() */
+		seen = smp_load_acquire(&connection->send.seen_any_write_yet);
+		/* pairs with smp_store_release() in maybe_send_barrier() */
+		epoch_nr = smp_load_acquire(&connection->send.current_epoch_nr);
+		if (seen && (int)(epoch_nr - epoch) < 0) {
+			acked = false;
+			break;
+		}
+		sent = READ_ONCE(connection->send.last_sent_epoch_nr);
+		ack = READ_ONCE(connection->last_acked_epoch_nr);
+		if (ack != sent && (int)(ack - (epoch - 1)) < 0) {
+			acked = false;
+			break;
+		}
+		*done |= mask;
+	}
+	rcu_read_unlock();
+
+	return acked;
+}
+
+/* Close the epoch, wait for each connected peer's barrier acks of the writes
+ * in earlier epochs. A later write delays it by at most one barrier ack.
+ */
+static void wait_for_barrier_acks(struct drbd_resource *resource)
+{
+	unsigned int epoch;
+	u64 done = 0;
+
+	start_new_tl_epoch(resource);
+	epoch = atomic_read(&resource->current_tle_nr);
+	wait_event(resource->barrier_wait, barriers_acked(resource, epoch, &done));
+}
+
+/* Like wait_for_barrier_acks(); returns -ERESTARTSYS when interrupted */
+int wait_for_barrier_acks_interruptible(struct drbd_resource *resource)
+{
+	unsigned int epoch;
+	u64 done = 0;
+
+	start_new_tl_epoch(resource);
+	epoch = atomic_read(&resource->current_tle_nr);
+	return wait_event_interruptible(resource->barrier_wait,
+					barriers_acked(resource, epoch, &done));
+}
+
 static void drbd_fsync_device(struct drbd_device *device)
 {
 	struct drbd_resource *resource = device->resource;
@@ -3104,14 +3189,7 @@ static void drbd_fsync_device(struct drbd_device *device)
 	 * immediately after a write. */
 	wait_event(device->misc_wait, !atomic_read(&device->ap_bio_cnt[WRITE]));
 
-	if (start_new_tl_epoch(resource)) {
-		struct drbd_connection *connection;
-		u64 im;
-
-		for_each_connection_ref(connection, im, resource)
-			drbd_flush_workqueue(&connection->sender_work);
-	}
-	wait_event(resource->barrier_wait, !barrier_pending(resource));
+	wait_for_barrier_acks(resource);
 	/* After waiting for pending barriers, we got any possible NEG_ACKs,
 	   and see them in wait_for_peer_disk_updates() */
 	wait_for_peer_disk_updates(resource);
@@ -3163,7 +3241,6 @@ static void drbd_release(struct gendisk *gd)
 			resource->role[NOW] == R_PRIMARY &&
 			!test_bit(EXPLICIT_PRIMARY, &resource->flags)) {
 		union comm_pid_tag_buf tag;
-		sigset_t mask, oldmask;
 		int rv;
 
 		snprintf_current_comm_pid_tag(&tag, "auto-demote");
@@ -3174,17 +3251,14 @@ static void drbd_release(struct gendisk *gd)
 		 * not be affected by the state of the process. In particular,
 		 * it should ignore any pending signals. It may be the case
 		 * that the process is releasing DRBD because it is being
-		 * terminated using a signal.
+		 * terminated using a signal. Masking signals is not enough:
+		 * a group exit's SIGKILL and TIF_NOTIFY_SIGNAL are pending
+		 * through any mask, so the waits themselves ignore signals.
 		 */
-		sigfillset(&mask);
-		sigprocmask(SIG_BLOCK, &mask, &oldmask);
-
-		rv = drbd_set_role(resource, R_SECONDARY, false, tag.buf, NULL);
+		rv = drbd_set_role(resource, R_SECONDARY, CS_NO_SIGNALS, tag.buf, NULL);
 		if (rv < SS_SUCCESS)
 			drbd_warn(resource, "Auto-demote failed: %s (%d)\n",
 					drbd_set_st_err_str(rv), rv);
-
-		sigprocmask(SIG_SETMASK, &oldmask, NULL);
 	}
 
 	if (open_ro_cnt == 0 && open_rw_cnt == 0 && resource->fail_io[NOW]) {
@@ -3200,7 +3274,7 @@ static void drbd_release(struct gendisk *gd)
 	if (open_rw_cnt == 0 && open_ro_cnt == 0 && resource->auto_promoted_by.pid != 0)
 		memset(&resource->auto_promoted_by, 0, sizeof(resource->auto_promoted_by));
 	if (device->open_cnt == 0) {
-		struct device_info info;
+		struct drbd_device_info info;
 
 		device_to_info(&info, device);
 		mutex_lock(&notification_mutex);
@@ -3517,7 +3591,7 @@ static void do_retry(struct work_struct *ws)
 		unsigned long start_jif = req->start_jif;
 		bool expected;
 
-		ktime_get_accounting_assign(ktime_t start_kt, req->start_kt);
+		ktime_var_assign_for_accounting(start_kt, req->start_kt);
 
 		/* No locking when accessing local_rq_state & net_rq_state, since
 		 * this request is not active at the moment. */
@@ -3778,7 +3852,8 @@ static void wake_all_device_misc(struct drbd_resource *resource)
 	rcu_read_unlock();
 }
 
-int set_resource_options(struct drbd_resource *resource, struct res_opts *res_opts, const char *tag)
+int set_resource_options(struct drbd_resource *resource, struct drbd_res_opts *res_opts,
+			 const char *tag)
 {
 	struct drbd_connection *connection;
 	cpumask_var_t new_cpu_mask;
@@ -3786,7 +3861,7 @@ int set_resource_options(struct drbd_resource *resource, struct res_opts *res_op
 	bool wake_device_misc = false;
 	bool force_state_recalc = false;
 	unsigned long irq_flags;
-	struct res_opts *old_opts = &resource->res_opts;
+	struct drbd_res_opts *old_opts = &resource->res_opts;
 
 	if (!zalloc_cpumask_var(&new_cpu_mask, GFP_KERNEL))
 		return -ENOMEM;
@@ -3856,7 +3931,7 @@ fail:
 }
 
 struct drbd_resource *drbd_create_resource(const char *name,
-					   struct res_opts *res_opts)
+					   struct drbd_res_opts *res_opts)
 {
 	struct drbd_resource *resource;
 
@@ -3878,6 +3953,8 @@ struct drbd_resource *drbd_create_resource(const char *name,
 	INIT_LIST_HEAD(&resource->peer_ack_req_list);
 	INIT_LIST_HEAD(&resource->peer_ack_list);
 	INIT_LIST_HEAD(&resource->peer_ack_work.list);
+	spin_lock_init(&resource->send_oos_lock);
+	INIT_LIST_HEAD(&resource->send_oos);
 	resource->peer_ack_work.cb = w_queue_peer_ack;
 	timer_setup(&resource->peer_ack_timer, peer_ack_timer_fn, 0);
 	spin_lock_init(&resource->initiator_flush_lock);
@@ -3989,10 +4066,8 @@ struct drbd_connection *drbd_create_connection(struct drbd_resource *resource,
 	spin_lock_init(&connection->primary_flush_lock);
 	spin_lock_init(&connection->flush_ack_lock);
 	spin_lock_init(&connection->peer_reqs_lock);
-	spin_lock_init(&connection->send_oos_lock);
 	INIT_LIST_HEAD(&connection->peer_requests);
 	INIT_LIST_HEAD(&connection->peer_reads);
-	INIT_LIST_HEAD(&connection->send_oos);
 	INIT_LIST_HEAD(&connection->connections);
 	INIT_LIST_HEAD(&connection->done_ee);
 	INIT_LIST_HEAD(&connection->dagtag_wait_ee);
@@ -4157,6 +4232,7 @@ struct drbd_peer_device *create_peer_device(struct drbd_device *device, struct d
 	INIT_LIST_HEAD(&peer_device->resync_requests);
 
 	atomic_set(&peer_device->rs_sect_in, 0);
+	atomic_set(&peer_device->rs_sect_parked, 0);
 
 	peer_device->bitmap_index = -1;
 	peer_device->resync_finished_pdsk = D_UNKNOWN;
@@ -4220,7 +4296,8 @@ static int init_submitter(struct drbd_device *device)
 }
 
 enum drbd_ret_code drbd_create_device(struct drbd_adm_ctx *adm_ctx, unsigned int minor,
-				      struct device_conf *device_conf, struct drbd_device **p_device)
+				      struct drbd_device_conf *device_conf,
+				      struct drbd_device **p_device)
 {
 	struct drbd_resource *resource = adm_ctx->resource;
 	struct drbd_connection *connection;
@@ -4266,7 +4343,10 @@ enum drbd_ret_code drbd_create_device(struct drbd_adm_ctx *adm_ctx, unsigned int
 	atomic_set(&device->wait_for_actlog, 0);
 	atomic_set(&device->wait_for_actlog_ecnt, 0);
 	atomic_set(&device->local_cnt, 0);
-	atomic_set(&device->rs_sect_ev, 0);
+	atomic_set(&device->rs_sect_done, 0);
+	atomic_set(&device->rs_sect_queued, 0);
+	atomic_set(&device->rs_drain_sect, 0);
+	device->rs_drain_since = ktime_get();
 	atomic_set(&device->md_io.in_use, 0);
 
 #ifdef CONFIG_DRBD_TIMING_STATS
@@ -4676,6 +4756,9 @@ static int __init drbd_init(void)
 	       "Version: " REL_VERSION " (api:%d/proto:%d-%d)\n",
 	       DRBD_FAMILY_VERSION, PRO_VERSION_MIN, PRO_VERSION_MAX);
 	pr_info("%s\n", drbd_buildtag());
+#if defined(CONFIG_DRBD_COMPAT_84) && !defined(DRBD_NL_FAMILY_V2)
+	pr_info("serving the DRBD 8.4 netlink API, advertised as version " DRBD_PROC_VERSION "\n");
+#endif
 	pr_info("registered as block device major %d\n", DRBD_MAJOR);
 
 #ifdef CONFIG_DRBD_COMPAT_84
@@ -4731,6 +4814,13 @@ void drbd_md_encode_9(struct drbd_device *device, struct meta_data_on_disk_9 *bu
 
 	buffer->al_stripes = cpu_to_be32(device->ldev->md.al_stripes);
 	buffer->al_stripe_size_4k = cpu_to_be32(device->ldev->md.al_stripe_size_4k);
+
+	buffer->cbt_bookmark.id = cpu_to_be64(device->ldev->md.cbt.id);
+	buffer->cbt_bookmark.bitmap_uuid = cpu_to_be64(device->ldev->md.cbt.bitmap_uuid);
+	buffer->cbt_bookmark.bitmap_dagtag = cpu_to_be64(device->ldev->md.cbt.bitmap_dagtag);
+	buffer->cbt_bookmark.since = cpu_to_be64(device->ldev->md.cbt.since);
+	buffer->cbt_bookmark.flags = cpu_to_be32(device->ldev->md.cbt.flags);
+	buffer->cbt_bookmark.bitmap_index = cpu_to_be32(device->ldev->md.cbt.bitmap_index);
 
 	if (device->bitmap == NULL)
 		for (i = 0; i < DRBD_PEERS_MAX; i++)
@@ -6243,11 +6333,8 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 		u64 to_nodes = filled ? -1 : ~NODE_MASK(peer_device->node_id);
 
 		drbd_propagate_uuids(device, to_nodes);
-		drbd_suspend_io(device, WRITE_ONLY);
-		drbd_bm_lock(device, "detect_finished_resyncs()", BM_LOCK_BULK);
-		drbd_bm_write(device, NULL);
-		drbd_bm_unlock(device);
-		drbd_resume_io(device);
+		drbd_bitmap_io(device, &drbd_bm_write_copy_pages,
+			       "detect_finished_resyncs()", BM_LOCK_BULK, NULL);
 	}
 }
 

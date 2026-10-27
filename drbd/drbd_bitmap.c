@@ -1294,11 +1294,11 @@ static void drbd_bm_endio(struct bio *bio)
 	struct drbd_device *device = ctx->device;
 	struct drbd_bitmap *b = device->bitmap;
 	unsigned int idx = bm_page_to_idx(bio->bi_io_vec[0].bv_page);
+	const bool copy_pages = ctx->flags & BM_AIO_COPY_PAGES;
 
 	blk_status_t status = bio->bi_status;
 
-	if ((ctx->flags & BM_AIO_COPY_PAGES) == 0 &&
-	    !bm_test_page_unchanged(b->bm_pages[idx]))
+	if (!copy_pages && !bm_test_page_unchanged(b->bm_pages[idx]))
 		drbd_warn(device, "bitmap page idx %u changed during IO!\n", idx);
 
 	if (status) {
@@ -1318,7 +1318,15 @@ static void drbd_bm_endio(struct bio *bio)
 
 	bm_page_unlock_io(device, idx);
 
-	if (ctx->flags & BM_AIO_COPY_PAGES)
+	/* this should not count as user activity and cause the resync to
+	 * throttle -- see drbd_rs_c_min_rate_throttle(). Only where the
+	 * meta-data shares the backing device's disk: the detector reads the
+	 * part_stat counters of that whole disk.
+	 */
+	if (device->ldev->md_bdev->bd_disk == device->ldev->backing_bdev->bd_disk)
+		atomic_add(bio->bi_io_vec[0].bv_len >> 9, &device->rs_sect_done);
+
+	if (copy_pages)
 		mempool_free(bio->bi_io_vec[0].bv_page, &drbd_md_io_page_pool);
 
 	bio_put(bio);
@@ -1327,6 +1335,9 @@ static void drbd_bm_endio(struct bio *bio)
 		ctx->done = 1;
 		wake_up(&device->misc_wait);
 		kref_put(&ctx->kref, &drbd_bm_aio_ctx_destroy);
+	} else if (copy_pages) {
+		/* a submitter may be parked on the in-flight bound */
+		wake_up(&device->misc_wait);
 	}
 }
 
@@ -1412,10 +1423,46 @@ static void bm_page_io_async(struct drbd_bm_aio_ctx *ctx, int page_nr)
 		submit_bio(bio);
 		if (op == REQ_OP_WRITE)
 			device->bm_writ_cnt++;
-		/* this should not count as user activity and cause the
-		 * resync to throttle -- see drbd_rs_should_slow_down(). */
-		atomic_add(len >> 9, &device->rs_sect_ev);
 	}
+}
+
+/* A copying write-out allocates one page per page in flight, and the
+ * submitter fills the plug far faster than the backend drains it.  Bound what
+ * one write-out may hold at once; the whole bitmap is gigabytes on a large
+ * volume with several bitmap slots.
+ */
+#define BM_AIO_COPY_PAGES_MAX_IN_FLIGHT 1024
+
+/* Wait until a copying write-out is back under its in-flight bound.  Going to
+ * sleep flushes the plug, so what is queued reaches the backend.
+ * The disk-timeout applies as in wait_until_done_or_force_detached(): if no
+ * page completes within it, force-detach.
+ * Returns false if the local disk gave up and submitting more is pointless.
+ */
+static bool bm_wait_for_copy_page(struct drbd_device *device, struct drbd_bm_aio_ctx *ctx)
+{
+	long dt;
+
+	if (!(ctx->flags & BM_AIO_COPY_PAGES))
+		return true;
+
+	/* ldev_safe: get_ldev_if_state() in bm_rw_range(), put_ldev in drbd_bm_aio_ctx_destroy() */
+	dt = drbd_disk_timeout(device->ldev);
+
+	/* in_flight carries the submitter's own reference as well */
+	dt = wait_event_timeout(device->misc_wait,
+		   atomic_read(&ctx->in_flight) <= BM_AIO_COPY_PAGES_MAX_IN_FLIGHT ||
+		   test_bit(FORCE_DETACH, &device->flags) ||
+		   test_bit(ABORT_MDIO, &device->flags),
+		   dt);
+
+	if (dt == 0) {
+		drbd_err(device, "meta-data IO operation timed out\n");
+		drbd_handle_io_error(device, DRBD_FORCE_DETACH);
+		return false;
+	}
+
+	return atomic_read(&ctx->in_flight) <= BM_AIO_COPY_PAGES_MAX_IN_FLIGHT;
 }
 
 /**
@@ -1522,6 +1569,8 @@ static int bm_rw_range(struct drbd_device *device, unsigned int start_page, unsi
 			/* Has it even changed? */
 			if (bm_test_page_unchanged(b->bm_pages[i]))
 				continue;
+			if (!bm_wait_for_copy_page(device, ctx))
+				break;
 			atomic_inc(&ctx->in_flight);
 			bm_page_io_async(ctx, i);
 			++count;
@@ -1542,6 +1591,8 @@ static int bm_rw_range(struct drbd_device *device, unsigned int start_page, unsi
 				dynamic_drbd_dbg(device, "skipped bm lazy write for idx %u\n", i);
 				continue;
 			}
+			if (!bm_wait_for_copy_page(device, ctx))
+				break;
 			atomic_inc(&ctx->in_flight);
 			bm_page_io_async(ctx, i);
 			++count;
@@ -1689,7 +1740,8 @@ int drbd_bm_write_all(struct drbd_device *device,
  */
 int drbd_bm_write_lazy(struct drbd_device *device, unsigned int upper_idx)
 {
-	return bm_rw_range(device, 0, upper_idx - 1, BM_AIO_COPY_PAGES | BM_AIO_WRITE_LAZY);
+	return bm_rw_range(device, 0, upper_idx - 1,
+			   BM_AIO_COPY_PAGES | BM_AIO_WRITE_LAZY | BM_AIO_NO_STATS);
 }
 
 /*
@@ -1716,7 +1768,7 @@ int drbd_bm_write_copy_pages(struct drbd_device *device,
  */
 int drbd_bm_write_hinted(struct drbd_device *device)
 {
-	return bm_rw(device, BM_AIO_WRITE_HINTED | BM_AIO_COPY_PAGES);
+	return bm_rw(device, BM_AIO_WRITE_HINTED | BM_AIO_COPY_PAGES | BM_AIO_NO_STATS);
 }
 
 static __always_inline unsigned long
@@ -1824,14 +1876,19 @@ void drbd_bm_set_all(struct drbd_device *device)
 		__bm_many_bits_op(device, bitmap_index, 0, -1, BM_OP_SET);
 }
 
-/* clear all bits in the bitmap */
+/* clear all bits in the bitmap, except for the changed block tracking slot:
+ * the data did not change, so its record of changes stays valid
+ */
 void drbd_bm_clear_all(struct drbd_device *device)
 {
 	struct drbd_bitmap *bitmap = device->bitmap;
+	/* ldev_safe: callers clear the bitmap of an attached disk */
+	int cbt_index = drbd_cbt_bitmap_index(device->ldev);
 	unsigned int bitmap_index;
 
 	for (bitmap_index = 0; bitmap_index < bitmap->bm_max_peers; bitmap_index++)
-		__bm_many_bits_op(device, bitmap_index, 0, -1, BM_OP_CLEAR);
+		if (bitmap_index != cbt_index)
+			__bm_many_bits_op(device, bitmap_index, 0, -1, BM_OP_CLEAR);
 }
 
 unsigned int drbd_bm_clear_bits(struct drbd_device *device, unsigned int bitmap_index,
@@ -1847,18 +1904,22 @@ int drbd_bm_count_bits(struct drbd_device *device, unsigned int bitmap_index, un
 	return bm_op(device, device->bitmap, bitmap_index, s, e, BM_OP_COUNT, NULL);
 }
 
-void drbd_bm_copy_slot(struct drbd_device *device, unsigned int from_index, unsigned int to_index)
+enum bm_slot_op { BM_SLOT_COPY, BM_SLOT_OR };
+
+static void __bm_slot_op(struct drbd_device *device, unsigned int from_index,
+			 unsigned int to_index, enum bm_slot_op op)
 {
 	struct drbd_bitmap *bitmap = device->bitmap;
 	unsigned long word_nr, from_word_nr, to_word_nr, words32_total;
 	unsigned int from_page_nr, to_page_nr, current_page_nr;
-	u32 data_word, *addr;
+	u32 data_word, *addr, *to_word;
 
 	words32_total = bitmap->bm_words * sizeof(unsigned long) / sizeof(u32);
 	spin_lock_irq(&bitmap->bm_all_slots_lock);
 	spin_lock(&bitmap->bm_lock);
 
-	bitmap->bm_set[to_index] = 0;
+	if (op == BM_SLOT_COPY)
+		bitmap->bm_set[to_index] = 0;
 	current_page_nr = 0;
 	addr = bm_map(bitmap, current_page_nr);
 	for (word_nr = 0; word_nr < words32_total; word_nr += bitmap->bm_max_peers) {
@@ -1885,16 +1946,35 @@ void drbd_bm_copy_slot(struct drbd_device *device, unsigned int from_index, unsi
 			current_page_nr = to_page_nr;
 			addr = bm_map(bitmap, current_page_nr);
 		}
+		to_word = &addr[word32_in_page(to_word_nr)];
 
-		if (addr[word32_in_page(to_word_nr)] != data_word)
-			bm_set_page_need_writeout(bitmap, current_page_nr);
-		addr[word32_in_page(to_word_nr)] = data_word;
+		if (op == BM_SLOT_OR) {
+			/* count only the bits that are new in the target */
+			data_word &= ~*to_word;
+			if (data_word)
+				bm_set_page_need_writeout(bitmap, current_page_nr);
+			*to_word |= data_word;
+		} else {
+			if (*to_word != data_word)
+				bm_set_page_need_writeout(bitmap, current_page_nr);
+			*to_word = data_word;
+		}
 		bitmap->bm_set[to_index] += hweight32(data_word);
 	}
 	bm_unmap(bitmap, addr);
-	if (bitmap->bm_set[to_index] == 0)
+	if (op == BM_SLOT_COPY && bitmap->bm_set[to_index] == 0)
 		drbd_md_slot_emptied(device, to_index);
 
 	spin_unlock(&bitmap->bm_lock);
 	spin_unlock_irq(&bitmap->bm_all_slots_lock);
+}
+
+void drbd_bm_copy_slot(struct drbd_device *device, unsigned int from_index, unsigned int to_index)
+{
+	__bm_slot_op(device, from_index, to_index, BM_SLOT_COPY);
+}
+
+void drbd_bm_or_slot(struct drbd_device *device, unsigned int from_index, unsigned int to_index)
+{
+	__bm_slot_op(device, from_index, to_index, BM_SLOT_OR);
 }

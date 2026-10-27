@@ -57,8 +57,8 @@ void drbd_md_put_buffer(struct drbd_device *device)
 		wake_up(&device->misc_wait);
 }
 
-void wait_until_done_or_force_detached(struct drbd_device *device, struct drbd_backing_dev *bdev,
-				       unsigned int *done)
+/* disk-timeout in jiffies, MAX_SCHEDULE_TIMEOUT if it is not set */
+long drbd_disk_timeout(struct drbd_backing_dev *bdev)
 {
 	long dt;
 
@@ -68,6 +68,14 @@ void wait_until_done_or_force_detached(struct drbd_device *device, struct drbd_b
 	dt = dt * HZ / 10;
 	if (dt == 0)
 		dt = MAX_SCHEDULE_TIMEOUT;
+
+	return dt;
+}
+
+void wait_until_done_or_force_detached(struct drbd_device *device, struct drbd_backing_dev *bdev,
+				       unsigned int *done)
+{
+	long dt = drbd_disk_timeout(bdev);
 
 	dt = wait_event_timeout(device->misc_wait,
 			*done ||
@@ -844,10 +852,12 @@ out:
  * @size:	size of disk range in bytes
  * @bits:	bit values to use by bitmap index
  * @mask:	bitmap indexes to modify (mask set)
+ * @authoritative: whether the caller knows that the peers it sets out of sync
+ *		lack the blocks; if not, the bitmap slots record placeholders
+ * @src_node_id: for non-authoritative bits, the node whose resync data this
+ *		is, or -1 if no node can retire the placeholders
  *
- * The caller knows the peers it sets out of sync lack the blocks; the bits
- * are recorded as authoritative.  Returns a mask of the bitmap indexes which
- * were modified.
+ * Return: a mask of the bitmap indexes which were modified.
  */
 static unsigned long __drbd_set_sync(struct drbd_device *device, sector_t sector, int size,
 				     unsigned long bits, unsigned long mask, bool authoritative,
@@ -859,6 +869,7 @@ static unsigned long __drbd_set_sync(struct drbd_device *device, sector_t sector
 	sector_t esector, nr_sectors;
 	unsigned long irq_flags;
 	unsigned long modified = 0;
+	int cbt_index;
 
 	if (size <= 0 || !IS_ALIGNED(size, 512)) {
 		drbd_err(device, "%s sector: %llus, size: %d\n",
@@ -873,6 +884,10 @@ static unsigned long __drbd_set_sync(struct drbd_device *device, sector_t sector
 	if (!bm) /* attached without a bitmap: nothing to track */
 		goto out;
 	mask &= (1 << bm->bm_max_peers) - 1;
+
+	cbt_index = drbd_cbt_bitmap_index(device->ldev);
+	if (cbt_index != -1)
+		mask &= ~(1UL << cbt_index);  /* not clearing anything out of CBT */
 
 	nr_sectors = get_capacity(device->vdisk);
 	esector = sector + (size >> 9) - 1;
@@ -955,6 +970,62 @@ unsigned long drbd_set_sync(struct drbd_device *device, sector_t sector, int siz
 			    unsigned long bits, unsigned long mask)
 {
 	return __drbd_set_sync(device, sector, size, bits, mask, true, -1);
+}
+
+/* Record a write to the backing device in the changed block tracking slot.
+ * Called before the write is submitted, with an ldev reference held.
+ */
+void drbd_cbt_mark(struct drbd_device *device, sector_t sector, sector_t nr_sectors)
+{
+	struct drbd_bitmap *bm = device->bitmap;
+	int cbt_index = drbd_cbt_bitmap_index(device->ldev);
+
+	if (cbt_index != -1 && bm && nr_sectors)
+		drbd_bm_set_bits(device, cbt_index, bm_sect_to_bit(bm, sector),
+				 bm_sect_to_bit(bm, sector + nr_sectors - 1));
+}
+
+/* A resync rewrites the blocks set in the peer's slot, outside the activity
+ * log. Merge them into the tracking slot and write it out before the first
+ * resync write, so that a crash during the resync cannot lose them: the bits a
+ * crash leaves in the peer's slot get merged again when the resync restarts.
+ */
+void drbd_cbt_merge_resync_bits(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+	int cbt_index;
+
+	if (!get_ldev(device))
+		return;
+
+	cbt_index = drbd_cbt_bitmap_index(device->ldev);
+	if (cbt_index != -1 && device->bitmap) {
+		if (peer_device->bitmap_index != -1)
+			drbd_bm_or_slot(device, peer_device->bitmap_index, cbt_index);
+		else
+			_drbd_bm_set_many_bits(device, cbt_index, 0, -1UL);
+		drbd_bm_write_copy_pages(device, NULL);
+	}
+	put_ldev(device);
+}
+
+/* Writes resume: the bitmap on disk stops being complete. Persist that before
+ * the first of them, so that no later snapshot claims otherwise. resume-io
+ * calls this before it lifts the suspension, the only transition that does.
+ */
+void drbd_cbt_clear_flushed(struct drbd_device *device)
+{
+	clear_bit(CBT_BITMAPS_FLUSHED, &device->flags);
+
+	if (!get_ldev(device))
+		return;
+	if (device->ldev->md.cbt.flags & CBT_BOOKMARK_FLUSHED) {
+		WRITE_ONCE(device->ldev->md.cbt.flags,
+			   device->ldev->md.cbt.flags & ~CBT_BOOKMARK_FLUSHED);
+		drbd_md_mark_dirty(device);
+		drbd_md_sync_if_dirty(device);
+	}
+	put_ldev(device);
 }
 
 /* A sync target sets every other peer out of sync for each block it receives,
