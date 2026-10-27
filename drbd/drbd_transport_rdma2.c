@@ -14,8 +14,7 @@
 #include <rdma/ib_cm.h>
 #include <linux/interrupt.h>
 #include <linux/drbd.h>
-#include <linux/drbd_genl.h>
-#include <linux/drbd_nl_gen.h>
+#include <linux/drbd_nl_types.h>
 #include "drbd_protocol.h"
 #include "drbd_transport.h"
 #include "linux/drbd_config.h" /* for REL_VERSION */
@@ -106,7 +105,7 @@ MODULE_VERSION(REL_VERSION);
 # define DTR_MAX_TX_SGES (PAGE_SIZE / 512)
 #endif
 
-#define DTR_MAGIC ((u32)0x5257494E)
+#define DTR_MAGIC ((u32)0x52444D32) /* "RDM2" */
 
 /*
  * These numbers are sent within the immediate data value to identify
@@ -399,8 +398,6 @@ struct dtr_flow {
 
 enum connect_state_enum {
 	PCS_INACTIVE,
-	PCS_REQUEST_ABORT,
-	PCS_FINISHING = PCS_REQUEST_ABORT,
 	PCS_CONNECTING,
 };
 
@@ -408,7 +405,7 @@ struct dtr_connect_state {
 	struct delayed_work retry_connect_work;
 	atomic_t active_state; /* trying to establish a connection*/
 	atomic_t passive_state; /* listening for a connection */
-	wait_queue_head_t wq;
+	struct mutex mutex; /* state check + dtr_path_prepare()/establishing vs. abort */
 	bool active; /* active = established by connect ; !active = established by accept */
 };
 
@@ -787,12 +784,26 @@ static int dtr_init_listener(struct drbd_transport *transport, const struct sock
 static void dtr_destroy_listener(struct drbd_listener *generic_listener);
 
 
+/* Sent as the connection manager's private data in the connect request and
+ * the accept. The rdma transport sends none, so both sides recognize a peer
+ * running it before the QP carries any message.
+ */
+static const __be32 dtr_cm_magic = cpu_to_be32(DTR_MAGIC);
+
 static struct rdma_conn_param dtr_conn_param = {
+	.private_data = &dtr_cm_magic,
+	.private_data_len = sizeof(dtr_cm_magic),
 	.responder_resources = 1,
 	.initiator_depth = 1,
 	.retry_count = 10,
 	.rnr_retry_count  = 7,
 };
+
+static bool dtr_peer_runs_rdma2(const struct rdma_conn_param *conn)
+{
+	return conn->private_data_len >= sizeof(dtr_cm_magic) &&
+		!memcmp(conn->private_data, &dtr_cm_magic, sizeof(dtr_cm_magic));
+}
 
 static u32 dtr_cm_to_lkey(struct dtr_cm *cm)
 {
@@ -863,6 +874,18 @@ static int dtr_init(struct drbd_transport *transport)
 	return 0;
 }
 
+/* Before waiting for any path's prepare, so that no other path starts rdma_connect() */
+static void dtr_stop_connect_works(struct drbd_transport *transport)
+{
+	struct drbd_path *drbd_path;
+
+	list_for_each_entry(drbd_path, &transport->paths, list) {
+		struct dtr_path *path = container_of(drbd_path, struct dtr_path, path);
+
+		atomic_set(&path->cs.active_state, PCS_INACTIVE);
+	}
+}
+
 static void dtr_free(struct drbd_transport *transport, enum drbd_tr_free_op free_op)
 {
 	struct dtr_transport *rdma_transport =
@@ -900,6 +923,7 @@ static void dtr_free(struct drbd_transport *transport, enum drbd_tr_free_op free
 		atomic_set(&rdma_transport->resend_pending[CONTROL_STREAM], 0);
 	}
 
+	dtr_stop_connect_works(transport);
 	list_for_each_entry(drbd_path, &transport->paths, list) {
 		struct dtr_path *path = container_of(drbd_path, struct dtr_path, path);
 
@@ -1360,9 +1384,12 @@ static void dtr_path_established_work_fn(struct work_struct *work)
 	if (err)
 		goto out_put;
 
-	p = atomic_cmpxchg(&cs->passive_state, PCS_CONNECTING, PCS_FINISHING);
-	if (p < PCS_CONNECTING)
-		goto out;
+	mutex_lock(&cs->mutex);
+	if (atomic_read(&cs->passive_state) != PCS_CONNECTING) {
+		atomic_set(&cs->active_state, PCS_INACTIVE);
+		mutex_unlock(&cs->mutex);
+		goto out_put;
+	}
 
 	kref_get(&cm->kref); /* connected -> expect a disconnect in the future */
 
@@ -1411,13 +1438,10 @@ static void dtr_path_established_work_fn(struct work_struct *work)
 	if (!dtr_path_ok(path)) {
 		if (path->cs.active)
 			dtr_cma_retry_connect(path, path->cm);
-		/* Release the PCS_FINISHING hold taken above, as the success path
-		 * does below, or __dtr_disconnect_path() waits a minute for it.
-		 */
 		p = atomic_xchg(&cs->passive_state, PCS_INACTIVE);
-		if (p > PCS_INACTIVE)
+		mutex_unlock(&cs->mutex);
+		if (p == PCS_CONNECTING)
 			drbd_put_listener(&path->path);
-		wake_up(&cs->wq);
 		goto out_put;
 	}
 
@@ -1439,13 +1463,11 @@ static void dtr_path_established_work_fn(struct work_struct *work)
 	 * kicks dtr_kick_register_buffers() when the peer's ring announce arrives.
 	 */
 
-out:
 	atomic_set(&cs->active_state, PCS_INACTIVE);
 	p = atomic_xchg(&cs->passive_state, PCS_INACTIVE);
-	if (p > PCS_INACTIVE)
+	mutex_unlock(&cs->mutex);
+	if (p == PCS_CONNECTING)
 		drbd_put_listener(&path->path);
-
-	wake_up(&cs->wq);
 
 out_put:
 	kref_put(&cm->kref, dtr_destroy_cm);  /* for work */
@@ -1490,8 +1512,9 @@ static struct dtr_cm *dtr_alloc_cm(struct dtr_path *path)
 }
 
 static int dtr_cma_accept(struct dtr_listener *listener, struct rdma_cm_id *new_cm_id,
-			  struct dtr_cm **ret_cm)
+			  const struct rdma_conn_param *conn, struct dtr_cm **ret_cm)
 {
+	struct dtr_transport *rdma_transport;
 	struct sockaddr_storage *peer_addr;
 	struct dtr_connect_state *cs;
 	struct dtr_path *path;
@@ -1534,13 +1557,27 @@ static int dtr_cma_accept(struct dtr_listener *listener, struct rdma_cm_id *new_
 
 	path = container_of(drbd_path, struct dtr_path, path);
 	cs = &path->cs;
-	if (atomic_read(&cs->passive_state) < PCS_CONNECTING)
+	rdma_transport = container_of(drbd_path->transport, struct dtr_transport, transport);
+	if (!dtr_peer_runs_rdma2(conn)) {
+		if (__ratelimit(&rdma_transport->rate_limit))
+			tr_err(&rdma_transport->transport,
+			       "Rejecting connection, peer does not run the rdma2 transport\n");
 		goto reject;
+	}
+	/*
+	 * Do not block the rdma_cm event handler. A busy mutex means our
+	 * connect work is installing its cm, or teardown is running; either
+	 * way this request would fail. The peer retries.
+	 */
+	if (!mutex_trylock(&cs->mutex))
+		goto reject;
+	if (atomic_read(&cs->passive_state) != PCS_CONNECTING)
+		goto reject_unlock;
 
 	cm = dtr_alloc_cm(path);
 	if (!cm) {
 		pr_err("rejecting connecting since -ENOMEM for cm\n");
-		goto reject;
+		goto reject_unlock;
 	}
 
 	cm->state = DSM_CONNECT_REQ;
@@ -1561,8 +1598,9 @@ static int dtr_cma_accept(struct dtr_listener *listener, struct rdma_cm_id *new_
 	err = dtr_path_prepare(path, cm, false);
 	if (err) {
 		/* Returning the cm via ret_cm and an error causes the caller to put one ref */
-		goto reject;
+		goto reject_unlock;
 	}
+	mutex_unlock(&cs->mutex);
 	kref_put(&drbd_path->kref, drbd_destroy_path);
 
 	err = rdma_accept(new_cm_id, &dtr_conn_param);
@@ -1573,6 +1611,8 @@ static int dtr_cma_accept(struct dtr_listener *listener, struct rdma_cm_id *new_
 
 	return err;
 
+reject_unlock:
+	mutex_unlock(&cs->mutex);
 reject:
 	rdma_reject(new_cm_id, NULL, 0, IB_CM_REJ_CONSUMER_DEFINED);
 	kref_put(&drbd_path->kref, drbd_destroy_path);
@@ -1624,14 +1664,10 @@ static void dtr_cma_retry_connect_work_fn(struct work_struct *work)
 {
 	struct dtr_connect_state *cs =
 		container_of(work, struct dtr_connect_state, retry_connect_work.work);
-	enum connect_state_enum p;
 	int err;
 
-	p = atomic_cmpxchg(&cs->active_state, PCS_REQUEST_ABORT, PCS_INACTIVE);
-	if (p != PCS_CONNECTING) {
-		wake_up(&cs->wq);
+	if (atomic_read(&cs->active_state) != PCS_CONNECTING)
 		return;
-	}
 
 	err = dtr_start_try_connect(cs);
 	if (err) {
@@ -1672,24 +1708,19 @@ static void dtr_cma_retry_connect(struct dtr_path *path, struct dtr_cm *failed_c
 	struct drbd_transport *transport = path->path.transport;
 	struct dtr_connect_state *cs = &path->cs;
 	long connect_int = 10 * HZ;
-	struct net_conf *nc;
-	int a;
+	struct drbd_net_conf *nc;
 
 	dtr_cancel_connect_timeout(failed_cm);
 	dtr_remove_cm_from_path(path, failed_cm);
 
-	a = atomic_read(&cs->active_state);
-	if (a == PCS_INACTIVE) {
+	if (atomic_read(&cs->active_state) != PCS_CONNECTING)
 		return;
-	} else if (a == PCS_CONNECTING) {
-		rcu_read_lock();
-		nc = rcu_dereference(transport->net_conf);
-		if (nc)
-			connect_int = nc->connect_int * HZ;
-		rcu_read_unlock();
-	} else {
-		connect_int = 1;
-	}
+
+	rcu_read_lock();
+	nc = rcu_dereference(transport->net_conf);
+	if (nc)
+		connect_int = nc->connect_int * HZ;
+	rcu_read_unlock();
 	schedule_delayed_work(&cs->retry_connect_work, connect_int);
 }
 
@@ -1706,7 +1737,7 @@ static void dtr_arm_connect_timeout(struct dtr_cm *cm)
 {
 	struct drbd_transport *transport = cm->path->path.transport;
 	long connect_int = 10 * HZ;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	bool was_active;
 
 	rcu_read_lock();
@@ -1775,12 +1806,11 @@ static void dtr_cma_connect_work_fn(struct work_struct *work)
 	struct dtr_cm *cm = container_of(work, struct dtr_cm, connect_work);
 	struct dtr_path *path = cm->path;
 	struct drbd_transport *transport = path->path.transport;
-	enum connect_state_enum p;
 	int err;
 
-	p = atomic_cmpxchg(&path->cs.active_state, PCS_REQUEST_ABORT, PCS_INACTIVE);
-	if (p != PCS_CONNECTING) {
-		wake_up(&path->cs.wq);
+	mutex_lock(&path->cs.mutex);
+	if (atomic_read(&path->cs.active_state) != PCS_CONNECTING) {
+		mutex_unlock(&path->cs.mutex);
 		kref_put(&cm->kref, dtr_destroy_cm); /* for work */
 		return;
 	}
@@ -1789,11 +1819,16 @@ static void dtr_cma_connect_work_fn(struct work_struct *work)
 	err = dtr_path_prepare(path, cm, true);
 	if (err) {
 		tr_err(transport, "dtr_path_prepare() = %d\n", err);
-		goto out;
+		goto out_unlock;
 	}
+
+	/* Teardown requested an abort while we prepared */
+	if (atomic_read(&path->cs.active_state) != PCS_CONNECTING)
+		goto out_unlock;
 
 	kref_get(&cm->kref); /* Expecting RDMA_CM_EVENT_ESTABLISHED */
 	set_bit(DSB_CONNECTING, &cm->state);
+	mutex_unlock(&path->cs.mutex);
 	err = rdma_connect(cm->id, &dtr_conn_param);
 	if (err) {
 		if (test_and_clear_bit(DSB_CONNECTING, &cm->state))
@@ -1806,6 +1841,8 @@ static void dtr_cma_connect_work_fn(struct work_struct *work)
 
 	kref_put(&cm->kref, dtr_destroy_cm); /* for work */
 	return;
+out_unlock:
+	mutex_unlock(&path->cs.mutex);
 out:
 	kref_put(&cm->kref, dtr_destroy_cm); /* for work */
 	dtr_cma_retry_connect(path, cm);
@@ -1918,7 +1955,7 @@ static int dtr_cma_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event 
 		/* for listener */
 
 		listener = container_of(cm, struct dtr_listener, cm);
-		err = dtr_cma_accept(listener, cm_id, &cm);
+		err = dtr_cma_accept(listener, cm_id, &event->param.conn, &cm);
 
 		/*
 		 * When a new connection comes in, the callback gets called
@@ -1936,19 +1973,33 @@ static int dtr_cma_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event 
 		return 0; /* do not touch kref of the new connection */
 
 	case RDMA_CM_EVENT_CONNECT_RESPONSE:
-		break;
+		/*
+		 * The QP exists before rdma_connect(), so rdma_cm reports this
+		 * instead of ESTABLISHED only after __dtr_destroy_cm() destroyed
+		 * the QP. The cm is going away; this event holds no ref.
+		 */
+		return 0;
 
 	case RDMA_CM_EVENT_ESTABLISHED:
 		/* cm->state = DSM_CONNECTED; is set later in the work item */
 		/* This is called for active and passive connections */
 
-		connecting = test_and_clear_bit(DSB_CONNECTING, &cm->state) ||
-			test_and_clear_bit(DSB_CONNECT_REQ, &cm->state);
+		if (test_and_clear_bit(DSB_CONNECTING, &cm->state)) {
+			/* Active side: the accept's private data identifies the peer */
+			if (!dtr_peer_runs_rdma2(&event->param.conn)) {
+				if (__ratelimit(&cm->rdma_transport->rate_limit))
+					tr_err(&cm->rdma_transport->transport,
+					       "Dropping connection, peer does not run the rdma2 transport\n");
+				set_bit(DSB_ERROR, &cm->state);
+				dtr_cma_retry_connect(cm->path, cm);
+				break;
+			}
+		} else if (!test_and_clear_bit(DSB_CONNECT_REQ, &cm->state)) {
+			return 0; /* __dtr_disconnect_path() won and dropped the ref */
+		}
+
 		kref_get(&cm->kref); /* for the work */
 		schedule_work(&cm->establish_work);
-
-		if (!connecting)
-			return 0; /* keep ref; __dtr_disconnect_path() won */
 		break;
 
 	case RDMA_CM_EVENT_ADDR_ERROR:
@@ -1963,26 +2014,12 @@ static int dtr_cma_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event 
 	case RDMA_CM_EVENT_REJECTED:
 		set_bit(DSB_ERROR, &cm->state);
 
-		/* shield ref: prevent the last kref put calling rdma_destroy_id() here */
-		kref_get(&cm->kref);
-		dtr_cma_retry_connect(cm->path, cm);
 		connecting = test_and_clear_bit(DSB_CONNECTING, &cm->state) ||
 			test_and_clear_bit(DSB_CONNECT_REQ, &cm->state);
-		if (connecting) {
-			/* Drop the "expecting ESTABLISHED" ref. Use the keep_id variant:
-			 * if a racing teardown already dropped this cm's path->cm and timer
-			 * refs while the connecting bit stayed set, this put can be the last
-			 * one -- and rdma_destroy_id() must never run inside an rdma_cm event
-			 * callback (it blocks on the id's handler_mutex, which this callback
-			 * holds: self-deadlock, the cm_id then leaks and pins the port at
-			 * bind -98). When it is the last put, return non-zero so the core
-			 * destroys the id outside the callback, exactly as the tail put does.
-			 * The shield above keeps this from being the last put in the balanced
-			 * case, where the tail put at function exit does the final release.
-			 */
-			if (kref_put(&cm->kref, dtr_destroy_cm_keep_id))
-				return 1;
-		}
+		if (!connecting)
+			return 0; /* teardown or the watchdog won and dropped the ref */
+
+		dtr_cma_retry_connect(cm->path, cm);
 		break;
 
 	case RDMA_CM_EVENT_DISCONNECTED:
@@ -2355,7 +2392,7 @@ static void dtr_tx_timeout_fn(struct timer_list *t)
 static void dtr_arm_tx_timeout(struct dtr_cm *cm)
 {
 	struct drbd_transport *transport = &cm->rdma_transport->transport;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	unsigned int timeout;
 	bool was_active;
 
@@ -2539,6 +2576,61 @@ abort:
 	tasklet_schedule(&rdma_transport->control_tasklet);
 }
 
+static void dtr_rx_desc_error(struct dtr_cm *cm, struct dtr_rx_desc *rx_desc)
+{
+	unsigned long irq_flags;
+
+	/* dtr_free_rx_desc() will call drbd_free_page(), and that function
+	 * should not be called from softirq context.
+	 */
+	spin_lock_irqsave(&cm->error_rx_descs_lock, irq_flags);
+	list_add_tail(&rx_desc->list, &cm->error_rx_descs);
+	spin_unlock_irqrestore(&cm->error_rx_descs_lock, irq_flags);
+	dtr_dec_rx_descs(cm);
+	set_bit(DSB_ERROR, &cm->state);
+
+	kref_get(&cm->kref);
+	if (!schedule_work(&cm->end_rx_work))
+		kref_put(&cm->kref, dtr_destroy_cm);
+}
+
+/* The peer sent something this transport never sends. Most likely it runs a
+ * different RDMA transport (e.g. rdma) that accepted our connection on the
+ * same address and port. Do not interpret the message; drop the connection as
+ * if the peer had disconnected.
+ */
+static void dtr_rx_protocol_error(struct dtr_cm *cm, struct dtr_rx_desc *rx_desc,
+				  struct ib_wc *wc)
+{
+	struct dtr_transport *rdma_transport = cm->rdma_transport;
+
+	if (__ratelimit(&rdma_transport->rate_limit))
+		tr_err(&rdma_transport->transport,
+		       "Unexpected message from peer (opcode %d, len %u, imm 0x%x), different transport on peer? Dropping connection\n",
+		       wc->opcode, wc->byte_len, be32_to_cpu(wc->ex.imm_data));
+
+	dtr_rx_desc_error(cm, rx_desc);
+
+	/* The reference held for DSB_CONNECTED goes to the work */
+	if (test_and_clear_bit(DSB_CONNECTED, &cm->state) &&
+	    !schedule_work(&cm->disconnect_work))
+		kref_put(&cm->kref, dtr_destroy_cm);
+}
+
+/* A record SENT into a recv buffer must be complete and carry one of our magics */
+static bool dtr_record_len_ok(u32 magic, u32 len)
+{
+	switch (magic) {
+	case DTR_MAGIC:
+		return len >= sizeof(struct dtr_flow_control);
+	case DTR_ANNOUNCE_MAGIC:
+		return len >= sizeof(struct dtr_announce_buffer);
+	case DTR_SHUTDOWN_MAGIC:
+		return len >= sizeof(struct dtr_shutdown);
+	}
+	return false;
+}
+
 static void dtr_rx_cqe_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct dtr_rx_desc *rx_desc = container_of(wc->wr_cqe, struct dtr_rx_desc, cqe);
@@ -2551,7 +2643,6 @@ static void dtr_rx_cqe_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	if (wc->status != IB_WC_SUCCESS || !(wc->opcode & IB_WC_RECV)) {
 		struct drbd_transport *transport = &rdma_transport->transport;
-		unsigned long irq_flags;
 
 		switch (wc->status) {
 		case IB_WC_WR_FLUSH_ERR:
@@ -2576,24 +2667,16 @@ static void dtr_rx_cqe_done(struct ib_cq *cq, struct ib_wc *wc)
 			}
 		}
 
-		/* dtr_free_rx_desc() will call drbd_free_page(), and that function
-		 * should not be called from softirq context.
-		 */
-		spin_lock_irqsave(&cm->error_rx_descs_lock, irq_flags);
-		list_add_tail(&rx_desc->list, &cm->error_rx_descs);
-		spin_unlock_irqrestore(&cm->error_rx_descs_lock, irq_flags);
-		dtr_dec_rx_descs(cm);
-		set_bit(DSB_ERROR, &cm->state);
-
-		kref_get(&cm->kref);
-		if (!schedule_work(&cm->end_rx_work))
-			kref_put(&cm->kref, dtr_destroy_cm);
-
+		dtr_rx_desc_error(cm, rx_desc);
 		return;
 	}
 
 	rx_desc->size = wc->byte_len;
 	immediate = be32_to_cpu(wc->ex.imm_data);
+	if (!(wc->wc_flags & IB_WC_WITH_IMM) || dtr_imm_stream(immediate) > ST_FLOW_CTRL) {
+		dtr_rx_protocol_error(cm, rx_desc, wc);
+		return;
+	}
 
 	/* The first peer RDMA-write ends the bootstrap SEND phase: the peer emits
 	 * all its SENDs before any RDMA-write and the single RC QP delivers in
@@ -2635,6 +2718,10 @@ static void dtr_rx_cqe_done(struct ib_cq *cq, struct ib_wc *wc)
 			ib_dma_sync_single_for_cpu(cm->id->device, rx_desc->sge.addr,
 						   PAGE_SIZE, DMA_FROM_DEVICE);
 			msg = page_address(rx_desc->page);
+			if (!dtr_record_len_ok(be32_to_cpu(*(__be32 *)msg), wc->byte_len)) {
+				dtr_rx_protocol_error(cm, rx_desc, wc);
+				return;
+			}
 		}
 		/* Flow-control and region-announce records share the ST_FLOW_CTRL
 		 * immediate; both carry a leading magic, disambiguate on it. A ring
@@ -4333,7 +4420,7 @@ static u32 dtr_local_buffer_target_bytes(struct dtr_region_set *rs, u32 stride)
 	struct dtr_flow *flow = &path->flow[rs->stream];
 	u32 want = flow->rx_window_bytes;
 	u32 credit_cap, mxb_cap;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 
 	credit_cap = (u32)flow->rx_descs_max / 2 * rdma_transport->sges_max * PAGE_SIZE;
 
@@ -4950,7 +5037,7 @@ static void dtr_register_buffers_work_fn(struct work_struct *work)
  * of the DATA windows. An unset sndbuf tracks the matching rcvbuf, so the
  * sender may keep a full receive window in flight.
  */
-static void dtr_window_bytes(struct net_conf *nc, enum drbd_stream stream,
+static void dtr_window_bytes(struct drbd_net_conf *nc, enum drbd_stream stream,
 			     unsigned int *rx_bytes, unsigned int *tx_bytes)
 {
 	unsigned int rcvbuf = nc->rcvbuf_size ?: RDMA_DEF_BUFFER_SIZE;
@@ -4987,7 +5074,7 @@ static int dtr_init_flow(struct dtr_path *path, enum drbd_stream stream)
 	struct drbd_transport *transport = path->path.transport;
 	struct dtr_flow *flow = &path->flow[stream];
 	unsigned int rx_bytes, tx_bytes;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 
 	rcu_read_lock();
 	nc = rcu_dereference(transport->net_conf);
@@ -5297,10 +5384,8 @@ static void __dtr_modify_qp_to_err(struct dtr_cm *cm)
 static void __dtr_disconnect_path(struct dtr_path *path)
 {
 	struct drbd_transport *transport;
-	enum connect_state_enum a, p;
-	bool was_scheduled;
+	enum connect_state_enum p;
 	struct dtr_cm *cm;
-	long t;
 	int err;
 
 	if (!path)
@@ -5308,44 +5393,14 @@ static void __dtr_disconnect_path(struct dtr_path *path)
 
 	transport = path->path.transport;
 
-	a = atomic_cmpxchg(&path->cs.active_state, PCS_CONNECTING, PCS_REQUEST_ABORT);
-	p = atomic_cmpxchg(&path->cs.passive_state, PCS_CONNECTING, PCS_INACTIVE);
-
-	switch (p) {
-	case PCS_CONNECTING:
+	atomic_set(&path->cs.active_state, PCS_INACTIVE);
+	p = atomic_xchg(&path->cs.passive_state, PCS_INACTIVE);
+	/* Wait for a dtr_path_prepare() or establishing in progress */
+	mutex_lock(&path->cs.mutex);
+	mutex_unlock(&path->cs.mutex);
+	if (p == PCS_CONNECTING)
 		drbd_put_listener(&path->path);
-		break;
-	case PCS_FINISHING:
-		t = wait_event_timeout(path->cs.wq,
-				       atomic_read(&path->cs.passive_state) == PCS_INACTIVE,
-				       HZ * 60);
-		if (t == 0)
-			tr_warn(transport, "passive_state still %d\n",
-				atomic_read(&path->cs.passive_state));
-		fallthrough;
-	case PCS_INACTIVE:
-		break;
-	}
-
-	switch (a) {
-	case PCS_CONNECTING:
-		was_scheduled = flush_delayed_work(&path->cs.retry_connect_work);
-		if (!was_scheduled) {
-			atomic_set(&path->cs.active_state, PCS_INACTIVE);
-			break;
-		}
-		fallthrough;
-	case PCS_REQUEST_ABORT:
-		t = wait_event_timeout(path->cs.wq,
-				       atomic_read(&path->cs.active_state) == PCS_INACTIVE,
-				       HZ * 60);
-		if (t == 0)
-			tr_warn(transport, "active_state still %d\n",
-				atomic_read(&path->cs.active_state));
-		fallthrough;
-	case PCS_INACTIVE:
-		break;
-	}
+	cancel_delayed_work_sync(&path->cs.retry_connect_work);
 
 	cm = dtr_path_get_cm(path);
 	if (!cm)
@@ -5577,8 +5632,6 @@ static int dtr_activate_path(struct dtr_path *path)
 	if (test_bit(DTR_ACTIVE_SHUT_DOWN, &path->flags))
 		return 0;
 
-	init_waitqueue_head(&cs->wq);
-
 	/* A path re-establishing after a passive graceful shutdown (the peer ran
 	 * del-path) carries a stale DTR_PASSIVE_SHUT_DOWN bit; clear it so the fresh
 	 * connection is selectable for tx again.
@@ -5618,7 +5671,6 @@ out:
 out_no_put:
 	atomic_set(&cs->passive_state, PCS_INACTIVE);
 	atomic_set(&cs->active_state, PCS_INACTIVE);
-	wake_up(&cs->wq);
 
 	return err;
 }
@@ -5630,7 +5682,7 @@ static int dtr_prepare_connect(struct drbd_transport *transport)
 
 	struct dtr_stream *data_stream = NULL, *control_stream = NULL;
 	struct dtr_path *path;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	int timeout, err = -ENOMEM;
 
 	flush_signals(current);
@@ -5718,14 +5770,15 @@ static void dtr_finish_connect(struct drbd_transport *transport)
 	if (!rdma_transport->active) {
 		struct dtr_path *path;
 
+		dtr_stop_connect_works(transport);
 		list_for_each_entry(path, &transport->paths, path.list)
 			dtr_disconnect_path(path);
 	}
 }
 
-static int dtr_net_conf_change(struct drbd_transport *transport, struct net_conf *new_net_conf)
+static int dtr_net_conf_change(struct drbd_transport *transport, struct drbd_net_conf *new_net_conf)
 {
-	struct net_conf *old_net_conf;
+	struct drbd_net_conf *old_net_conf;
 	struct dtr_transport *dtr_transport = container_of(transport,
 		struct dtr_transport, transport);
 	int ret = 0;
@@ -6343,6 +6396,7 @@ static int dtr_add_path(struct drbd_path *add_path)
 	/* initialize private parts of path */
 	atomic_set(&path->cs.passive_state, PCS_INACTIVE);
 	atomic_set(&path->cs.active_state, PCS_INACTIVE);
+	mutex_init(&path->cs.mutex);
 	for (i = DATA_STREAM; i <= CONTROL_STREAM; i++) {
 		struct dtr_region_set *rs = &path->regions[i];
 
@@ -6452,7 +6506,7 @@ static void dtr_remove_path(struct drbd_path *del_path)
 	if (test_bit(TR_ESTABLISHED, &del_path->flags) && dtr_other_path_connected(path)) {
 		long timeout = HZ; /* fallback if net_conf went away */
 		unsigned long deadline;
-		struct net_conf *nc;
+		struct drbd_net_conf *nc;
 		long remaining;
 		int err;
 

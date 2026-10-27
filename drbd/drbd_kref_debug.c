@@ -16,7 +16,7 @@ static void get_resource_name(const struct kref_debug_info *debug_info, char *na
 static void get_connection_name(const struct kref_debug_info *debug_info, char *name)
 {
 	struct drbd_connection *connection = container_of(debug_info, struct drbd_connection, kref_debug);
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	const char *resource_n =
 		connection->resource && connection->resource->name ? connection->resource->name : "unknown";
 
@@ -74,7 +74,7 @@ struct kref_debug_class kref_class_connection = {
 		[15] = "for_each_peer_device_ref()",
 		[16] = "queue_twopc",
 		[17] = "path",
-		[18] = "drbd_send_out_of_sync_wf",
+		[18] = "send_oos list entry",
 		[19] = "send_ping_work/send_ping_ack_work",
 		[20] = "dagtag_wait_reqs",
 		[21] = "sync source of an unsecured write",

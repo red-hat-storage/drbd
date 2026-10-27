@@ -11,6 +11,7 @@
 #include <linux/jiffies.h>
 #include <linux/list.h>
 #include <generated/utsrelease.h>
+#include <uapi/linux/drbd_genl.h>
 
 #include "drbd_int.h"
 #include "drbd_req.h"
@@ -142,9 +143,35 @@ static void print_one_age_or_dash(struct seq_file *m, struct drbd_request *req,
 		unsigned int s = req->net_rq_state[peer_device->node_id];
 
 		if (s & set_mask && !(s & clear_mask)) {
-			ktime_t ktime = ktime_sub(now, memberat(req, ktime_t, offset));
+			ktime_t ktime = ktime_sub(now, memberat(req, ktime_t,
+					offset + peer_device->node_id * sizeof(ktime_t)));
 
 			seq_printf(m, "\t[%d]%d", peer_device->node_id, (int)ktime_to_ms(ktime));
+			return;
+		}
+	}
+	seq_puts(m, "\t-");
+}
+#else
+static void seq_print_jif_age_or_dash(struct seq_file *m, bool valid, unsigned long dt)
+{
+	if (valid)
+		seq_printf(m, "\t%d", (int)jiffies_to_msecs(dt));
+	else
+		seq_puts(m, "\t-");
+}
+
+static void print_sent_age_or_dash(struct seq_file *m, struct drbd_request *req, unsigned long jif)
+{
+	struct drbd_device *device = req->device;
+	struct drbd_peer_device *peer_device;
+
+	for_each_peer_device(peer_device, device) {
+		int node_id = peer_device->node_id;
+
+		if (req->net_rq_state[node_id] & RQ_NET_SENT) {
+			seq_printf(m, "\t[%d]%d", node_id,
+				   (int)jiffies_to_msecs(jif - req->pre_send_jif[node_id]));
 			return;
 		}
 	}
@@ -176,9 +203,12 @@ static void seq_print_one_request(struct seq_file *m, struct drbd_request *req, 
 	print_one_age_or_dash(m, req, RQ_NET_SENT, RQ_NET_PENDING, now, offsetof(typeof(*req), acked_kt));
 	print_one_age_or_dash(m, req, RQ_NET_DONE, 0, now, offsetof(typeof(*req), net_done_kt));
 #else
-#define RQ_HDR_2 "\tstart"
-#define RQ_HDR_3 ""
+#define RQ_HDR_2 "\tstart\tsubmit"
 	seq_printf(m, "\t%d", (int)jiffies_to_msecs(jif - req->start_jif));
+	seq_print_jif_age_or_dash(m, s & RQ_LOCAL_PENDING, jif - req->pre_submit_jif);
+
+#define RQ_HDR_3 "\tsent"
+	print_sent_age_or_dash(m, req, jif);
 #endif
 #define RQ_HDR_4 "\tstate\n"
 	seq_print_request_state(m, req);
@@ -537,7 +567,7 @@ static int resource_in_flight_summary_show(struct seq_file *m, void *pos)
 	unsigned long jif = jiffies;
 
 	/* BUMP me if you change the file format/content/presentation */
-	seq_printf(m, "v: %u\n\n", 1);
+	seq_printf(m, "v: %u\n\n", 2);
 
 	seq_puts(m, "oldest bitmap IO\n");
 	seq_print_resource_pending_bitmap_io(m, resource, jif);
@@ -862,7 +892,7 @@ static int connection_oldest_requests_show(struct seq_file *m, void *ignored)
 	struct drbd_request *r1, *r2;
 
 	/* BUMP me if you change the file format/content/presentation */
-	seq_printf(m, "v: %u\n\n", 1);
+	seq_printf(m, "v: %u\n\n", 2);
 
 	rcu_read_lock();
 	r1 = READ_ONCE(connection->todo.req_next);
@@ -935,7 +965,6 @@ static int connection_debug_show(struct seq_file *m, void *ignored)
 	pretty_print_bit(TWOPC_RETRY);
 	pretty_print_bit(CONN_DRY_RUN);
 	pretty_print_bit(DISCONNECT_EXPECTED);
-	pretty_print_bit(BARRIER_ACK_PENDING);
 	pretty_print_bit(DATA_CORKED);
 	pretty_print_bit(CONTROL_CORKED);
 	pretty_print_bit(C_UNREGISTERED);
@@ -955,6 +984,9 @@ static int connection_debug_show(struct seq_file *m, void *ignored)
 	u2 = connection->send.current_epoch_nr;
 	seq_printf(m, "resource->current_tle_nr: %u\n", u1);
 	seq_printf(m, "   send.current_epoch_nr: %u (%d)\n", u2, (int)(u2 - u1));
+	seq_printf(m, "   last barrier sent, acked: %u, %u\n",
+		   READ_ONCE(connection->send.last_sent_epoch_nr),
+		   READ_ONCE(connection->last_acked_epoch_nr));
 
 	ull1 = resource->dagtag_sector;
 	ull2 = resource->last_peer_acked_dagtag;
@@ -1177,7 +1209,7 @@ static int device_oldest_requests_show(struct seq_file *m, void *ignored)
 	int i;
 
 	/* BUMP me if you change the file format/content/presentation */
-	seq_printf(m, "v: %u\n\n", 0);
+	seq_printf(m, "v: %u\n\n", 1);
 
 	seq_puts(m, RQ_HDR);
 	spin_lock_irq(&device->pending_completion_lock);
@@ -1844,7 +1876,7 @@ static int peer_device_proc_drbd_show(struct seq_file *m, void *ignored)
 	struct drbd_device *device = peer_device->device;
 	union drbd_state state;
 	const char *sn;
-	struct net_conf *nc;
+	struct drbd_net_conf *nc;
 	bool have_ldev;
 	char wp;
 
