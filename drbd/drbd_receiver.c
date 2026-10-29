@@ -141,6 +141,7 @@ enum sync_strategy {
 	REQUIRES_PROTO_124,
 	SYNC_TARGET_PRIMARY_RECONNECT,
 	SYNC_TARGET_PRIMARY_DISCONNECT,
+	DRY_RUN,
 };
 
 struct sync_descriptor {
@@ -251,6 +252,10 @@ static const struct sync_descriptor sync_descriptors[] = {
 		.is_sync_target = true,
 		.disconnect = true,
 	},
+	[DRY_RUN] = {
+		.name = "dry-run",
+		.disconnect = true,
+	},
 };
 
 enum rcv_timeou_kind {
@@ -271,7 +276,7 @@ static void process_twopc(struct drbd_connection *, struct twopc_reply *, struct
 static void drbd_resync(struct drbd_peer_device *, enum resync_reason);
 static void drbd_unplug_all_devices(struct drbd_connection *connection);
 static int decode_header(struct drbd_connection *, const void *, struct packet_info *);
-static void check_resync_source(struct drbd_device *device, u64 weak_nodes);
+static void check_resync_source(struct drbd_peer_device *primary_pd, u64 weak_nodes);
 static void set_rcvtimeo(struct drbd_connection *connection, enum rcv_timeou_kind kind);
 static bool disconnect_expected(struct drbd_connection *connection);
 static bool uuid_in_peer_history(struct drbd_peer_device *peer_device, u64 uuid);
@@ -1372,6 +1377,7 @@ start:
 	 * or the challenge response authentication could be garbled. */
 	mutex_lock(&connection->mutex[DATA_STREAM]);
 	have_mutex = true;
+	clear_bit(PING_TIMEOUT_ACTIVE, &connection->flags);
 	transport->class->ops.set_rcvtimeo(transport, DATA_STREAM, ping_timeo * 4 * HZ/10);
 	transport->class->ops.set_rcvtimeo(transport, CONTROL_STREAM, ping_int * HZ);
 
@@ -7253,8 +7259,8 @@ static enum sync_strategy discard_my_data_to_strategy(struct drbd_peer_device *p
 	return strategy;
 }
 
-/* drbd_sync_handshake() returns the new replication state on success, and -1
- * on failure.
+/* drbd_sync_handshake() returns the strategy for this connection; one with
+ * .reconnect or .disconnect set ends the connect attempt.
  */
 static enum sync_strategy drbd_sync_handshake(struct drbd_peer_device *peer_device,
 					      union drbd_state peer_state)
@@ -7493,7 +7499,7 @@ static enum sync_strategy drbd_sync_handshake(struct drbd_peer_device *peer_devi
 			drbd_info(peer_device, "dry-run connect: Would become %s, doing a %s resync.",
 				 drbd_repl_str(strategy_descriptor(strategy).is_sync_target ? L_SYNC_TARGET : L_SYNC_SOURCE),
 				 strategy_descriptor(strategy).name);
-		return -2;
+		return DRY_RUN;
 	}
 
 	err = bitmap_mod_after_handshake(peer_device, strategy, peer_node_id);
@@ -8715,7 +8721,7 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 
 	if (peer_device->connection->peer_role[NOW] == R_PRIMARY &&
 	    peer_device->uuid_flags & UUID_FLAG_STABLE)
-		check_resync_source(device, node_mask);
+		check_resync_source(peer_device, node_mask);
 
 	err = __receive_uuids(peer_device, node_mask);
 
@@ -8744,9 +8750,47 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 	return err;
 }
 
+/*
+ * Nothing else restarts a resync that check_resync_source() aborted: with no
+ * other resync queued the target would stay Inconsistent next to an UpToDate
+ * Primary until a reconnect. Carry the blocks the weak source still owed over
+ * to the Primary's bitmap slot and resync from the Primary instead.
+ */
+static void resync_from_primary_after_abort(struct drbd_peer_device *primary_pd,
+					    struct drbd_peer_device *weak_pd)
+{
+	struct drbd_device *device = primary_pd->device;
+
+	if (primary_pd->repl_state[NOW] != L_ESTABLISHED ||
+	    primary_pd->disk_state[NOW] != D_UP_TO_DATE ||
+	    device->disk_state[NOW] >= D_UP_TO_DATE)
+		return;
+
+	if (!get_ldev(device))
+		return;
+
+	/* Without both slots the owed blocks cannot be carried over. */
+	if (weak_pd->bitmap_index == -1 || primary_pd->bitmap_index == -1) {
+		put_ldev(device);
+		return;
+	}
+
+	drbd_suspend_io(device, WRITE_ONLY);
+	drbd_bm_slot_lock(primary_pd, "or_slot after resync abort", BM_LOCK_BULK);
+	drbd_bm_or_slot(device, weak_pd->bitmap_index, primary_pd->bitmap_index);
+	drbd_bm_write(device, NULL);
+	drbd_bm_slot_unlock(primary_pd);
+	drbd_resume_io(device);
+
+	drbd_info(primary_pd, "Resyncing from the primary instead of the weak sync source\n");
+	drbd_send_uuids(primary_pd, UUID_FLAG_RESYNC, 0);
+	drbd_resync(primary_pd, AFTER_UNSTABLE);
+	put_ldev(device);
+}
+
 /**
  * check_resync_source() - Abort resync if the source is weak
- * @device: The device to check
+ * @primary_pd: The peer device of the primary that reported @weak_nodes
  * @weak_nodes: Mask of currently weak nodes in the cluster
  *
  * If a primary loses connection to a SYNC_SOURCE node from us, then we
@@ -8760,8 +8804,9 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
  * We are stopping the resync from such an outdated source here and waiting
  * until all the resync activity has drained (P_RS_DATA_REPLY packets).
  */
-static void check_resync_source(struct drbd_device *device, u64 weak_nodes)
+static void check_resync_source(struct drbd_peer_device *primary_pd, u64 weak_nodes)
 {
+	struct drbd_device *device = primary_pd->device;
 	struct drbd_peer_device *peer_device;
 	struct drbd_connection *connection;
 
@@ -8794,6 +8839,8 @@ abort:
 	peer_device->rs_total  = 0;
 	peer_device->rs_failed = 0;
 	peer_device->rs_paused = 0;
+
+	resync_from_primary_after_abort(primary_pd, peer_device);
 }
 
 /**
@@ -10414,7 +10461,7 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 
 	if (!test_bit(INITIAL_STATE_RECEIVED, peer_device->flags) &&
 	    peer_state.role == R_PRIMARY && peer_device->uuid_flags & UUID_FLAG_STABLE)
-		check_resync_source(device, peer_device->uuid_node_mask);
+		check_resync_source(peer_device, peer_device->uuid_node_mask);
 
 	peer_was_resync_target =
 		connection->agreed_pro_version >= 110 ?
@@ -11503,7 +11550,7 @@ static int receive_current_uuid(struct drbd_connection *connection, struct packe
 		put_ldev(device);
 	}
 	if (connection->peer_role[NOW] == R_PRIMARY)
-		check_resync_source(device, weak_nodes);
+		check_resync_source(peer_device, weak_nodes);
 
 	if (connection->peer_role[NOW] == R_UNKNOWN) {
 		set_bit(CURRENT_UUID_RECEIVED, peer_device->flags);
@@ -12609,10 +12656,13 @@ static void conn_disconnect(struct drbd_connection *connection)
 	unsigned long irq_flags;
 	bool reconsider = false;
 	bool kept_for_resend;
+	bool dry_run;
 	int vnr, i;
 
 	clear_bit(CONN_DRY_RUN, &connection->flags);
+	dry_run = test_and_clear_bit(CONN_DRY_RUN_LOCAL, &connection->flags);
 	clear_bit(CONN_CONGESTED, &connection->flags);
+	clear_bit(CONN_PRE_110, &connection->flags);
 
 	if (connection->cstate[NOW] == C_STANDALONE)
 		return;
@@ -12768,7 +12818,11 @@ static void conn_disconnect(struct drbd_connection *connection)
 
 	begin_state_change(resource, &irq_flags, CS_VERBOSE | CS_LOCAL_ONLY);
 	oc = connection->cstate[NOW];
-	if (oc >= C_UNCONNECTED) {
+	if (oc >= C_UNCONNECTED && dry_run) {
+		/* The node that asked for the dry run stays down; its peer reconnects */
+		__change_cstate(connection, C_DISCONNECTING);
+		oc = C_DISCONNECTING;
+	} else if (oc >= C_UNCONNECTED) {
 		__change_cstate(connection, C_UNCONNECTED);
 		/* drbd_receiver() has to be restarted after it returns */
 		drbd_thread_restart_nowait(&connection->receiver);
@@ -12914,13 +12968,16 @@ int drbd_do_features(struct drbd_connection *connection)
 		struct drbd_connection *connection2;
 		bool multiple = false;
 
-		rcu_read_lock();
-		for_each_connection_rcu(connection2, resource) {
+		/* new-peer adds a connection under the write lock, and none beside CONN_PRE_110 */
+		read_lock_irq(&resource->state_rwlock);
+		for_each_connection(connection2, resource) {
 			if (connection == connection2)
 				continue;
 			multiple = true;
 		}
-		rcu_read_unlock();
+		if (!multiple)
+			set_bit(CONN_PRE_110, &connection->flags);
+		read_unlock_irq(&resource->state_rwlock);
 
 		if (multiple) {
 			drbd_err(connection, "Peer supports protocols %d-%d, but "

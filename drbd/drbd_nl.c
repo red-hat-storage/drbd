@@ -2342,7 +2342,8 @@ static void __update_mdf_al_disabled(struct drbd_device *device, bool al_updates
 {
 	struct drbd_md *md = &device->ldev->md;
 	struct drbd_connection *peer = NULL;
-	bool al_updates_old = !(md->flags & MDF_AL_DISABLED);
+	bool al_updates_old = !(md->flags & MDF_AL_DISABLED) ||
+			      test_bit(AL_ENABLE_PENDING, &device->flags);
 	bool optimized = false;
 
 	if (al_updates)
@@ -2365,10 +2366,18 @@ static void __update_mdf_al_disabled(struct drbd_device *device, bool al_updates
 
 	if (al_updates) {
 		drbd_info(device, "Enabling local AL-updates\n");
+		/* Extents that became active meanwhile have no transaction;
+		 * drbd_al_begin_io_commit() writes them, then clears the flag.
+		 */
+		if (!drbd_md_dax_active(device->ldev)) {
+			set_bit(AL_ENABLE_PENDING, &device->flags);
+			return;
+		}
 		md->flags &= ~MDF_AL_DISABLED;
 	} else {
 		drbd_info(device, "Disabling local AL-updates %s\n",
 			  optimized ? "(optimization)" : "(config)");
+		clear_bit(AL_ENABLE_PENDING, &device->flags);
 		md->flags |= MDF_AL_DISABLED;
 	}
 	drbd_md_mark_dirty(device);
@@ -2512,8 +2521,6 @@ int drbd_adm_disk_opts(struct drbd_adm_ctx *adm_ctx)
 
 	mutex_unlock(&resource->conf_update);
 
-	__update_mdf_al_disabled(device, new_disk_conf->al_updates, NOW);
-
 	assign_bit(MD_NO_FUA, &device->flags, !new_disk_conf->md_flushes);
 
 	if (write_ordering_changed(old_disk_conf, new_disk_conf))
@@ -2523,7 +2530,14 @@ int drbd_adm_disk_opts(struct drbd_adm_ctx *adm_ctx)
 	    new_disk_conf->discard_zeroes_if_aligned)
 		drbd_reconsider_queue_parameters(device, device->ldev);
 
+	/* No extent becomes active without a transaction before the superblock
+	 * says AL updates are off.
+	 */
+	wait_event(device->al_wait, drbd_al_try_lock_for_transaction(device));
+	__update_mdf_al_disabled(device, new_disk_conf->al_updates, NOW);
 	drbd_md_sync_if_dirty(device);
+	lc_unlock(device->act_log);
+	wake_up(&device->al_wait);
 
 	for_each_peer_device(peer_device, device) {
 		if (peer_device->repl_state[NOW] >= L_ESTABLISHED)
@@ -2836,7 +2850,6 @@ static int link_backing_dev(struct drbd_device *device,
 	int err = bd_link_disk_holder(file_bdev(file), device->vdisk);
 
 	if (err) {
-		fput(file);
 		drbd_err(device, "bd_link_disk_holder(\"%s\", ...) failed with %d\n",
 				bdev_path, err);
 	}
@@ -4805,6 +4818,8 @@ static int adm_new_connection(struct drbd_adm_ctx *adm_ctx)
 	char *transport_name;
 	struct drbd_transport_class *tr_class;
 	struct drbd_transport *transport;
+	struct drbd_connection *connection2;
+	int pre_110_node_id = -1, pre_110_pro = 0;
 
 	/* allocation not in the IO path, drbdsetup / netlink process context */
 	new_net_conf = kzalloc_obj(*new_net_conf);
@@ -4921,6 +4936,23 @@ static int adm_new_connection(struct drbd_adm_ctx *adm_ctx)
 	 * if no further writes occur.
 	 */
 	connection->last_peer_ack_dagtag_seen = READ_ONCE(adm_ctx->resource->dagtag_sector);
+
+	/* A peer below protocol 110 must stay the only one (drbd_do_features()) */
+	for_each_connection(connection2, adm_ctx->resource) {
+		if (test_bit(CONN_PRE_110, &connection2->flags)) {
+			pre_110_node_id = connection2->peer_node_id;
+			pre_110_pro = connection2->agreed_pro_version;
+			break;
+		}
+	}
+	if (pre_110_node_id >= 0) {
+		write_unlock_irq(&adm_ctx->resource->state_rwlock);
+		drbd_adm_msg(adm_ctx,
+			     "peer %d is connected with protocol %d, which allows no other connection",
+			     pre_110_node_id, pre_110_pro);
+		retcode = ERR_INVALID_REQUEST;
+		goto unlock_fail_free_connection;
+	}
 
 	list_add_tail_rcu(&connection->connections, &adm_ctx->resource->connections);
 	write_unlock_irq(&adm_ctx->resource->state_rwlock);
@@ -5204,8 +5236,10 @@ int drbd_adm_connect(struct drbd_adm_ctx *adm_ctx)
 		}
 		set_bit(CONN_DISCARD_MY_DATA, &connection->flags);
 	}
-	if (parms.tentative)
+	if (parms.tentative) {
 		set_bit(CONN_DRY_RUN, &connection->flags);
+		set_bit(CONN_DRY_RUN_LOCAL, &connection->flags);
+	}
 
 	/* Eventually allocate bitmap indexes for the peer_devices here */
 	idr_for_each_entry(&connection->peer_devices, peer_device, i) {

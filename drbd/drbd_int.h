@@ -635,6 +635,7 @@ enum device_flag {
 	FORCE_DETACH,		/* Force-detach from local disk, aborting any pending local IO */
 	ABORT_MDIO,		/* Interrupt ongoing meta-data I/O */
 	AL_SUSPENDED,		/* Activity logging is currently suspended. */
+	AL_ENABLE_PENDING,	/* AL updates on, the in-core AL not yet on disk */
 	UNREGISTERED,
 	FLUSH_PENDING,		/* if set, device->flush_jif is when we submitted that flush
 				 * from drbd_flush_after_epoch() */
@@ -1070,6 +1071,7 @@ enum connection_flag {
 	TWOPC_NO,
 	TWOPC_RETRY,
 	CONN_DRY_RUN,		/* Expect disconnect after resync handshake. */
+	CONN_DRY_RUN_LOCAL,	/* This node asked for the dry run. */
 	DISCONNECT_EXPECTED,
 	CORKED,
 	DATA_CORKED = CORKED,	/* used as computed value CORKED + DATA_STREAM */
@@ -1094,6 +1096,7 @@ enum connection_flag {
 			     * behind that walk.
 			     */
 	PING_TIMEOUT_ACTIVE,
+	CONN_PRE_110,		/* agreed on a protocol below 110: the only connection */
 };
 
 /* flag bits per resource */
