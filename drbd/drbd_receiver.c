@@ -6495,12 +6495,11 @@ static enum sync_strategy drbd_uuid_compare(struct drbd_peer_device *peer_device
 				SYNC_SOURCE_IF_BOTH_FAILED :
 				SYNC_TARGET_IF_BOTH_FAILED;
 
-		if (connection->agreed_pro_version < 120) {
-			*rule = RULE_RECONNECTED;
-			if (peer_device->uuid_flags & UUID_FLAG_RECONNECT &&
-			    local_uuid_flags & UUID_FLAG_RECONNECT)
-				return NO_SYNC;
-		}
+		*rule = RULE_RECONNECTED;
+		if (connection->agreed_pro_version < 120 &&
+		    peer_device->uuid_flags & UUID_FLAG_RECONNECT &&
+		    local_uuid_flags & UUID_FLAG_RECONNECT)
+			return NO_SYNC;
 
 		/* Peer crashed as primary, I survived, resync from me */
 		if (peer_device->uuid_flags & UUID_FLAG_CRASHED_PRIMARY &&
@@ -10569,6 +10568,18 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 		return 0;
 	}
 
+	/* The peer pulled ahead and came back while we stayed SyncTarget
+	 * (its P_RS_CANCEL_AHEAD outran the Ahead state change), so the
+	 * SyncTarget -> Behind -> SyncTarget path that would clear the flag
+	 * is never taken. Clear it here and resume issuing requests.
+	 */
+	if (peer_state.conn == L_SYNC_SOURCE &&
+	    peer_device->repl_state[NOW] == L_SYNC_TARGET &&
+	    test_and_clear_bit(SYNC_TARGET_TO_BEHIND, peer_device->flags)) {
+		drbd_info(peer_device, "peer back from ahead, resuming resync requests\n");
+		mod_timer(&peer_device->resync_timer, jiffies + RS_MAKE_REQS_INTV);
+	}
+
 	/* Start resync after AHEAD/BEHIND */
 	if (connection->agreed_pro_version >= 110 &&
 	    peer_state.conn == L_SYNC_SOURCE && old_peer_state.conn == L_BEHIND) {
@@ -13833,8 +13844,10 @@ static int got_NegRSDReply(struct drbd_connection *connection, struct packet_inf
 
 	dec_rs_pending(peer_device);
 
-	if (pi->cmd == P_RS_CANCEL_AHEAD)
-		set_bit(SYNC_TARGET_TO_BEHIND, peer_device->flags);
+	if (pi->cmd == P_RS_CANCEL_AHEAD &&
+	    !test_and_set_bit(SYNC_TARGET_TO_BEHIND, peer_device->flags) &&
+	    peer_device->repl_state[NOW] == L_SYNC_TARGET)
+		drbd_info(peer_device, "peer pulled ahead during resync\n");
 
 	drbd_unsuccessful_resync_request(peer_req, pi->cmd == P_NEG_RS_DREPLY);
 	return 0;
@@ -14185,10 +14198,10 @@ static int got_OVResult(struct drbd_connection *connection, struct packet_info *
 	else
 		ov_out_of_sync_print(peer_device);
 
+	dec_rs_pending(peer_device);
+
 	if (!get_ldev(device))
 		return 0;
-
-	dec_rs_pending(peer_device);
 
 	verify_progress(peer_device, sector, size);
 
