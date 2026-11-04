@@ -6148,12 +6148,19 @@ static int drbd_find_peer_bitmap_by_uuid(struct drbd_peer_device *peer_device, u
  * that callers can still tell "UUID unknown" (-1) from "UUID known but only as
  * a convergence bitmap"; callers that must copy re-check is_divergence_bitmap()
  * on the result.
+ *
+ * Of the slots without a bitmap and without a known node, consider only the
+ * day0 slot _drbd_send_uuids110() last sent to this peer, if any. The peer
+ * sees only that one, so a match on another one would be a decision it does
+ * not share. Which slot that is, and whether one is sent at all, can change
+ * between sending and the handshake, so take what was sent.
  */
 static int drbd_find_bitmap_by_uuid(struct drbd_peer_device *peer_device, u64 uuid)
 {
 	struct drbd_connection *connection = peer_device->connection;
 	struct drbd_device *device = peer_device->device;
 	struct drbd_peer_md *peer_md = device->ldev->md.peers;
+	int day0 = READ_ONCE(peer_device->comm_day0_node_id);
 	int i, any = -1;
 
 	for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
@@ -6161,6 +6168,10 @@ static int drbd_find_bitmap_by_uuid(struct drbd_peer_device *peer_device, u64 uu
 			continue;
 		if (connection->agreed_pro_version < 116 &&
 		    peer_md[i].bitmap_index == -1)
+			continue;
+		if (i != day0 && i != peer_device->node_id &&
+		    !test_bit(__MDF_HAVE_BITMAP, &peer_md[i].flags) &&
+		    !test_bit(__MDF_NODE_EXISTS, &peer_md[i].flags))
 			continue;
 		if ((peer_md[i].bitmap_uuid & ~UUID_PRIMARY) != uuid)
 			continue;
@@ -8798,6 +8809,11 @@ static void resync_from_primary_after_abort(struct drbd_peer_device *primary_pd,
 					    struct drbd_peer_device *weak_pd)
 {
 	struct drbd_device *device = primary_pd->device;
+	enum drbd_repl_state weak_rs = weak_pd->repl_state[NOW];
+
+	/* The weak peer started resyncing again while we drained. */
+	if (weak_rs == L_SYNC_TARGET || weak_rs == L_PAUSED_SYNC_T)
+		return;
 
 	if (primary_pd->repl_state[NOW] != L_ESTABLISHED ||
 	    primary_pd->disk_state[NOW] != D_UP_TO_DATE ||
@@ -8847,6 +8863,7 @@ static void check_resync_source(struct drbd_peer_device *primary_pd, u64 weak_no
 	struct drbd_device *device = primary_pd->device;
 	struct drbd_peer_device *peer_device;
 	struct drbd_connection *connection;
+	int err;
 
 	rcu_read_lock();
 	for_each_peer_device_rcu(peer_device, device) {
@@ -8863,20 +8880,27 @@ static void check_resync_source(struct drbd_peer_device *primary_pd, u64 weak_no
 abort:
 	connection = peer_device->connection;
 	drbd_info(peer_device, "My sync source became a weak node, aborting resync!\n");
-	change_repl_state(peer_device, L_ESTABLISHED, CS_VERBOSE, "abort-resync");
+	if (change_repl_state(peer_device, L_ESTABLISHED, CS_VERBOSE, "abort-resync") < SS_SUCCESS)
+		return;
 	drbd_flush_workqueue(&connection->sender_work);
 	drbd_cancel_conflicting_resync_requests(peer_device);
 
-	wait_event_interruptible(connection->ee_wait,
-				 peer_device->repl_state[NOW] <= L_ESTABLISHED ||
-				 atomic_read(&connection->backing_ee_cnt) == 0);
-	wait_event_interruptible(device->misc_wait,
-				 peer_device->repl_state[NOW] <= L_ESTABLISHED ||
-				 atomic_read(&peer_device->rs_pending_cnt) == 0);
+	/* Wait for the replies still in flight, then for their writes. */
+	err = wait_event_interruptible(device->misc_wait,
+				       peer_device->repl_state[NOW] < L_ESTABLISHED ||
+				       atomic_read(&peer_device->rs_pending_cnt) == 0);
+	if (!err)
+		err = wait_event_interruptible(connection->ee_wait,
+					       peer_device->repl_state[NOW] < L_ESTABLISHED ||
+					       atomic_read(&connection->backing_ee_cnt) == 0);
 
 	peer_device->rs_total  = 0;
 	peer_device->rs_failed = 0;
 	peer_device->rs_paused = 0;
+
+	/* Interrupted, resync replies from the weak source may still arrive. */
+	if (err)
+		return;
 
 	resync_from_primary_after_abort(primary_pd, peer_device);
 }
@@ -11548,6 +11572,29 @@ out:
 	return 0;
 }
 
+/* Whether any of our peer slots holds the UUID. Unlike
+ * drbd_find_bitmap_by_uuid() this is a local question, so it looks at every
+ * slot, not only at those the peer knows about.
+ */
+static bool uuid_in_my_bitmap_slots(struct drbd_peer_device *peer_device, u64 uuid)
+{
+	struct drbd_device *device = peer_device->device;
+	struct drbd_peer_md *peer_md = device->ldev->md.peers;
+	int i;
+
+	for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
+		if (i == device->ldev->md.node_id)
+			continue;
+		if (peer_device->connection->agreed_pro_version < 116 &&
+		    peer_md[i].bitmap_index == -1)
+			continue;
+		if ((peer_md[i].bitmap_uuid & ~UUID_PRIMARY) == uuid)
+			return true;
+	}
+
+	return false;
+}
+
 static bool drbd_diskless_moved_on(struct drbd_peer_device *peer_device, u64 current_uuid)
 {
 	struct drbd_device *device = peer_device->device;
@@ -11568,7 +11615,7 @@ static bool drbd_diskless_moved_on(struct drbd_peer_device *peer_device, u64 cur
 
 	if (get_ldev(device)) {
 		from_the_past =
-			drbd_find_bitmap_by_uuid(peer_device, current_uuid & ~UUID_PRIMARY) != -1;
+			uuid_in_my_bitmap_slots(peer_device, current_uuid & ~UUID_PRIMARY);
 		if (!from_the_past)
 			from_the_past = uuid_in_my_history(device, current_uuid & ~UUID_PRIMARY);
 		put_ldev(device);

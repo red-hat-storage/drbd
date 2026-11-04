@@ -2671,20 +2671,11 @@ allocate_bitmap_index(struct drbd_peer_device *peer_device,
 	return 0;
 }
 
-static struct drbd_peer_md *day0_peer_md(struct drbd_device *device)
+static struct drbd_peer_md *day0_peer_md(struct drbd_device *device, int exclude)
 {
-	const int my_node_id = device->resource->res_opts.node_id;
-	struct drbd_peer_md *peer_md = device->ldev->md.peers;
-	int node_id;
+	int node_id = drbd_day0_node_id(&device->ldev->md, exclude);
 
-	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
-		if (node_id == my_node_id)
-			continue;
-		/* Only totally unused slots definitely contain the day0 UUID. */
-		if (peer_md[node_id].bitmap_index == -1 && !peer_md[node_id].flags)
-			return &peer_md[node_id];
-	}
-	return NULL;
+	return node_id == -1 ? NULL : &device->ldev->md.peers[node_id];
 }
 
 /* Clear the flags in "mask", one bit at a time, so that a concurrent set_bit()
@@ -2737,7 +2728,7 @@ static int clear_peer_slot(struct drbd_device *device, int peer_node_id, u32 md_
 		goto out_no_buffer;
 
 	/* Look for day0 UUID before changing this peer slot to a day0 slot. */
-	day0_md = day0_peer_md(device);
+	day0_md = day0_peer_md(device, peer_node_id);
 
 	clear_peer_md_flags(peer_md, ~md_flags | MDF_HAVE_BITMAP);
 	peer_md->bitmap_index = -1;
@@ -3167,6 +3158,58 @@ static void distrust_unsupported_peer_flags(struct drbd_device *device, struct d
 			  "not trusting MDF_PEER_DIVERGENCE_BITMAP of node(s) 0x%llX\n", nodes);
 }
 
+/* A slot without a bitmap needs no divergence flag: is_divergence_bitmap() is
+ * true for it regardless, and a day0 slot must keep flags == 0.
+ */
+static void drop_divergence_flag_without_bitmap(struct drbd_md *md)
+{
+	int i;
+
+	for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
+		struct drbd_peer_md *peer_md = &md->peers[i];
+
+		if (!test_bit(__MDF_HAVE_BITMAP, &peer_md->flags))
+			clear_bit(__MDF_PEER_DIVERGENCE_BITMAP, &peer_md->flags);
+	}
+}
+
+/* Make all non-zero day0 slots agree with the one drbd_day0_node_id() picks,
+ * so that forget-peer cannot copy a disagreeing value into a forgotten slot.
+ *
+ * Slots at 0 are left alone: before the first UUID bump all of them are, and
+ * the bump fills them all with the same UUID.
+ *
+ * A day0 slot has no bitmap of its own, so this changes no bitmap. A returning
+ * node whose current UUID is one of the overwritten values no longer finds it
+ * here; it can still match by our history, otherwise the handshake no longer
+ * relates it.
+ */
+static void repair_day0_slots(struct drbd_device *device, struct drbd_md *md)
+{
+	int day0 = drbd_day0_node_id(md, -1);
+	u64 day0_uuid, nodes = 0;
+	int node_id;
+
+	if (day0 == -1 || !md->peers[day0].bitmap_uuid)
+		return;
+	day0_uuid = md->peers[day0].bitmap_uuid;
+
+	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
+		struct drbd_peer_md *peer_md = &md->peers[node_id];
+
+		if (!drbd_is_day0_slot(md, node_id) || !peer_md->bitmap_uuid ||
+		    (peer_md->bitmap_uuid & ~UUID_PRIMARY) == (day0_uuid & ~UUID_PRIMARY))
+			continue;
+		peer_md->bitmap_uuid = day0_uuid;
+		peer_md->bitmap_dagtag = md->peers[day0].bitmap_dagtag;
+		nodes |= NODE_MASK(node_id);
+	}
+
+	if (nodes)
+		drbd_warn(device, "Unallocated peer slot(s) of node(s) 0x%llX did not hold the day0 UUID %016llX; reset them to it\n",
+			  nodes, (unsigned long long)day0_uuid);
+}
+
 static void decode_magic(struct meta_data_on_disk_9 *on_disk, u32 *magic, u32 *flags)
 {
 	/* magic and flags are in at the same offsets in 8.4 and 9 */
@@ -3210,6 +3253,8 @@ int drbd_md_decode(struct drbd_adm_ctx *adm_ctx,
 		clear_bit(LEGACY_84_MD, &device->flags);
 		decode_md_9(buffer, &bdev->md);
 		distrust_unsupported_peer_flags(device, &bdev->md);
+		drop_divergence_flag_without_bitmap(&bdev->md);
+		repair_day0_slots(device, &bdev->md);
 	} else {
 		if (!device->resource->res_opts.drbd8_compat_mode) {
 			drbd_err_and_skb_info(adm_ctx,
