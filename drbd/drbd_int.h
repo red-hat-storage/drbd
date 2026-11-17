@@ -598,6 +598,11 @@ enum {
 	 * backing device already holds its share of resync work.
 	 */
 	__EE_RS_DEPTH_PARKED,
+
+	/* SyncSource: a resync read from submission or parking until its
+	 * reply is sent, counted in rs_read_sect_held.
+	 */
+	__EE_RS_READ_HELD,
 };
 #define EE_MAY_SET_IN_SYNC     (1<<__EE_MAY_SET_IN_SYNC)
 #define EE_SET_OUT_OF_SYNC     (1<<__EE_SET_OUT_OF_SYNC)
@@ -614,6 +619,7 @@ enum {
 #define EE_IN_ACTLOG		(1<<__EE_IN_ACTLOG)
 #define EE_LAST_RESYNC_REQUEST	(1<<__EE_LAST_RESYNC_REQUEST)
 #define EE_RS_DEPTH_PARKED	(1<<__EE_RS_DEPTH_PARKED)
+#define EE_RS_READ_HELD		(1<<__EE_RS_READ_HELD)
 #define EE_ON_RECV_ORDER	(1<<__EE_ON_RECV_ORDER)
 #define EE_ON_SEND_OOS		(1<<__EE_ON_SEND_OOS)
 #define EE_WAIT_FOR_SOURCE	(1<<__EE_WAIT_FOR_SOURCE)
@@ -674,7 +680,7 @@ enum device_flag {
  */
 enum drbd_gen_obl_state {
 	GEN_OBL_NONE,		/* no obligation, writes admitted */
-	GEN_OBL_ARMED,		/* obligation outstanding, writes not admitted */
+	GEN_OBL_ARMED,		/* obligation outstanding, writes held back */
 	GEN_OBL_MINTING,	/* the new generation is being made right now */
 	GEN_OBL_UNCONFIRMED,	/* diskless: the new generation is exposed and
 				 * queued in order on every established channel,
@@ -795,6 +801,9 @@ enum peer_device_flag {
 	BITMAP_HELD_AT_PRIMARY_LOSS, /* had bits before the last lost primary */
 	UNSTABLE_RESYNC,	/* Sync source went unstable during resync. */
 	PEER_UPGRADE_PREDICTED,	/* Recorded the peer UpToDate before its P_STATE */
+	SEND_UUIDS_PEER_ATTACH,	/* Peer attached: receiver or worker, whichever is
+				 * first, sends P_UUIDS and P_STATE before we decide
+				 */
 	SEND_STATE_AFTER_AHEAD,
 	GOT_NEG_ACK,		/* got a neg_ack while primary, wait until peer_disk is lower than
 				   D_UP_TO_DATE before becoming secondary! */
@@ -1021,7 +1030,7 @@ struct drbd_backing_dev {
 	struct drbd_md md;
 	struct drbd_disk_conf __rcu *disk_conf; /* RCU, for updates: resource->conf_update */
 	sector_t known_size; /* last known size of that backing device */
-#if IS_ENABLED(CONFIG_DEV_DAX_PMEM)
+#if IS_ENABLED(CONFIG_DRBD_DAX)
 	struct dax_device *dax_dev;
 	struct meta_data_on_disk_9 *md_on_pmem; /* address of md_offset */
 	struct al_on_pmem *al_on_pmem;
@@ -1073,6 +1082,8 @@ enum connection_flag {
 	CONN_DRY_RUN,		/* Expect disconnect after resync handshake. */
 	CONN_DRY_RUN_LOCAL,	/* This node asked for the dry run. */
 	DISCONNECT_EXPECTED,
+	WAIT_FOR_PEER_CLOSE,	/* We sent the peer a disconnect it has yet to process. */
+	ABORT_DRAIN,		/* Stop waiting for the peer to close, see drbd_transport_drain() */
 	CORKED,
 	DATA_CORKED = CORKED,	/* used as computed value CORKED + DATA_STREAM */
 	CONTROL_CORKED,		/* used as computed value CORKED + CONTROL_STREAM */
@@ -1759,6 +1770,10 @@ struct drbd_peer_device {
 	 * bound: no longer in flight, not yet submitted.
 	 */
 	atomic_t rs_sect_parked;
+	/* SyncSource: resync reads submitted or parked and not yet answered.
+	 * The receiver limits them to max-buffers.
+	 */
+	atomic_t rs_read_sect_held;
 	int rs_last_events;  /* counter of read or write "events" (unit sectors)
 			      * on the lower level device when we last looked. */
 	int rs_in_flight; /* resync sectors in flight (to proxy, in proxy and from proxy) */
@@ -1780,7 +1795,10 @@ struct drbd_peer_device {
 	unsigned long comm_bm_set; /* communicated number of set bits. */
 	u64 comm_current_uuid; /* communicated current UUID */
 	u64 comm_uuid_flags; /* communicated UUID flags */
+	/* Held across clearing SEND_UUIDS_PEER_ATTACH and the sends it calls for */
+	struct mutex peer_attach_send_mutex;
 	u64 comm_bitmap_uuid;
+	int comm_day0_node_id; /* communicated day0 slot, or -1 */
 	union drbd_state comm_state;
 
 #ifdef CONFIG_DEBUG_FS
@@ -2187,6 +2205,7 @@ enum dds_flags {
 	DDSF_NO_RESYNC = 2, /* Do not run a resync for the new space */
 	DDSF_IGNORE_PEER_CONSTRAINTS = 4, /* no longer used */
 	DDSF_2PC = 8, /* local only, not on the wire */
+	DDSF_NO_IO_DRAIN = 16, /* local only: the caller is a receiver */
 };
 struct meta_data_on_disk_9;
 
@@ -2219,6 +2238,7 @@ int conn_send_state(struct drbd_connection *connection,
 int drbd_send_state(struct drbd_peer_device *peer_device,
 		    union drbd_state state);
 int drbd_send_current_state(struct drbd_peer_device *peer_device);
+void drbd_send_uuids_peer_attach(struct drbd_peer_device *peer_device);
 int drbd_send_sync_param(struct drbd_peer_device *peer_device);
 int drbd_send_out_of_sync(struct drbd_peer_device *peer_device,
 			  sector_t sector, unsigned int size);
@@ -2281,10 +2301,11 @@ void drbd_uuid_new_current_by_user(struct drbd_device *device);
 void _drbd_uuid_push_history(struct drbd_device *device, u64 val);
 u64 _drbd_uuid_pull_history(struct drbd_peer_device *peer_device);
 void drbd_set_peer_bitmap_uuid(struct drbd_peer_md *peer_md, u64 bitmap_uuid, u64 dagtag);
+int drbd_day0_node_id(struct drbd_md *md, int exclude);
 void drbd_uuid_resync_starting(struct drbd_peer_device *peer_device);
 void drbd_uuid_resync_starting_source(struct drbd_peer_device *peer_device);
 u64 drbd_uuid_resync_finished(struct drbd_peer_device *peer_device);
-void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device);
+int drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device);
 bool drbd_uuid_set_exposed(struct drbd_device *device, u64 val, bool log);
 u64 drbd_weak_nodes_device(struct drbd_device *device);
 bool drbd_uuid_is_day0(struct drbd_device *device);
@@ -2662,6 +2683,8 @@ struct drbd_connection *drbd_create_connection(struct drbd_resource *resource,
 					       struct drbd_transport_class *tc);
 void drbd_transport_shutdown(struct drbd_connection *connection,
 			     enum drbd_tr_free_op op);
+void drbd_transport_drain(struct drbd_connection *connection);
+void drbd_transport_abort_drain(struct drbd_connection *connection);
 void drbd_destroy_connection(struct kref *kref);
 void conn_free_crypto(struct drbd_connection *connection);
 
@@ -2692,6 +2715,7 @@ enum suspend_scope {
 };
 void __drbd_suspend_io(struct drbd_device *device);
 void drbd_suspend_io(struct drbd_device *device, enum suspend_scope ss);
+int drbd_suspend_io_receiver(struct drbd_peer_device *peer_device);
 bool drbd_wait_io_drained(struct drbd_device *device, enum suspend_scope ss, long timeout);
 /* in drbd_state.c */
 void twopc_suspend_io(struct drbd_device *device);
@@ -3192,6 +3216,7 @@ int send_command(struct drbd_connection *connection, int vnr,
 int drbd_send_command(struct drbd_peer_device *peer_device,
 		      enum drbd_packet cmd, enum drbd_stream drbd_stream);
 
+int drbd_send_disconnect(struct drbd_connection *connection);
 int drbd_send_ping(struct drbd_connection *connection);
 int conn_send_state_req(struct drbd_connection *connection, int vnr,
 			enum drbd_packet cmd, union drbd_state mask,
@@ -3271,7 +3296,11 @@ static inline void inc_rs_pending(struct drbd_peer_device *peer_device)
 	((void)expect((peer_device), __dec_rs_pending(peer_device) >= 0))
 static inline int __dec_rs_pending(struct drbd_peer_device *peer_device)
 {
-	return atomic_dec_return(&peer_device->rs_pending_cnt);
+	int rs_pending_cnt = atomic_dec_return(&peer_device->rs_pending_cnt);
+
+	if (rs_pending_cnt == 0)
+		wake_up(&peer_device->device->misc_wait);
+	return rs_pending_cnt;
 }
 
 /* counts how many answers we still need to send to the peer.
@@ -3286,6 +3315,12 @@ static inline int __dec_rs_pending(struct drbd_peer_device *peer_device)
 static inline void inc_unacked(struct drbd_peer_device *peer_device)
 {
 	atomic_inc(&peer_device->unacked_cnt);
+}
+
+static inline void drbd_rs_read_unhold(struct drbd_peer_device *peer_device, unsigned int size)
+{
+	atomic_sub(size >> 9, &peer_device->rs_read_sect_held);
+	wake_up(&peer_device->connection->ee_wait);
 }
 
 #define dec_unacked(peer_device) \
@@ -3309,6 +3344,15 @@ static inline bool repl_is_sync(enum drbd_repl_state repl_state)
 {
 	return repl_is_sync_source(repl_state) ||
 		repl_is_sync_target(repl_state);
+}
+
+/* Only the side that sends the requests takes a max_parallel_resyncs slot.
+ * A SyncSource answers what its target asks for, and the target's node
+ * counts and pauses it.
+ */
+static inline bool repl_holds_resync_slot(enum drbd_repl_state repl_state)
+{
+	return repl_state == L_SYNC_TARGET || repl_state == L_VERIFY_S;
 }
 
 static inline bool is_sync_target_state(struct drbd_peer_device *peer_device,
@@ -3361,7 +3405,6 @@ drbd_insert_fault_conn(struct drbd_connection *connection, unsigned int type) {
 /**
  * get_ldev() - Increase the ref count on device->ldev. Returns 0 if there is no ldev
  * @_device:		DRBD device.
- * @_min_state:		Minimum device state required for success.
  *
  * You have to call put_ldev() when finished working with device->ldev.
  */
@@ -3549,6 +3592,17 @@ static inline bool is_divergence_bitmap(struct drbd_peer_md *peer_md)
 {
 	return !test_bit(__MDF_HAVE_BITMAP, &peer_md->flags) ||
 		test_bit(__MDF_PEER_DIVERGENCE_BITMAP, &peer_md->flags);
+}
+
+/* A day0 slot: a totally unused peer slot, without a bitmap of its own and
+ * without flags.
+ */
+static inline bool drbd_is_day0_slot(struct drbd_md *md, int node_id)
+{
+	struct drbd_peer_md *peer_md = &md->peers[node_id];
+
+	return node_id != md->node_id && peer_md->bitmap_index == -1 &&
+		!peer_md->flags;
 }
 
 static inline u64 drbd_history_uuid(struct drbd_device *device, int i)
