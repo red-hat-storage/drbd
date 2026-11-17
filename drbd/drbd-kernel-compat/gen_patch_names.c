@@ -423,6 +423,9 @@ int main(int argc, char **argv)
 	patch(1, "blkdev_issue_discard", false, true,
 	      COMPAT_BLKDEV_ISSUE_DISCARD_TAKES_FLAGS, "takes_flags");
 
+	patch(1, "bdev_end_io_acct", true, false,
+	      COMPAT_BDEV_END_IO_ACCT_TAKES_SECTORS, "takes_sectors");
+
 	patch(1, "drbd_wrappers", false, true,
 	      COMPAT_NEED_DRBD_WRAPPERS, "need");
 
@@ -511,6 +514,12 @@ int main(int argc, char **argv)
 
 	patch(1, "linux_unaligned_h", true, false,
 		COMPAT_HAVE_LINUX_UNALIGNED_H, "present");
+
+	patch(1, "linux_umh_h", true, false,
+	      COMPAT_HAVE_LINUX_UMH_H, "present");
+
+	patch(1, "sk_set_nospace", true, false,
+	      COMPAT_HAVE_SK_SET_NOSPACE, "present");
 
 	patch(1, "genlmsg_multicast_allns", true, false,
 	      COMPAT_GENLMSG_MULTICAST_ALLNS_HAS_4_PARAMS, "has_4_params");

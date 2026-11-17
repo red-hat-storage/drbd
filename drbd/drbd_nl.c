@@ -9,6 +9,7 @@
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 
 #include <linux/module.h>
+#include <linux/umh.h>
 #include <linux/drbd.h>
 #include <linux/in.h>
 #include <linux/fs.h>
@@ -1373,11 +1374,8 @@ char *ppsize(char *buf, unsigned long long size)
 	return buf;
 }
 
-/* The receiver may call drbd_suspend_io(device, WRITE_ONLY).
- * It should not call drbd_suspend_io(device, READ_AND_WRITE) since
- * if the node is an D_INCONSISTENT R_PRIMARY (L_SYNC_TARGET) it
- * may need to issue remote READs. Those is turn need the receiver
- * to complete. -> calling drbd_suspend_io(device, READ_AND_WRITE) deadlocks.
+/* Not for the receiver: a write it waits for may complete only in its own
+ * conn_disconnect(). The receiver uses drbd_suspend_io_receiver().
  */
 /* Note these are not to be confused with
  * drbd_nl_suspend_io_doit/drbd_nl_resume_io_doit,
@@ -1410,6 +1408,30 @@ void drbd_suspend_io(struct drbd_device *device, enum suspend_scope ss)
 {
 	__drbd_suspend_io(device);
 	wait_event(device->misc_wait, ap_bio_drained(device, ss));
+}
+
+/* Returns -ECONNABORTED, with the suspension released, once the receiver's
+ * connection goes down: only that receiver can then complete the writes.
+ */
+int drbd_suspend_io_receiver(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+	struct drbd_connection *connection = peer_device->connection;
+	bool drained;
+
+	__drbd_suspend_io(device);
+	/* Do not test ap_bio_drained() again after the wait: a writer that
+	 * raced with the suspend raises ap_bio_cnt briefly before it rolls back.
+	 */
+	wait_event(device->misc_wait,
+		   (drained = ap_bio_drained(device, WRITE_ONLY)) ||
+		   READ_ONCE(connection->cstate[NOW]) < C_CONNECTING);
+	if (drained)
+		return 0;
+
+	drbd_resume_io(device);
+	drbd_warn(peer_device, "Connection lost while waiting for application writes\n");
+	return -ECONNABORTED;
 }
 
 /* For a suspend taken with __drbd_suspend_io(); the caller still owns it
@@ -1518,7 +1540,12 @@ drbd_determine_dev_size(struct drbd_device *device, sector_t peer_current_size,
 	 * Move is not exactly correct, btw, currently we have all our meta
 	 * data in core memory, to "move" it we just write it all out, there
 	 * are no reads. */
-	drbd_suspend_io(device, READ_AND_WRITE);
+	__drbd_suspend_io(device);
+	/* A receiver completes requests pending on its peer, so it must not wait for
+	 * them. The resize 2PC already waited, bounded, for I/O to drain.
+	 */
+	if (!(flags & DDSF_NO_IO_DRAIN) && !test_bit(TWOPC_IO_SUSPENDED, &device->flags))
+		wait_event(device->misc_wait, ap_bio_drained(device, READ_AND_WRITE));
 
 	/* Take the AL transaction lock before the md_buffer to avoid an
 	 * AB-BA deadlock against al_write_transaction().
@@ -2671,20 +2698,11 @@ allocate_bitmap_index(struct drbd_peer_device *peer_device,
 	return 0;
 }
 
-static struct drbd_peer_md *day0_peer_md(struct drbd_device *device)
+static struct drbd_peer_md *day0_peer_md(struct drbd_device *device, int exclude)
 {
-	const int my_node_id = device->resource->res_opts.node_id;
-	struct drbd_peer_md *peer_md = device->ldev->md.peers;
-	int node_id;
+	int node_id = drbd_day0_node_id(&device->ldev->md, exclude);
 
-	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
-		if (node_id == my_node_id)
-			continue;
-		/* Only totally unused slots definitely contain the day0 UUID. */
-		if (peer_md[node_id].bitmap_index == -1 && !peer_md[node_id].flags)
-			return &peer_md[node_id];
-	}
-	return NULL;
+	return node_id == -1 ? NULL : &device->ldev->md.peers[node_id];
 }
 
 /* Clear the flags in "mask", one bit at a time, so that a concurrent set_bit()
@@ -2737,7 +2755,7 @@ static int clear_peer_slot(struct drbd_device *device, int peer_node_id, u32 md_
 		goto out_no_buffer;
 
 	/* Look for day0 UUID before changing this peer slot to a day0 slot. */
-	day0_md = day0_peer_md(device);
+	day0_md = day0_peer_md(device, peer_node_id);
 
 	clear_peer_md_flags(peer_md, ~md_flags | MDF_HAVE_BITMAP);
 	peer_md->bitmap_index = -1;
@@ -3167,6 +3185,58 @@ static void distrust_unsupported_peer_flags(struct drbd_device *device, struct d
 			  "not trusting MDF_PEER_DIVERGENCE_BITMAP of node(s) 0x%llX\n", nodes);
 }
 
+/* A slot without a bitmap needs no divergence flag: is_divergence_bitmap() is
+ * true for it regardless, and a day0 slot must keep flags == 0.
+ */
+static void drop_divergence_flag_without_bitmap(struct drbd_md *md)
+{
+	int i;
+
+	for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
+		struct drbd_peer_md *peer_md = &md->peers[i];
+
+		if (!test_bit(__MDF_HAVE_BITMAP, &peer_md->flags))
+			clear_bit(__MDF_PEER_DIVERGENCE_BITMAP, &peer_md->flags);
+	}
+}
+
+/* Make all non-zero day0 slots agree with the one drbd_day0_node_id() picks,
+ * so that forget-peer cannot copy a disagreeing value into a forgotten slot.
+ *
+ * Slots at 0 are left alone: before the first UUID bump all of them are, and
+ * the bump fills them all with the same UUID.
+ *
+ * A day0 slot has no bitmap of its own, so this changes no bitmap. A returning
+ * node whose current UUID is one of the overwritten values no longer finds it
+ * here; it can still match by our history, otherwise the handshake no longer
+ * relates it.
+ */
+static void repair_day0_slots(struct drbd_device *device, struct drbd_md *md)
+{
+	int day0 = drbd_day0_node_id(md, -1);
+	u64 day0_uuid, nodes = 0;
+	int node_id;
+
+	if (day0 == -1 || !md->peers[day0].bitmap_uuid)
+		return;
+	day0_uuid = md->peers[day0].bitmap_uuid;
+
+	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
+		struct drbd_peer_md *peer_md = &md->peers[node_id];
+
+		if (!drbd_is_day0_slot(md, node_id) || !peer_md->bitmap_uuid ||
+		    (peer_md->bitmap_uuid & ~UUID_PRIMARY) == (day0_uuid & ~UUID_PRIMARY))
+			continue;
+		peer_md->bitmap_uuid = day0_uuid;
+		peer_md->bitmap_dagtag = md->peers[day0].bitmap_dagtag;
+		nodes |= NODE_MASK(node_id);
+	}
+
+	if (nodes)
+		drbd_warn(device, "Unallocated peer slot(s) of node(s) 0x%llX did not hold the day0 UUID %016llX; reset them to it\n",
+			  nodes, (unsigned long long)day0_uuid);
+}
+
 static void decode_magic(struct meta_data_on_disk_9 *on_disk, u32 *magic, u32 *flags)
 {
 	/* magic and flags are in at the same offsets in 8.4 and 9 */
@@ -3210,6 +3280,8 @@ int drbd_md_decode(struct drbd_adm_ctx *adm_ctx,
 		clear_bit(LEGACY_84_MD, &device->flags);
 		decode_md_9(buffer, &bdev->md);
 		distrust_unsupported_peer_flags(device, &bdev->md);
+		drop_divergence_flag_without_bitmap(&bdev->md);
+		repair_day0_slots(device, &bdev->md);
 	} else {
 		if (!device->resource->res_opts.drbd8_compat_mode) {
 			drbd_err_and_skb_info(adm_ctx,
@@ -5458,6 +5530,10 @@ static enum drbd_state_rv conn_try_disconnect(struct drbd_connection *connection
 	int retries = 0;
 	long t;
 
+	/* A graceful disconnect before may still wait for the peer to close */
+	if (force)
+		drbd_transport_abort_drain(connection);
+
 repeat:
 	rv = change_cstate_tag(connection, C_DISCONNECTING, flags, tag, &err_str);
 	switch (rv) {
@@ -5488,6 +5564,16 @@ repeat:
 						     HZ);
 		if (t <= 0)
 			break;
+		goto repeat;
+	case SS_IN_TRANSIENT_STATE:
+		/* The peer applied our disconnect and closed before our local commit;
+		 * repeat once the receiver has left C_UNCONNECTED.
+		 */
+		if (++retries > DISCONNECT_RETRIES)
+			break;
+		wait_event_interruptible_timeout(resource->state_wait,
+						 connection->cstate[NOW] != C_UNCONNECTED,
+						 HZ);
 		goto repeat;
 	case SS_ALREADY_STANDALONE:
 		rv = SS_SUCCESS;
@@ -6397,8 +6483,9 @@ int drbd_adm_suspend_io(struct drbd_adm_ctx *adm_ctx)
 	if (adm_ctx->d->has_set(adm_ctx, DRBD_NL_SET_SUSPEND_IO_PARMS)) {
 		err = drbd_adm_overlay_suspend_io_parms(adm_ctx, &params);
 		if (err) {
+			retcode = ERR_MANDATORY_TAG;
 			drbd_adm_msg_overlay_error(adm_ctx, err);
-			return err;
+			goto out;
 		}
 	}
 
@@ -6674,8 +6761,9 @@ int drbd_adm_cbt_start(struct drbd_adm_ctx *adm_ctx)
 
 	err = drbd_adm_overlay_cbt_start_parms(adm_ctx, &parms);
 	if (err) {
+		retcode = ERR_MANDATORY_TAG;
 		drbd_adm_msg_overlay_error(adm_ctx, err);
-		return err;
+		goto out;
 	}
 
 	if (mutex_lock_interruptible(&adm_ctx->resource->adm_mutex)) {

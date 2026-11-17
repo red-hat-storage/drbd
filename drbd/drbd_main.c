@@ -958,6 +958,7 @@ static void cancel_send_buffer(struct drbd_connection *connection,
 		enum drbd_stream drbd_stream)
 {
 	connection->send_buffer[drbd_stream].allocated_size = 0;
+	connection->send_buffer[drbd_stream].additional_size = 0;
 }
 
 /* Only used the shrink the previously allocated size. */
@@ -1121,8 +1122,10 @@ int __send_command(struct drbd_connection *connection, int vnr,
 	bool flush = stream_and_flags & SFLAG_FLUSH;
 	int err;
 
-	if (connection->cstate[NOW] < C_CONNECTING)
+	if (connection->cstate[NOW] < C_CONNECTING) {
+		cancel_send_buffer(connection, drbd_stream);
 		return -EIO;
+	}
 	prepare_header(connection, vnr, sbuf->pos, cmd,
 		       sbuf->allocated_size + sbuf->additional_size);
 
@@ -1203,6 +1206,16 @@ int drbd_send_command(struct drbd_peer_device *peer_device,
 {
 	return send_command(peer_device->connection, peer_device->device->vnr,
 			    cmd, drbd_stream);
+}
+
+int drbd_send_disconnect(struct drbd_connection *connection)
+{
+	if (connection->agreed_pro_version < 118)
+		return 0;
+
+	if (!conn_prepare_command(connection, 0, DATA_STREAM))
+		return -EIO;
+	return send_command(connection, -1, P_DISCONNECT, DATA_STREAM | SFLAG_FLUSH);
 }
 
 int drbd_send_ping(struct drbd_connection *connection)
@@ -1530,18 +1543,18 @@ u64 drbd_resolved_uuid(struct drbd_peer_device *peer_device_base, u64 *uuid_flag
 static int _drbd_send_uuids110(struct drbd_peer_device *peer_device, u64 uuid_flags, u64 node_mask)
 {
 	struct drbd_device *device = peer_device->device;
-	const int my_node_id = device->resource->res_opts.node_id;
 	struct drbd_peer_md *peer_md;
 	struct p_uuids110 *p;
-	bool sent_one_unallocated;
-	int i, pos = 0;
+	int i, pos = 0, day0 = -1, sent_day0 = -1;
 	u64 local_uuid_flags = 0, authoritative_mask, bitmap_uuids_mask = 0;
 	int p_size = sizeof(*p);
 
-	if (!get_ldev_if_state(device, D_NEGOTIATING))
+	if (!get_ldev_if_state(device, D_NEGOTIATING)) {
+		WRITE_ONCE(peer_device->comm_day0_node_id, -1);
 		return drbd_send_current_uuid(peer_device,
 					      diskless_primary_present_current_uuid(peer_device),
 					      drbd_weak_nodes_device(device));
+	}
 
 	peer_md = device->ldev->md.peers;
 
@@ -1556,18 +1569,19 @@ static int _drbd_send_uuids110(struct drbd_peer_device *peer_device, u64 uuid_fl
 	peer_device->comm_current_uuid = drbd_resolved_uuid(peer_device, &local_uuid_flags);
 	p->current_uuid = cpu_to_be64(peer_device->comm_current_uuid);
 
-	/* advertise an unallocated day0 bitmap slot only if we actually have one */
-	sent_one_unallocated = peer_device->connection->agreed_pro_version < 116 ||
-		drbd_unallocated_index(device->ldev) == -1;
+	/* Advertise an unallocated day0 bitmap slot only if we actually have
+	 * one. drbd_find_bitmap_by_uuid() considers only the one we sent.
+	 */
+	if (peer_device->connection->agreed_pro_version >= 116 &&
+	    drbd_unallocated_index(device->ldev) != -1)
+		day0 = drbd_day0_node_id(&device->ldev->md, peer_device->node_id);
 	for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
 		u64 val = __bitmap_uuid(device, i);
 		bool send_this = test_bit(__MDF_HAVE_BITMAP, &peer_md[i].flags) ||
 			test_bit(__MDF_NODE_EXISTS, &peer_md[i].flags);
-
-		if (!send_this && !sent_one_unallocated &&
-		    i != my_node_id && i != peer_device->node_id && val) {
+		if (i == day0 && val) {
 			send_this = true;
-			sent_one_unallocated = true;
+			sent_day0 = i;
 			uuid_flags |= (u64)i << UUID_FLAG_UNALLOC_SHIFT;
 			uuid_flags |= UUID_FLAG_HAS_UNALLOC;
 		}
@@ -1576,6 +1590,7 @@ static int _drbd_send_uuids110(struct drbd_peer_device *peer_device, u64 uuid_fl
 			p->other_uuids[pos++] = cpu_to_be64(val);
 		}
 	}
+	WRITE_ONCE(peer_device->comm_day0_node_id, sent_day0);
 	peer_device->comm_bitmap_uuid = drbd_bitmap_uuid(peer_device);
 
 	for (i = 0; i < HISTORY_UUIDS; i++)
@@ -1796,6 +1811,31 @@ int drbd_send_state(struct drbd_peer_device *peer_device, union drbd_state state
 {
 	peer_device->comm_state = state;
 	return send_state(peer_device->connection, peer_device->device->vnr, state);
+}
+
+/**
+ * drbd_send_uuids_peer_attach() - Send P_UUIDS and P_STATE for a peer attach
+ * @peer_device: Peer DRBD device that attached.
+ *
+ * The worker and the receiver both call this; whichever clears
+ * SEND_UUIDS_PEER_ATTACH first does the sending. The mutex covers the
+ * clear and the sends, so when this returns, P_UUIDS has been sent and
+ * comm_bm_set and comm_uuid_flags hold what the peer decides on, no
+ * matter which thread sent them.
+ *
+ * The state is read after the flag is cleared, so it includes the state
+ * change that set the flag. A worker item queued for an earlier attach
+ * that clears the flag of a later one therefore sends a state that
+ * matches the later attach, not its own stale one.
+ */
+void drbd_send_uuids_peer_attach(struct drbd_peer_device *peer_device)
+{
+	mutex_lock(&peer_device->peer_attach_send_mutex);
+	if (test_and_clear_bit(SEND_UUIDS_PEER_ATTACH, peer_device->flags)) {
+		drbd_send_uuids(peer_device, 0, 0);
+		drbd_send_current_state(peer_device);
+	}
+	mutex_unlock(&peer_device->peer_attach_send_mutex);
 }
 
 int conn_send_state_req(struct drbd_connection *connection, int vnr, enum drbd_packet cmd,
@@ -2811,14 +2851,14 @@ static int try_to_promote(struct drbd_device *device, long timeout, bool ndelay)
 				timeout);
 			if (t <= 0)
 				break;
-			timeout -= t;
+			timeout = t;
 		} else if (rv == SS_NO_UP_TO_DATE_DISK && connection_state_may_improve_soon(resource)) {
 			/* Wait until we get a connection established */
 			t = wait_event_interruptible_timeout(resource->state_wait,
 				any_disk_is_uptodate(device), timeout);
 			if (t <= 0)
 				break;
-			timeout -= t;
+			timeout = t;
 		} else {
 			break;
 		}
@@ -4134,6 +4174,12 @@ void drbd_transport_shutdown(struct drbd_connection *connection, enum drbd_tr_fr
 	mutex_lock(&connection->mutex[DATA_STREAM]);
 	mutex_lock(&connection->mutex[CONTROL_STREAM]);
 
+	/* With both stream mutexes held, a prepared packet was abandoned:
+	 * its header was never written, so it must not reach the wire.
+	 */
+	cancel_send_buffer(connection, DATA_STREAM);
+	cancel_send_buffer(connection, CONTROL_STREAM);
+
 	/* Ignore send errors, if any: we are shutting down. */
 	flush_send_buffer(connection, DATA_STREAM);
 	flush_send_buffer(connection, CONTROL_STREAM);
@@ -4150,6 +4196,72 @@ void drbd_transport_shutdown(struct drbd_connection *connection, enum drbd_tr_fr
 
 	mutex_unlock(&connection->mutex[CONTROL_STREAM]);
 	mutex_unlock(&connection->mutex[DATA_STREAM]);
+}
+
+/**
+ * drbd_transport_drain() - Discard received data until the peer closes the connection
+ * @connection: The connection we sent a disconnect (P_TWOPC_COMMIT or P_DISCONNECT)
+ *
+ * Closing a TCP socket with unread data in its receive queue resets the
+ * connection. The peer, that has yet to process our disconnect, may then fail
+ * a send and see a network failure instead of the disconnect. Keep the
+ * sockets open until the peer has processed the disconnect and closed them,
+ * at most for the ping timeout, or until drbd_transport_abort_drain().
+ */
+void drbd_transport_drain(struct drbd_connection *connection)
+{
+	struct drbd_transport *transport = &connection->transport;
+	struct drbd_transport_ops *tr_ops = &transport->class->ops;
+	unsigned long deadline;
+	struct drbd_net_conf *nc;
+	long timeout = 0;
+	void *buf;
+	int rv;
+
+	if (!transport->class->drain_before_close)
+		return;
+
+	rcu_read_lock();
+	nc = rcu_dereference(transport->net_conf);
+	if (nc)
+		timeout = nc->ping_timeo * HZ / 10;
+	rcu_read_unlock();
+	if (!timeout)
+		return;
+
+	deadline = jiffies + timeout;
+	while (time_before(jiffies, deadline)) {
+		/* Signals from stopping the receiver are expected here; only
+		 * drbd_transport_abort_drain() ends the wait early.
+		 */
+		flush_signals(current);
+		if (test_bit(ABORT_DRAIN, &connection->flags)) {
+			drbd_info(connection, "Stopped waiting for the peer to close\n");
+			return;
+		}
+		tr_ops->set_rcvtimeo(transport, DATA_STREAM, max_t(long, deadline - jiffies, 1));
+		rv = tr_ops->recv(transport, DATA_STREAM, &buf, DRBD_SOCKET_BUFFER_SIZE, 0);
+		if (rv == 0)
+			return;
+		if (rv < 0 && rv != -EAGAIN && rv != -EINTR && rv != -ERESTARTSYS)
+			return;
+	}
+	drbd_warn(connection, "Peer did not close the connection in time\n");
+}
+
+void drbd_transport_abort_drain(struct drbd_connection *connection)
+{
+	struct drbd_thread *thi = &connection->receiver;
+	unsigned long flags;
+
+	set_bit(ABORT_DRAIN, &connection->flags);
+	/* Only a disconnecting receiver drains; do not disturb a running one */
+	if (connection->cstate[NOW] != C_DISCONNECTING)
+		return;
+	spin_lock_irqsave(&thi->t_lock, flags);
+	if (thi->task && thi->task != current)
+		send_sig(DRBD_SIGKILL, thi->task, 1);
+	spin_unlock_irqrestore(&thi->t_lock, flags);
 }
 
 void drbd_destroy_path(struct kref *kref)
@@ -4207,6 +4319,7 @@ struct drbd_peer_device *create_peer_device(struct drbd_device *device, struct d
 	peer_device->replication[NOW] = true;
 	peer_device->peer_replication[NOW] = true;
 	spin_lock_init(&peer_device->peer_seq_lock);
+	mutex_init(&peer_device->peer_attach_send_mutex);
 
 	ratelimit_state_init(&peer_device->ratelimit[D_RL_PD_GENERIC], 5*HZ, /* no burst */ 1);
 
@@ -4233,8 +4346,10 @@ struct drbd_peer_device *create_peer_device(struct drbd_device *device, struct d
 
 	atomic_set(&peer_device->rs_sect_in, 0);
 	atomic_set(&peer_device->rs_sect_parked, 0);
+	atomic_set(&peer_device->rs_read_sect_held, 0);
 
 	peer_device->bitmap_index = -1;
+	peer_device->comm_day0_node_id = -1;
 	peer_device->resync_finished_pdsk = D_UNKNOWN;
 
 	peer_device->q_limits.physical_block_size = SECTOR_SIZE;
@@ -5030,6 +5145,54 @@ void drbd_set_peer_bitmap_uuid(struct drbd_peer_md *peer_md, u64 bitmap_uuid, u6
 		clear_bit(__MDF_PEER_DIVERGENCE_BITMAP, &peer_md->flags);
 }
 
+/**
+ * drbd_day0_node_id() - Pick the day0 slot that stands for all of them
+ * @md: the meta data
+ * @exclude: a node id not to pick, or -1
+ *
+ * All day0 slots should hold the same UUID, but meta data can hold day0 slots
+ * that disagree. The sender of our UUIDs advertises only one of them, so the
+ * search for a bitmap to copy and forget-peer must use that same one, or the
+ * two ends of a handshake decide differently.
+ *
+ * When they disagree, take the UUID most of them hold: disagreeing slots belong
+ * to the few node ids that were used and forgotten, while the node ids never
+ * used keep the day0 UUID. Between UUIDs held by equally many slots, take the
+ * one set at the lower dagtag, the older one.
+ *
+ * Returns the node id of a day0 slot holding that UUID, else of one with
+ * bitmap UUID 0, else -1.
+ */
+int drbd_day0_node_id(struct drbd_md *md, int exclude)
+{
+	int node_id, other, best = -1, best_count = 0, unset = -1;
+
+	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
+		u64 uuid = md->peers[node_id].bitmap_uuid & ~UUID_PRIMARY;
+		int count = 0;
+
+		if (node_id == exclude || !drbd_is_day0_slot(md, node_id))
+			continue;
+		if (!uuid) {
+			if (unset == -1)
+				unset = node_id;
+			continue;
+		}
+		for (other = 0; other < DRBD_NODE_ID_MAX; other++) {
+			if (drbd_is_day0_slot(md, other) &&
+			    (md->peers[other].bitmap_uuid & ~UUID_PRIMARY) == uuid)
+				count++;
+		}
+		if (best == -1 || count > best_count ||
+		    (count == best_count &&
+		     md->peers[node_id].bitmap_dagtag < md->peers[best].bitmap_dagtag)) {
+			best = node_id;
+			best_count = count;
+		}
+	}
+	return best != -1 ? best : unset;
+}
+
 void __drbd_uuid_set_bitmap(struct drbd_peer_device *peer_device, u64 val)
 {
 	struct drbd_device *device = peer_device->device;
@@ -5183,8 +5346,14 @@ static u64 rotate_current_into_bitmap(struct drbd_device *device, u64 weak_nodes
 		if (slot_nr == -1) {
 			slot_nr = find_first_zero_bit((unsigned long *)&slot_mask, sizeof(slot_mask) * BITS_PER_BYTE);
 			__set_bit(slot_nr, (unsigned long *)&slot_mask);
+			/* A slot without a bitmap needs no divergence flag, and a
+			 * day0 slot must keep flags == 0.
+			 */
+			peer_md[node_id].bitmap_uuid = prev_c_uuid;
+			peer_md[node_id].bitmap_dagtag = dagtag;
+		} else {
+			drbd_set_peer_bitmap_uuid(&peer_md[node_id], prev_c_uuid, dagtag);
 		}
-		drbd_set_peer_bitmap_uuid(&peer_md[node_id], prev_c_uuid, dagtag);
 		drbd_md_mark_dirty(device);
 		/* count, but only if that bitmap index exists. */
 		if (slot_nr < device->ldev->md.max_peers)
@@ -6039,6 +6208,19 @@ static const char *name_of_node_id(struct drbd_resource *resource, int node_id)
 	return connection ? rcu_dereference(connection->transport.net_conf)->name : "";
 }
 
+/* Drains before any UUID changes, so an abort leaves UUIDs and bits as they were */
+static int suspend_io_uuid_unlocked(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+	int err;
+
+	spin_unlock_irq(&device->ldev->md.uuid_lock);
+	err = drbd_suspend_io_receiver(peer_device);
+	spin_lock_irq(&device->ldev->md.uuid_lock);
+	return err;
+}
+
+/* Called with application writes drained by the caller */
 static void forget_bitmap(struct drbd_device *device, int node_id)
 {
 	int bitmap_index = device->ldev->md.peers[node_id].bitmap_index;
@@ -6053,24 +6235,30 @@ static void forget_bitmap(struct drbd_device *device, int node_id)
 	drbd_info(device, "clearing bitmap UUID and content (%lu bits) for node %d (%s)(slot %d)\n",
 		  _drbd_bm_total_weight(device, bitmap_index), node_id, name, bitmap_index);
 	rcu_read_unlock();
-	drbd_suspend_io(device, WRITE_ONLY);
 	drbd_bm_lock(device, "forget_bitmap()", BM_LOCK_TEST | BM_LOCK_SET);
 	_drbd_bm_clear_many_bits(device, bitmap_index, 0, -1UL);
 	drbd_bm_unlock(device);
-	drbd_resume_io(device);
 	drbd_md_mark_dirty(device);
 	spin_lock_irq(&device->ldev->md.uuid_lock);
 }
 
-static void copy_bitmap(struct drbd_device *device, int from_id, int to_id)
+static int copy_bitmap(struct drbd_peer_device *receiving_pd, int from_id, int to_id)
 {
+	struct drbd_device *device = receiving_pd->device;
 	struct drbd_peer_device *peer_device = peer_device_by_node_id(device, to_id);
 	struct drbd_peer_md *peer_md = device->ldev->md.peers;
-	u64 previous_bitmap_uuid = peer_md[to_id].bitmap_uuid;
-	int from_index = peer_md[from_id].bitmap_index;
-	int to_index = peer_md[to_id].bitmap_index;
+	u64 previous_bitmap_uuid;
+	int from_index, to_index;
 	const char *from_name, *to_name;
+	int err;
 
+	err = suspend_io_uuid_unlocked(receiving_pd);
+	if (err)
+		return err;
+
+	previous_bitmap_uuid = peer_md[to_id].bitmap_uuid;
+	from_index = peer_md[from_id].bitmap_index;
+	to_index = peer_md[to_id].bitmap_index;
 	drbd_set_peer_bitmap_uuid(&peer_md[to_id], peer_md[from_id].bitmap_uuid,
 			     peer_md[from_id].bitmap_dagtag);
 	_drbd_uuid_push_history(device, previous_bitmap_uuid);
@@ -6087,7 +6275,6 @@ static void copy_bitmap(struct drbd_device *device, int from_id, int to_id)
 	drbd_info(device, "Node %d (%s) synced up to node %d (%s). copying bitmap slot %d to %d.\n",
 		  to_id, to_name, from_id, from_name, from_index, to_index);
 	rcu_read_unlock();
-	drbd_suspend_io(device, WRITE_ONLY);
 	drbd_bm_lock(device, "copy_bitmap()", BM_LOCK_ALL);
 	drbd_bm_copy_slot(device, from_index, to_index);
 	/* the copy carries the reason the bits were set for */
@@ -6100,6 +6287,7 @@ static void copy_bitmap(struct drbd_device *device, int from_id, int to_id)
 	drbd_resume_io(device);
 	drbd_md_mark_dirty(device);
 	spin_lock_irq(&device->ldev->md.uuid_lock);
+	return 0;
 }
 
 /* Find a peer slot holding the given bitmap UUID, to be used as a copy source.
@@ -6147,7 +6335,8 @@ static bool node_connected(struct drbd_resource *resource, int node_id)
 	return r;
 }
 
-static bool detect_copy_ops_on_peer(struct drbd_peer_device *peer_device)
+/* Returns whether it copied a slot, or a negative error */
+static int detect_copy_ops_on_peer(struct drbd_peer_device *peer_device)
 {
 	struct drbd_device *device = peer_device->device;
 	struct drbd_peer_md *peer_md = device->ldev->md.peers;
@@ -6155,6 +6344,7 @@ static bool detect_copy_ops_on_peer(struct drbd_peer_device *peer_device)
 	int node_id1, node_id2, from_id;
 	u64 peer_bm_uuid;
 	bool modified = false;
+	int err;
 
 	for (node_id1 = 0; node_id1 < DRBD_NODE_ID_MAX; node_id1++) {
 		if (device->ldev->md.peers[node_id1].bitmap_index == -1)
@@ -6207,20 +6397,24 @@ found:
 
 	if (from_id != node_id1 &&
 	    peer_md[node_id1].bitmap_uuid != peer_bm_uuid) {
-		copy_bitmap(device, from_id, node_id1);
+		err = copy_bitmap(peer_device, from_id, node_id1);
+		if (err)
+			return err;
 		modified = true;
 
 	}
 	if (from_id != node_id2 &&
 	    peer_md[node_id2].bitmap_uuid != peer_bm_uuid) {
-		copy_bitmap(device, from_id, node_id2);
+		err = copy_bitmap(peer_device, from_id, node_id2);
+		if (err)
+			return err;
 		modified = true;
 	}
 
 	return modified;
 }
 
-void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
+int drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 {
 	u64 peer_current_uuid = peer_device->current_uuid & ~UUID_PRIMARY;
 	struct drbd_device *device = peer_device->device;
@@ -6229,7 +6423,8 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 	bool write_bm = false;
 	bool filled = false;
 	bool current_equal;
-	int node_id;
+	int node_id, ret;
+	int err = 0;
 
 	current_equal = peer_current_uuid == (drbd_resolved_uuid(peer_device, NULL) & ~UUID_PRIMARY) &&
 		!(peer_device->uuid_flags & UUID_FLAG_SYNC_TARGET) &&
@@ -6272,7 +6467,7 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 			}
 		}
 		spin_unlock_irq(&device->ldev->md.uuid_lock);
-		return;
+		return 0;
 	}
 
 	for (node_id = 0; node_id < DRBD_NODE_ID_MAX; node_id++) {
@@ -6293,8 +6488,18 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 			int from_node_id;
 
 			if (current_equal) {
-				u64 previous_bitmap_uuid = peer_md[node_id].bitmap_uuid;
+				bool drained = false;
+				u64 previous_bitmap_uuid;
 
+				if (node_id != peer_device->node_id &&
+				    test_bit(__MDF_HAVE_BITMAP, &peer_md[node_id].flags) &&
+				    _drbd_bm_total_weight(device, peer_md[node_id].bitmap_index)) {
+					err = suspend_io_uuid_unlocked(peer_device);
+					if (err)
+						break;
+					drained = true;
+				}
+				previous_bitmap_uuid = peer_md[node_id].bitmap_uuid;
 				drbd_set_peer_bitmap_uuid(&peer_md[node_id], 0, 0);
 				_drbd_uuid_push_history(device, previous_bitmap_uuid);
 				if (node_id == peer_device->node_id)
@@ -6304,6 +6509,8 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 				else
 					drbd_info(device, "Clearing bitmap UUID for node %d\n",
 						  node_id);
+				if (drained)
+					drbd_resume_io(device);
 				drbd_md_mark_dirty(device);
 				write_bm = true;
 			}
@@ -6314,18 +6521,27 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 			    dagtag_newer(peer_md[from_node_id].bitmap_dagtag,
 					 peer_md[node_id].bitmap_dagtag)) {
 				if (test_bit(__MDF_HAVE_BITMAP, &peer_md[node_id].flags) &&
-				    test_bit(__MDF_HAVE_BITMAP, &peer_md[from_node_id].flags))
-					copy_bitmap(device, from_node_id, node_id);
-				else
+				    test_bit(__MDF_HAVE_BITMAP, &peer_md[from_node_id].flags)) {
+					err = copy_bitmap(peer_device, from_node_id, node_id);
+					if (err)
+						break;
+				} else {
 					drbd_info(device, "Node %d synced up to node %d.\n",
 						  node_id, from_node_id);
+				}
 				drbd_md_mark_dirty(device);
 				filled = true;
 			}
 		}
 	}
 
-	write_bm |= detect_copy_ops_on_peer(peer_device);
+	if (!err) {
+		ret = detect_copy_ops_on_peer(peer_device);
+		if (ret < 0)
+			err = ret;
+		else if (ret)
+			write_bm = true;
+	}
 	spin_unlock_irq(&device->ldev->md.uuid_lock);
 
 	if (write_bm || filled) {
@@ -6335,6 +6551,7 @@ void drbd_uuid_detect_finished_resyncs(struct drbd_peer_device *peer_device)
 		drbd_bitmap_io(device, &drbd_bm_write_copy_pages,
 			       "detect_finished_resyncs()", BM_LOCK_BULK, NULL);
 	}
+	return err;
 }
 
 int drbd_bmio_set_all_n_write(struct drbd_device *device,

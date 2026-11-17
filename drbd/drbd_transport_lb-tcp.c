@@ -190,6 +190,7 @@ static struct drbd_transport_class dtl_transport_class = {
 	.instance_size = sizeof(struct dtl_transport),
 	.path_instance_size = sizeof(struct dtl_path),
 	.listener_instance_size = sizeof(struct dtl_listener),
+	.drain_before_close = true,
 	.ops = (struct drbd_transport_ops) {
 		.init = dtl_init,
 		.free = dtl_free,
@@ -2213,8 +2214,7 @@ static bool dtl_hint(struct drbd_transport *transport, enum drbd_stream stream,
 			tcp_sock_set_nodelay(sock->sk);
 			break;
 		case NOSPACE:
-			if (sock->sk->sk_socket)
-				set_bit(SOCK_NOSPACE, &sock->sk->sk_socket->flags);
+			sk_set_nospace(sock->sk);
 			break;
 		case QUICKACK:
 			tcp_sock_set_quickack(sock->sk, 2);

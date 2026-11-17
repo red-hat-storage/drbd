@@ -66,7 +66,9 @@ static bool lost_contact_to_peer_data(enum drbd_disk_state *peer_disk_state);
 static bool peer_returns_diskless(struct drbd_peer_device *peer_device,
 				  enum drbd_disk_state os, enum drbd_disk_state ns);
 static void print_state_change(struct drbd_resource *resource, const char *prefix, const char *tag);
-static void finish_state_change(struct drbd_resource *, const char *tag);
+#define FSC_RESUME_WALK		1
+#define FSC_RESTART_SUSPENDED	2
+static unsigned int finish_state_change(struct drbd_resource *, const char *tag);
 static int w_after_state_change(struct drbd_work *w, int unused);
 static enum drbd_state_rv is_valid_soft_transition(struct drbd_resource *);
 static enum drbd_state_rv is_valid_transition(struct drbd_resource *resource);
@@ -385,9 +387,9 @@ static bool writes_held_towards_lost_peers(struct drbd_device *device, u64 only_
 }
 
 /* Called at a resume exit, before the state change that can lift the last IO
- * suspension.  If that state change leaves peers behind, finish_state_change()
- * gives up the writes still held towards them (CANCEL_SUSPENDED_IO) and then
- * completes them to the application (COMPLETION_RESUMED).  That is a
+ * suspension.  If that state change leaves peers behind, it gives up the
+ * writes still held towards them (CANCEL_SUSPENDED_IO) and then completes
+ * them to the application (COMPLETION_RESUMED).  That is a
  * completion decision on behalf of a replica which never saw the data, so the
  * data generation labelling it must exist before those completions: with such
  * writes in the log, materialize the obligation and mint here, synchronously
@@ -1302,6 +1304,7 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 	int vnr;
 	bool all_devs_have_quorum = true;
 	struct after_state_change_work *work;
+	unsigned int fsc;
 
 	if (flags & CS_ABORT)
 		goto out;
@@ -1319,7 +1322,7 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 		goto out;
 
 	update_members(resource);
-	finish_state_change(resource, tag);
+	fsc = finish_state_change(resource, tag);
 
 	/* Check whether we are establishing a connection before applying the change. */
 	is_connect = drbd_state_change_is_connect(resource);
@@ -1414,6 +1417,14 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 	resource->cached_all_devices_have_quorum = all_devs_have_quorum;
 	smp_wmb(); /* Make the new state visible before the wake-ups below! */
 
+	/* Release held completions only now: drbd_req_complete() fails them
+	 * by cached_err_io, which must be that of the new state.
+	 */
+	if (fsc & FSC_RESUME_WALK)
+		__tl_walk(resource, NULL, NULL, COMPLETION_RESUMED);
+	if (fsc & FSC_RESTART_SUSPENDED)
+		drbd_restart_suspended_reqs(resource);
+
 	idr_for_each_entry(&resource->devices, device, vnr) {
 		struct drbd_peer_device *peer_device;
 
@@ -1459,7 +1470,7 @@ static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, st
 	 * "every surviving sync peer has it, and we are quorate" picture.  Release
 	 * the held completions of any generation that just became confirmed.  Runs
 	 * post-commit (NOW reflects the new state) under state_rwlock, like the
-	 * COMPLETION_RESUMED walk in finish_state_change.
+	 * COMPLETION_RESUMED walk above.
 	 */
 	{
 		bool release_gen = false;
@@ -3663,9 +3674,12 @@ static void update_peer_md_flags(struct drbd_peer_device *peer_device)
  * finish_state_change  -  carry out actions triggered by a state change
  * @resource: DBRD resource.
  * @tag: State change tag to print in status messages.
+ *
+ * Return: FSC_* actions that ___end_state_change() runs after the commit.
  */
-static void finish_state_change(struct drbd_resource *resource, const char *tag)
+static unsigned int finish_state_change(struct drbd_resource *resource, const char *tag)
 {
+	unsigned int ret = 0;
 	enum drbd_role *role = resource->role;
 	struct drbd_device *device;
 	struct drbd_connection *connection;
@@ -3820,6 +3834,10 @@ static void finish_state_change(struct drbd_resource *resource, const char *tag)
 
 			if (repl_state[OLD] <= L_ESTABLISHED && repl_state[NEW] == L_WF_BITMAP_S)
 				starting_resync = true;
+
+			if (peer_disk_state[OLD] < D_NEGOTIATING &&
+			    peer_disk_state[NEW] == D_NEGOTIATING)
+				set_bit(SEND_UUIDS_PEER_ATTACH, peer_device->flags);
 
 			if ((disk_state[OLD] != D_UP_TO_DATE || peer_disk_state[OLD] != D_UP_TO_DATE) &&
 			    (disk_state[NEW] == D_UP_TO_DATE && peer_disk_state[NEW] == D_UP_TO_DATE)) {
@@ -4203,20 +4221,16 @@ static void finish_state_change(struct drbd_resource *resource, const char *tag)
 		}
 	}
 
-	/* The completion-resumed walk may drop a postponed request's last
-	 * completion reference; drbd_suspended() still reads the old,
-	 * suspended state here, so that request parks on suspended_reqs.
-	 * Restart the suspended requests after the walk, or it is missed.
-	 */
 	if ((resource_suspended[OLD] && !resource_suspended[NEW]) || unfreeze_io)
-		__tl_walk(resource, NULL, NULL, COMPLETION_RESUMED);
-
+		ret |= FSC_RESUME_WALK;
 	if (resource_suspended[OLD] && !resource_suspended[NEW])
-		drbd_restart_suspended_reqs(resource);
+		ret |= FSC_RESTART_SUSPENDED;
 
 	/* reconcile settled: a held-Consistent survivor may return to UpToDate */
 	if (reconciliation_resync_done)
 		drbd_reconcile_settled_try_up_to_date(resource);
+
+	return ret;
 }
 
 static void abw_start_sync(struct drbd_device *device,
@@ -5097,8 +5111,7 @@ static int w_after_state_change(struct drbd_work *w, int unused)
 				peer_device->rs_total = 0;
 				peer_device->rs_failed = 0;
 
-				drbd_send_uuids(peer_device, 0, 0);
-				drbd_send_state(peer_device, new_state);
+				drbd_send_uuids_peer_attach(peer_device);
 			}
 			/* No point in queuing send_bitmap if we don't have a connection
 			 * anymore, so check also the _current_ state, not only the new state
@@ -5115,7 +5128,7 @@ static int w_after_state_change(struct drbd_work *w, int unused)
 				 * bitmap. This may set bits unnecessarily, but
 				 * it does no harm to resync a small amount of
 				 * additional data. */
-				drbd_set_pending_out_of_sync(peer_device);
+				drbd_set_pending_out_of_sync(peer_device, false);
 				/* ldev_safe: ref from extra_ldev_ref_for_after_state_chg() */
 				drbd_queue_bitmap_io(device, &drbd_send_bitmap, NULL,
 						"send_bitmap (WFBitMapS)",
@@ -5222,16 +5235,9 @@ static int w_after_state_change(struct drbd_work *w, int unused)
 				/* ldev_safe: ref from extra_ldev_ref_for_after_state_chg() */
 				resume_next_sg(device);
 				drbd_apply_resync_max_parallel();
-			} else {
-				enum drbd_repl_state old = repl_state[OLD];
-				enum drbd_repl_state new = repl_state[NEW];
-
-				/* A resync got paused; re-evaluate max_parallel_resyncs. */
-				if ((old == L_SYNC_SOURCE || old == L_SYNC_TARGET ||
-				     old == L_VERIFY_S || old == L_VERIFY_T) &&
-				    !(new == L_SYNC_SOURCE || new == L_SYNC_TARGET ||
-				      new == L_VERIFY_S || new == L_VERIFY_T))
-					drbd_apply_resync_max_parallel();
+			} else if (repl_holds_resync_slot(repl_state[OLD]) &&
+				   !repl_holds_resync_slot(repl_state[NEW])) {
+				drbd_apply_resync_max_parallel();
 			}
 
 			/* sync target done with resync. Explicitly notify all peers. Our sync
@@ -6489,11 +6495,20 @@ retry:
 	end_remote_state_change(resource, &irq_flags, context->flags | CS_TWOPC);
 	clear_bit(TWOPC_STATE_CHANGE_PENDING, &resource->flags);
 	if (rv >= SS_SUCCESS) {
+		bool disconnect = have_peers && target_connection &&
+			context->mask.conn == conn_MASK && context->val.conn == C_DISCONNECTING;
+
+		/* Set before the commit stops the receiver, see conn_disconnect() */
+		if (disconnect)
+			set_bit(WAIT_FOR_PEER_CLOSE, &target_connection->flags);
 		change(context, PH_COMMIT);
 		rv = end_state_change(resource, &irq_flags, tag);
-		if (rv < SS_SUCCESS)
+		if (rv < SS_SUCCESS) {
 			drbd_err(resource, "FATAL: Local commit of already committed %u failed!\n",
 				 request.tid);
+			if (disconnect)
+				clear_bit(WAIT_FOR_PEER_CLOSE, &target_connection->flags);
+		}
 	} else {
 		abort_state_change(resource, &irq_flags);
 	}
@@ -6720,11 +6735,9 @@ retry:
 
 	request.cmd = commit_it ? P_TWOPC_COMMIT : P_TWOPC_ABORT;
 	if (have_peers) {
-		/* A write queued behind the COMMIT on the data socket reaches
-		 * the peer only after its bitmap write, and our own drain in
-		 * drbd_determine_dev_size() would wait for that. Reads too:
-		 * this is not a receiver, and a read in flight to a peer is
-		 * answered only after the peer's bitmap write as well.
+		/* Drain before the COMMIT, so that the size change normally
+		 * starts with no request in flight; drbd_determine_dev_size()
+		 * does not drain again. Reads too: this is not a receiver.
 		 * Not earlier: a request sent during the prepare phase sits
 		 * behind the prepare on the peer's data socket and is answered
 		 * once that receiver has replied, so this drain covers it, and
