@@ -11,7 +11,7 @@
 
 const char *drbd_buildtag(void);
 
-#define REL_VERSION "9.3.5-rc.2"
+#define REL_VERSION "9.3.5"
 #define PRO_VERSION_MIN 118 /* 9.0.26 */
 #define PRO_VERSION_MAX 125
 
@@ -20,7 +20,8 @@ const char *drbd_buildtag(void);
 		      DRBD_FF_2PC_V2 | DRBD_FF_RS_SKIP_UUID | \
 		      DRBD_FF_RESYNC_WITHOUT_REPLICATION | \
 		      DRBD_FF_BM_BLOCK_SHIFT |\
-		      DRBD_FF_RECONCILE_RECONNECT | DRBD_FF_WRITE_POSTPONE)
+		      DRBD_FF_RECONCILE_RECONNECT | DRBD_FF_WRITE_POSTPONE | \
+		      DRBD_FF_RECONCILE_PRIMARY)
 
 #define PRO_VERSION_8_MIN 86
 #define PRO_VERSION_8_MAX 101
