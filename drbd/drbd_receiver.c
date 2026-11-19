@@ -6958,7 +6958,7 @@ static enum sync_strategy drbd_disk_states_target_strategy(
 static bool primary_neighbor_decides(struct drbd_peer_device *peer_device,
 				     bool connecting, enum sync_strategy *strategy)
 {
-	bool we_stable = peer_device->comm_uuid_flags & UUID_FLAG_STABLE;
+	bool self_stable = peer_device->comm_uuid_flags & UUID_FLAG_STABLE;
 	bool peer_stable = peer_device->uuid_flags & UUID_FLAG_STABLE;
 
 	/*
@@ -6967,10 +6967,60 @@ static bool primary_neighbor_decides(struct drbd_peer_device *peer_device,
 	 */
 	if (peer_device->connection->agreed_pro_version < 125)
 		return false;
-	if (!connecting || we_stable == peer_stable)
+	if (!connecting || self_stable == peer_stable)
 		return false;
 
-	*strategy = we_stable ? SYNC_TARGET_USE_BITMAP : SYNC_SOURCE_USE_BITMAP;
+	*strategy = self_stable ? SYNC_TARGET_USE_BITMAP : SYNC_SOURCE_USE_BITMAP;
+	return true;
+}
+
+/*
+ * The data of an UpToDate primary is the reference, and a primary refuses to
+ * become sync target ("I shall become SyncTarget, but I am primary!"). Out-of-sync
+ * bits a secondary holds toward the primary mark blocks where the secondary may
+ * differ, and the primary's copy of those blocks is the one to keep. That is true
+ * whichever side holds the bits and whether the secondary is UpToDate or
+ * Outdated, so this rule comes before the holder's disk-state requirements: an
+ * Outdated holder would otherwise get NO_SYNC, be lifted to UpToDate next to
+ * the primary, and keep the blocks its bits mark.
+ *
+ * Only at the connect handshake. Both sides must reach mirrored decisions, so
+ * both must see the same two roles: their own, and the one the peer sent with
+ * its state, in the same P_STATE as its disk state. On an established
+ * connection that does not hold: the after-unstable re-handshake
+ * (drbd_resync()) can run on a node before it has applied its peer's
+ * promotion, and the two sides would pick roles that do not mirror.
+ *
+ * Only toward an Outdated or UpToDate secondary. A Consistent secondary may
+ * have come back from a reboot without knowing whether it is current, and
+ * toward such a peer at an equal current UUID receive_state() refuses to thaw
+ * a suspended primary and mints a new data generation instead ("can not thaw
+ * IO with an only Consistent peer"). A reconcile resync would bypass that.
+ *
+ * A peer without DRBD_FF_RECONCILE_PRIMARY applies the other rules only, so
+ * this one must not apply toward it.
+ */
+static bool primary_decides(struct drbd_peer_device *peer_device, bool connecting,
+			    enum drbd_role peer_role,
+			    enum drbd_disk_state disk_state, enum drbd_disk_state peer_disk_state,
+			    enum sync_strategy *strategy)
+{
+	bool self_primary = peer_device->device->resource->role[NOW] == R_PRIMARY;
+	bool peer_primary = peer_role == R_PRIMARY;
+	enum drbd_disk_state primary_disk_state, other_disk_state;
+
+	if (!(peer_device->connection->agreed_features & DRBD_FF_RECONCILE_PRIMARY))
+		return false;
+	if (!connecting || self_primary == peer_primary)
+		return false;
+
+	primary_disk_state = self_primary ? disk_state : peer_disk_state;
+	other_disk_state = self_primary ? peer_disk_state : disk_state;
+	if (primary_disk_state != D_UP_TO_DATE ||
+	    (other_disk_state != D_OUTDATED && other_disk_state != D_UP_TO_DATE))
+		return false;
+
+	*strategy = self_primary ? SYNC_SOURCE_USE_BITMAP : SYNC_TARGET_USE_BITMAP;
 	return true;
 }
 
@@ -7008,6 +7058,11 @@ static bool primary_neighbor_decides(struct drbd_peer_device *peer_device,
  *         no stronger signal owns it     (crashed primary / lost quorum)
  *
  *     direction:
+ *         one of the two is an UpToDate primary -> it is the source
+ *                                   (primary_decides(), DRBD_FF_RECONCILE_PRIMARY,
+ *                                   connect only, the other side D_OUTDATED or
+ *                                   D_UP_TO_DATE, ahead of the holder's
+ *                                   disk-state requirements above)
  *         one of the two has a primary neighbor -> it is the source
  *                                   (primary_neighbor_decides(), connect only,
  *                                   both sides D_UP_TO_DATE)
@@ -7021,6 +7076,7 @@ static bool primary_neighbor_decides(struct drbd_peer_device *peer_device,
  * resync direction; it only rescues the would-be NO_SYNC-drops-bits case.
  */
 static bool reconcile_equal_uuid_bitmap_strategy(struct drbd_peer_device *peer_device,
+						enum drbd_role peer_role,
 						enum drbd_disk_state disk_state,
 						enum drbd_disk_state peer_disk_state,
 						enum sync_strategy *strategy,
@@ -7031,7 +7087,7 @@ static bool reconcile_equal_uuid_bitmap_strategy(struct drbd_peer_device *peer_d
 	const int node_id = device->resource->res_opts.node_id;
 	bool by_provenance = connection->agreed_pro_version >= 125;
 	bool connecting = connection->cstate[NOW] == C_CONNECTING;
-	bool we_hold, peer_holds;
+	bool self_holds, peer_holds;
 	u64 local_uuid_flags;
 
 	if (*strategy != NO_SYNC)
@@ -7052,16 +7108,27 @@ static bool reconcile_equal_uuid_bitmap_strategy(struct drbd_peer_device *peer_d
 		 * resync would pull a healthy UpToDate peer through Inconsistent
 		 * for nothing.
 		 */
-		we_hold = peer_device->comm_bm_set &&
+		self_holds = peer_device->comm_bm_set &&
 			(peer_device->comm_uuid_flags & UUID_FLAG_BITMAP_AUTHORITATIVE);
 		peer_holds = peer_device->dirty_bits &&
 			(peer_device->uuid_flags & UUID_FLAG_BITMAP_AUTHORITATIVE);
-		if (!we_hold && !peer_holds)
+		if (!self_holds && !peer_holds)
 			return false;
 
-		if (we_hold != peer_holds) {
-			enum drbd_disk_state holder = we_hold ? disk_state : peer_disk_state;
-			enum drbd_disk_state other = we_hold ? peer_disk_state : disk_state;
+		/*
+		 * A peer that announces DRBD_FF_RECONCILE_PRIMARY speaks
+		 * protocol 125 or later, so we do not need this primary rule
+		 * in the !by_provenance branch.
+		 */
+		if (primary_decides(peer_device, connecting, peer_role, disk_state,
+				    peer_disk_state, strategy)) {
+			*rule = RULE_RECONCILE_BITMAP;
+			return true;
+		}
+
+		if (self_holds != peer_holds) {
+			enum drbd_disk_state holder = self_holds ? disk_state : peer_disk_state;
+			enum drbd_disk_state other = self_holds ? peer_disk_state : disk_state;
 
 			if (holder != D_UP_TO_DATE || other < D_OUTDATED)
 				return false;
@@ -7108,12 +7175,12 @@ static bool reconcile_equal_uuid_bitmap_strategy(struct drbd_peer_device *peer_d
 		    (peer_device->uuid_flags & UUID_FLAG_PRIMARY_LOST_QUORUM))
 			return false;
 
-		we_hold = peer_device->comm_bm_set != 0;
+		self_holds = peer_device->comm_bm_set != 0;
 		peer_holds = peer_device->dirty_bits != 0;
 	}
 
 	*rule = RULE_RECONCILE_BITMAP;
-	if (we_hold != peer_holds) {
+	if (self_holds != peer_holds) {
 		/*
 		 * The primary neighbor overrides the holder only between two
 		 * UpToDate copies. From protocol 125 on, the non-holder may be
@@ -7126,7 +7193,7 @@ static bool reconcile_equal_uuid_bitmap_strategy(struct drbd_peer_device *peer_d
 
 		if (!both_up_to_date ||
 		    !primary_neighbor_decides(peer_device, connecting, strategy))
-			*strategy = we_hold ?
+			*strategy = self_holds ?
 				SYNC_SOURCE_USE_BITMAP : SYNC_TARGET_USE_BITMAP;
 	} else {
 		/*
@@ -7168,13 +7235,14 @@ static bool reconcile_equal_uuid_bitmap_strategy(struct drbd_peer_device *peer_d
 }
 
 static void maybe_reconcile_equal_uuid_bitmap(struct drbd_peer_device *peer_device,
+					      enum drbd_role peer_role,
 					      enum drbd_disk_state disk_state,
 					      enum drbd_disk_state peer_disk_state,
 					      enum sync_strategy *strategy,
 					      enum sync_rule *rule)
 {
-	if (!reconcile_equal_uuid_bitmap_strategy(peer_device, disk_state, peer_disk_state,
-						  strategy, rule))
+	if (!reconcile_equal_uuid_bitmap_strategy(peer_device, peer_role, disk_state,
+						  peer_disk_state, strategy, rule))
 		return;
 
 	/* Mark this as a reconciliation resync, like the connected dagtag reconcile
@@ -7192,6 +7260,7 @@ static void maybe_reconcile_equal_uuid_bitmap(struct drbd_peer_device *peer_devi
 }
 
 static void disk_states_to_strategy(struct drbd_peer_device *peer_device,
+				    enum drbd_role peer_role,
 				    enum drbd_disk_state peer_disk_state,
 				    enum sync_strategy *strategy, enum sync_rule *rule,
 				    int *peer_node_id)
@@ -7245,16 +7314,16 @@ static void disk_states_to_strategy(struct drbd_peer_device *peer_device,
 			  drbd_disk_str(disk_state), drbd_disk_str(peer_disk_state));
 	}
 
-	maybe_reconcile_equal_uuid_bitmap(peer_device, disk_state, peer_disk_state,
+	maybe_reconcile_equal_uuid_bitmap(peer_device, peer_role, disk_state, peer_disk_state,
 					  strategy, rule);
 }
 
 static enum sync_strategy drbd_attach_handshake(struct drbd_peer_device *peer_device,
+						  enum drbd_role peer_role,
 						  enum drbd_disk_state peer_disk_state)
 {
 	struct drbd_device *device = peer_device->device;
 	struct drbd_connection *connection = peer_device->connection;
-	enum drbd_role peer_role = connection->peer_role[NOW];
 	enum sync_strategy strategy;
 	enum sync_rule rule;
 	int peer_node_id, err;
@@ -7267,7 +7336,8 @@ static enum sync_strategy drbd_attach_handshake(struct drbd_peer_device *peer_de
 	if (!is_strategy_determined(strategy))
 		return strategy;
 
-	disk_states_to_strategy(peer_device, peer_disk_state, &strategy, &rule, &peer_node_id);
+	disk_states_to_strategy(peer_device, peer_role, peer_disk_state, &strategy, &rule,
+				&peer_node_id);
 
 	if (strategy == SPLIT_BRAIN_AUTO_RECOVER &&
 	    (!drbd_device_stable(device, NULL) ||
@@ -7441,7 +7511,8 @@ static enum sync_strategy drbd_sync_handshake(struct drbd_peer_device *peer_devi
 		}
 	}
 
-	disk_states_to_strategy(peer_device, peer_disk_state, &strategy, &rule, &peer_node_id);
+	disk_states_to_strategy(peer_device, peer_role, peer_disk_state, &strategy, &rule,
+				&peer_node_id);
 
 	if (strategy == SPLIT_BRAIN_AUTO_RECOVER && (!drbd_device_stable(device, NULL) || !(peer_device->uuid_flags & UUID_FLAG_STABLE))) {
 		drbd_warn(peer_device, "Ignore Split-Brain, for now, at least one side unstable\n");
@@ -8492,10 +8563,11 @@ static int drbd_resync(struct drbd_peer_device *peer_device,
 	announced_pdsk = test_bit(PEER_UPGRADE_PREDICTED, peer_device->flags) ?
 		D_OUTDATED : peer_disk_state;
 	if (reason == DISKLESS_PRIMARY)
-		disk_states_to_strategy(peer_device, peer_disk_state, &strategy,
+		disk_states_to_strategy(peer_device, peer_role, peer_disk_state, &strategy,
 					&rule, &peer_node_id);
 	else
-		maybe_reconcile_equal_uuid_bitmap(peer_device, peer_device->comm_state.disk,
+		maybe_reconcile_equal_uuid_bitmap(peer_device, peer_role,
+						  peer_device->comm_state.disk,
 						  announced_pdsk, &strategy, &rule);
 
 	new_repl_state = strategy_to_repl_state(peer_device, peer_role, strategy);
@@ -8539,6 +8611,8 @@ static int drbd_resync(struct drbd_peer_device *peer_device,
 	}
 
 	rv = change_repl_state(peer_device, new_repl_state, CS_VERBOSE, tag);
+	if (rv == SS_SUCCESS && new_repl_state == L_WF_BITMAP_T && rule == RULE_RECONCILE_BITMAP)
+		set_bit(RECONCILE_UNSTABLE_TARGET, peer_device->flags);
 	if ((rv == SS_NOTHING_TO_DO || rv == SS_RESYNC_RUNNING) &&
 	    (new_repl_state == L_WF_BITMAP_S || new_repl_state == L_WF_BITMAP_T)) {
 		/* Those events might happen very quickly. In case we are still processing
@@ -8548,6 +8622,46 @@ static int drbd_resync(struct drbd_peer_device *peer_device,
 		drbd_info(peer_device, "...postponing this until current resync finished\n");
 	}
 	return 0;
+}
+
+/*
+ * Two nodes that become stable at about the same time send each other
+ * UUID_FLAG_GOT_STABLE, and each answers the other's with UUID_FLAG_RESYNC and
+ * an after-unstable handshake. The GOT_STABLE a node answers may carry bits its
+ * sender has forgotten since, so both can decide to reconcile as the target of
+ * the other and wait in L_WF_BITMAP_T for a bitmap neither sends.
+ *
+ * The RESYNC that follows is the peer's own answer, and with RECONCILIATION_RESYNC
+ * set no handshake runs on it. If it shows that the peer holds no authoritative
+ * bits for us, it did not decide to be our source, and the reconcile is void.
+ *
+ * Leaving L_WF_BITMAP_T ends the reconcile hold, so the handshake that was
+ * skipped can run now. Without a resync it lifts the Outdated the reconcile
+ * set, while the peer is still known by the disk state it decided with.
+ */
+static void drop_stale_reconcile_target(struct drbd_peer_device *peer_device)
+{
+	struct drbd_device *device = peer_device->device;
+	bool peer_holds = peer_device->dirty_bits &&
+		(peer_device->uuid_flags & UUID_FLAG_BITMAP_AUTHORITATIVE);
+	enum drbd_state_rv rv;
+
+	if (!test_bit(RECONCILE_UNSTABLE_TARGET, peer_device->flags) ||
+	    peer_device->repl_state[NOW] != L_WF_BITMAP_T || peer_holds)
+		return;
+
+	if (!get_ldev(device))
+		return;
+	if ((peer_device->current_uuid & ~UUID_PRIMARY) !=
+	    (drbd_current_uuid(device) & ~UUID_PRIMARY))
+		goto out;
+
+	drbd_info(peer_device, "Peer holds no out-of-sync bits for us, dropping the reconcile\n");
+	rv = change_repl_state(peer_device, L_ESTABLISHED, CS_VERBOSE, "reconcile-dropped");
+	if (rv >= SS_SUCCESS)
+		drbd_resync(peer_device, AFTER_UNSTABLE);
+out:
+	put_ldev(device);
 }
 
 /* An Outdated peer upgrades itself when we trigger it (sanitize_state()); record
@@ -8567,8 +8681,8 @@ void drbd_predict_peer_upgrade(struct drbd_peer_device *peer_device)
 	    disk_state < D_CONSISTENT || !get_ldev(device))
 		return;
 	strategy = drbd_handshake(peer_device, &rule, &peer_node_id, false);
-	reconcile_equal_uuid_bitmap_strategy(peer_device, disk_state, D_OUTDATED,
-					     &strategy, &rule);
+	reconcile_equal_uuid_bitmap_strategy(peer_device, peer_device->connection->peer_role[NOW],
+					     disk_state, D_OUTDATED, &strategy, &rule);
 	put_ldev(device);
 	if (strategy != NO_SYNC)
 		return;
@@ -8620,7 +8734,7 @@ static void propagate_skip_initial_to_diskless(struct drbd_device *device)
 	}
 }
 
-static int __receive_uuids(struct drbd_peer_device *peer_device, u64 node_mask)
+static int __receive_uuids(struct drbd_peer_device *peer_device, u64 previous_uuid, u64 node_mask)
 {
 	enum drbd_repl_state repl_state = peer_device->repl_state[NOW];
 	struct drbd_device *device = peer_device->device;
@@ -8677,7 +8791,8 @@ static int __receive_uuids(struct drbd_peer_device *peer_device, u64 node_mask)
 		}
 
 		if (peer_device->uuid_flags & UUID_FLAG_NEW_DATAGEN)
-			drbd_uuid_received_new_current(peer_device, peer_device->current_uuid, node_mask);
+			drbd_uuid_received_new_current(peer_device, peer_device->current_uuid,
+						       previous_uuid, node_mask);
 
 		err = drbd_uuid_detect_finished_resyncs(peer_device);
 
@@ -8730,6 +8845,7 @@ static int receive_uuids(struct drbd_connection *connection, struct packet_info 
 	struct drbd_peer_device *peer_device;
 	struct p_uuids *p = pi->data;
 	int history_uuids, i;
+	u64 previous_uuid;
 
 	peer_device = conn_peer_device(connection, pi->vnr);
 	if (!peer_device)
@@ -8738,6 +8854,7 @@ static int receive_uuids(struct drbd_connection *connection, struct packet_info 
 	history_uuids = min_t(int, HISTORY_UUIDS_V08,
 			      ARRAY_SIZE(peer_device->history_uuids));
 
+	previous_uuid = peer_device->current_uuid;
 	peer_device->current_uuid = be64_to_cpu(p->current_uuid);
 	peer_device->bitmap_uuids[node_id] = be64_to_cpu(p->bitmap_uuid);
 	for (i = 0; i < history_uuids; i++)
@@ -8748,7 +8865,7 @@ static int receive_uuids(struct drbd_connection *connection, struct packet_info 
 	peer_device->uuid_flags = be64_to_cpu(p->uuid_flags) | UUID_FLAG_STABLE;
 	set_bit(UUIDS_RECEIVED, peer_device->flags);
 
-	return __receive_uuids(peer_device, 0);
+	return __receive_uuids(peer_device, previous_uuid, 0);
 }
 
 static int receive_uuids110(struct drbd_connection *connection, struct packet_info *pi)
@@ -8756,7 +8873,7 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 	struct drbd_peer_device *peer_device;
 	struct p_uuids110 *p = pi->data;
 	int bitmap_uuids, history_uuids, rest, i, pos, err;
-	u64 bitmap_uuids_mask, node_mask;
+	u64 bitmap_uuids_mask, node_mask, previous_uuid;
 	struct drbd_peer_md *peer_md = NULL;
 	struct drbd_device *device;
 	int not_allocated = -1;
@@ -8805,6 +8922,7 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 	 * it, the peer's handshake report is the truth -- take it, so we do not
 	 * treat the peer as UpToDate at a generation it never persisted.
 	 */
+	previous_uuid = peer_device->current_uuid;
 	if (test_bit(CURRENT_UUID_UNCONFIRMED, peer_device->flags) ||
 	    device->resource->role[NOW] != R_PRIMARY ||
 	    device->disk_state[NOW] != D_DISKLESS ||
@@ -8854,7 +8972,7 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 	    peer_device->uuid_flags & UUID_FLAG_STABLE)
 		check_resync_source(peer_device, node_mask);
 
-	err = __receive_uuids(peer_device, node_mask);
+	err = __receive_uuids(peer_device, previous_uuid, node_mask);
 	if (err)
 		return err;
 
@@ -8881,6 +8999,8 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 				put_ldev(device);
 			}
 		}
+	} else if (peer_device->uuid_flags & UUID_FLAG_RESYNC) {
+		drop_stale_reconcile_target(peer_device);
 	}
 
 	return err;
@@ -10267,7 +10387,8 @@ static void drbd_try_to_get_resynced(struct drbd_device *device)
 		spin_lock_irq(&device->ldev->md.uuid_lock);
 		strategy = drbd_uuid_compare(peer_device, &rule, &peer_node_id);
 		spin_unlock_irq(&device->ldev->md.uuid_lock);
-		disk_states_to_strategy(peer_device, peer_device->disk_state[NOW], &strategy, &rule,
+		disk_states_to_strategy(peer_device, peer_device->connection->peer_role[NOW],
+					peer_device->disk_state[NOW], &strategy, &rule,
 					&peer_node_id);
 		drbd_info(peer_device, "strategy = %s\n", strategy_descriptor(strategy).name);
 		if (strategy_descriptor(strategy).resync_peer_preference > best_preference) {
@@ -10792,7 +10913,8 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 		} else if (old_peer_state.conn == L_ESTABLISHED &&
 			   (peer_state.disk == D_NEGOTIATING ||
 			    old_peer_state.disk == D_NEGOTIATING)) {
-			strategy = drbd_attach_handshake(peer_device, peer_disk_state);
+			strategy = drbd_attach_handshake(peer_device, peer_state.role,
+							  peer_disk_state);
 			new_repl_state = strategy_to_repl_state(peer_device, peer_state.role, strategy);
 			if (new_repl_state == L_ESTABLISHED && device->disk_state[NOW] == D_UP_TO_DATE)
 				peer_disk_state = D_UP_TO_DATE;
@@ -11735,7 +11857,7 @@ static int receive_current_uuid(struct drbd_connection *connection, struct packe
 	struct drbd_peer_device *peer_device;
 	struct drbd_device *device;
 	struct p_current_uuid *p = pi->data;
-	u64 current_uuid, weak_nodes;
+	u64 current_uuid, previous_uuid, weak_nodes;
 	bool moved_on;
 
 	peer_device = conn_peer_device(connection, pi->vnr);
@@ -11748,6 +11870,7 @@ static int receive_current_uuid(struct drbd_connection *connection, struct packe
 	weak_nodes |= NODE_MASK(peer_device->node_id);
 	moved_on = drbd_diskless_moved_on(peer_device, current_uuid);
 
+	previous_uuid = peer_device->current_uuid;
 	peer_device->current_uuid = current_uuid;
 
 	if (get_ldev(device)) {
@@ -11782,7 +11905,8 @@ static int receive_current_uuid(struct drbd_connection *connection, struct packe
 		 * resync target (so resync-end adoption brings us to the
 		 * primary's generation), drop otherwise.
 		 */
-		drbd_uuid_received_new_current(peer_device, current_uuid, weak_nodes);
+		drbd_uuid_received_new_current(peer_device, current_uuid, previous_uuid,
+					       weak_nodes);
 		drbd_md_sync_if_dirty(device);
 		put_ldev(device);
 	} else if (peer_device->repl_state[NOW] >= L_ESTABLISHED &&
@@ -12599,6 +12723,7 @@ static void peer_device_disconnected(struct drbd_peer_device *peer_device)
 	 * followed, drop it so it cannot mislabel a later resync.
 	 */
 	clear_bit(RECONCILIATION_RESYNC, peer_device->flags);
+	clear_bit(RECONCILE_UNSTABLE_TARGET, peer_device->flags);
 
 	peer_device_init_connect_state(peer_device);
 
